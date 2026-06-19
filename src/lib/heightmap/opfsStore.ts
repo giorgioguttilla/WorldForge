@@ -14,6 +14,10 @@ interface CacheEntry {
   lastUsed: number;
 }
 
+interface TileAccessOptions {
+  cache?: boolean;
+}
+
 export class HeightmapTileStore {
   private root: FileSystemDirectoryHandle | null = null;
   private readonly cache = new Map<string, CacheEntry>();
@@ -47,7 +51,7 @@ export class HeightmapTileStore {
     return normalizeWorldConfig(JSON.parse(await file.text()));
   }
 
-  async writeTile(key: TileKey, samples: Uint16Array): Promise<void> {
+  async writeTile(key: TileKey, samples: Uint16Array, options: TileAccessOptions = {}): Promise<void> {
     const start = performance.now();
     const root = this.requireRoot();
     const pathParts = tilePath(key).split('/');
@@ -58,14 +62,17 @@ export class HeightmapTileStore {
     const writable = await handle.createWritable({ keepExistingData: false });
     await writable.write(R16HeightmapCodec.encode(samples));
     await writable.close();
-    this.setCache(key, samples);
+    if (options.cache !== false) {
+      this.setCache(key, samples);
+    }
     this.writeTotal += performance.now() - start;
     this.writeCount += 1;
   }
 
-  async readTile(key: TileKey, tileSize: number): Promise<Uint16Array> {
+  async readTile(key: TileKey, tileSize: number, options: TileAccessOptions = {}): Promise<Uint16Array> {
     const id = tilePath(key);
-    const cached = this.cache.get(id);
+    const shouldCache = options.cache !== false;
+    const cached = shouldCache ? this.cache.get(id) : undefined;
     if (cached) {
       cached.lastUsed = performance.now();
       return cached.samples;
@@ -75,7 +82,9 @@ export class HeightmapTileStore {
     const root = this.requireRoot();
     const file = await (await this.getFile(root, tilePath(key))).getFile();
     const samples = R16HeightmapCodec.decode(await file.arrayBuffer(), tileSize);
-    this.setCache(key, samples);
+    if (shouldCache) {
+      this.setCache(key, samples);
+    }
     this.readTotal += performance.now() - start;
     this.readCount += 1;
     return samples;

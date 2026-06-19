@@ -28,6 +28,7 @@ export class TerrainQuadtreeRenderer {
   private updateQueued = false;
   private lastSelectionId = '';
   private viewportHeight = 720;
+  private readonly sparePoolNodes = 8;
 
   constructor(private readonly manager: TileManager) {}
 
@@ -76,6 +77,7 @@ export class TerrainQuadtreeRenderer {
         this.active.set(id, node);
       }
       this.lastSelectionId = nextSelectionId;
+      this.trimUnusedPool();
       this.updateMetrics();
     } finally {
       this.updateQueued = false;
@@ -92,10 +94,12 @@ export class TerrainQuadtreeRenderer {
   }
 
   clear(): void {
-    for (const node of this.active.values()) {
-      node.inUse = false;
-      node.mesh.visible = false;
+    for (const node of this.pool) {
+      this.group.remove(node.mesh);
+      node.mesh.geometry.dispose();
+      node.mesh.material.dispose();
     }
+    this.pool.length = 0;
     this.active.clear();
     this.lastSelectionId = '';
     this.manager.setRenderMetrics(0, 0, 0);
@@ -246,5 +250,19 @@ export class TerrainQuadtreeRenderer {
     const vertices = [...this.active.values()].reduce((sum, node) => sum + node.mesh.geometry.attributes.position.count, 0);
     const triangles = [...this.active.values()].reduce((sum, node) => sum + (node.mesh.geometry.index?.count ?? 0) / 3, 0);
     this.manager.setRenderMetrics(this.active.size, vertices, triangles);
+  }
+
+  private trimUnusedPool(): void {
+    let spareCount = 0;
+    for (let i = this.pool.length - 1; i >= 0; i -= 1) {
+      const node = this.pool[i];
+      if (node.inUse) continue;
+      spareCount += 1;
+      if (spareCount <= this.sparePoolNodes) continue;
+      this.group.remove(node.mesh);
+      node.mesh.geometry.dispose();
+      node.mesh.material.dispose();
+      this.pool.splice(i, 1);
+    }
   }
 }

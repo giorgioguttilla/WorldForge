@@ -4,6 +4,12 @@ export class R16HeightmapCodec {
   }
 
   static encode(samples: Uint16Array): ArrayBuffer {
+    if (isLittleEndian()) {
+      return samples.byteOffset === 0 && samples.byteLength === samples.buffer.byteLength
+        ? samples.buffer
+        : samples.buffer.slice(samples.byteOffset, samples.byteOffset + samples.byteLength);
+    }
+
     const buffer = new ArrayBuffer(samples.length * Uint16Array.BYTES_PER_ELEMENT);
     const view = new DataView(buffer);
     for (let i = 0; i < samples.length; i += 1) {
@@ -17,6 +23,10 @@ export class R16HeightmapCodec {
     if (buffer.byteLength !== expected) {
       throw new Error(`Invalid R16 tile length ${buffer.byteLength}; expected ${expected}.`);
     }
+    if (isLittleEndian()) {
+      return new Uint16Array(buffer);
+    }
+
     const view = new DataView(buffer);
     const samples = new Uint16Array(tileSize * tileSize);
     for (let i = 0; i < samples.length; i += 1) {
@@ -24,4 +34,11 @@ export class R16HeightmapCodec {
     }
     return samples;
   }
+}
+
+let littleEndian: boolean | null = null;
+
+function isLittleEndian(): boolean {
+  littleEndian ??= new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  return littleEndian;
 }

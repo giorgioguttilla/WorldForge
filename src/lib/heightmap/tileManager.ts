@@ -69,7 +69,7 @@ export class TileManager {
       for (let x = 0; x < config.tilesPerSide; x += 1) {
         const key = { x, y, d: 0 };
         const samples = await compute.generateNoiseTile(config.tileSize, x, y, 137);
-        await this.store.writeTile(key, samples);
+        await this.store.writeTile(key, samples, { cache: false });
         dirty.push(key);
         generated += 1;
         options.onProgress?.({
@@ -93,6 +93,7 @@ export class TileManager {
     });
     this.metrics.lodRebuildMs = performance.now() - start;
     this.metrics.lastGeneratedTiles = generated;
+    this.store.clearCache();
     this.refreshStoreMetrics();
     return config;
   }
@@ -200,12 +201,14 @@ export class TileManager {
       for (let y = 0; y < side; y += 1) {
         for (let x = 0; x < side; x += 1) {
           const key = { x, y, d };
-          const samples = await this.readTile(key);
+          const samples = await this.store.readTile(key, config.tileSize, { cache: false });
           const blob = await encodeGrayscale16Png(config.tileSize, config.tileSize, samples);
           await this.writeBlobFile(directory, tilePath(key, 'png'), blob);
         }
       }
     }
+    this.store.clearCache();
+    this.refreshStoreMetrics();
   }
 
   setRenderMetrics(renderedTiles: number, vertices: number, triangles: number): void {
@@ -219,8 +222,8 @@ export class TileManager {
     const config = this.requireConfig();
     return new LodBuilder(
       {
-        readTile: (key) => this.store.readTile(key, config.tileSize),
-        writeTile: (key, samples) => this.store.writeTile(key, samples)
+        readTile: (key) => this.store.readTile(key, config.tileSize, { cache: false }),
+        writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false })
       },
       config.tileSize,
       config.tilesPerSide

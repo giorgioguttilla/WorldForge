@@ -59,9 +59,13 @@ export class LodBuilder {
     for (let depth = 1; depth <= maxDepth; depth += 1) {
       const parents = this.getDirtyAncestors(dirtyTiles).filter((key) => key.d === depth);
       for (const parent of parents) {
-        const children = await Promise.all(childTileKeys(parent).map((child) => this.io.readTile(child)));
+        const children: Uint16Array[] = [];
+        for (const child of childTileKeys(parent)) {
+          children.push(await this.io.readTile(child));
+        }
         const downsampled = downsample2x2Children(this.tileSize, children);
         await this.io.writeTile(parent, downsampled);
+        children.length = 0;
         rebuilt += 1;
         onProgress?.(rebuilt);
       }
