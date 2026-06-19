@@ -22,7 +22,7 @@ export class EditorViewport {
     private readonly container: HTMLElement,
     private readonly manager: TileManager
   ) {
-    this.controller = new CameraController(canvas);
+    this.controller = new CameraController(canvas, manager);
     this.terrain = new TerrainQuadtreeRenderer(manager);
   }
 

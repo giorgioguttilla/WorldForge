@@ -191,7 +191,7 @@
   const modes: { id: ViewMode; label: string; icon: typeof Crosshair; disabled?: boolean }[] = [
     { id: 'free', label: 'Free camera', icon: Navigation },
     { id: 'ortho', label: 'Ortho top down', icon: Map },
-    { id: 'character', label: 'Character stub', icon: UserRound, disabled: false }
+    { id: 'character', label: 'Character controller', icon: UserRound, disabled: false }
   ];
 
   const visualizations: { id: VisualizationMode; label: string; icon: typeof Crosshair }[] = [

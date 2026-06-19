@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createWorldConfig, getWorldAreaSquareMiles, getWorldLinearSize, isPowerOfTwo, normalizeWorldConfig, r16ToElevation, validateWorldConfig } from './worldConfig';
+import { createWorldConfig, getWorldAreaSquareMiles, getWorldLinearSize, isPowerOfTwo, metersToWorldUnits, normalizeWorldConfig, r16ToElevation, validateWorldConfig } from './worldConfig';
 
 describe('world config', () => {
   it('validates power-of-two sizing', () => {
@@ -47,6 +47,11 @@ describe('world config', () => {
   it('maps R16 values into the configured overall world height', () => {
     expect(r16ToElevation(65535, 3000)).toBe(3000);
     expect(r16ToElevation(0, 3000)).toBe(0);
+  });
+
+  it('converts meters into active world units', () => {
+    expect(metersToWorldUnits(2, { unit: 'meter' })).toBe(2);
+    expect(metersToWorldUnits(2, { unit: 'cm' })).toBe(200);
   });
 
   it('normalizes legacy maxElevation configs to worldHeight', () => {

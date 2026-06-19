@@ -3,7 +3,7 @@ import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './g
 import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
-import { createWorldConfig, getMaxLodDepth, normalizeWorldConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
+import { createWorldConfig, getMaxLodDepth, normalizeWorldConfig, r16ToElevation, type WorldConfig, type WorldConfigInput } from './worldConfig';
 
 export interface EditorMetrics extends TileMetricsSnapshot {
   renderedTiles: number;
@@ -189,6 +189,36 @@ export class TileManager {
     const samples = await this.store.readTile(key, config.tileSize);
     this.refreshStoreMetrics();
     return samples;
+  }
+
+  async sampleHeightAtWorld(worldX: number, worldZ: number): Promise<number | null> {
+    const config = this.requireConfig();
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    const localX = worldX + worldSize / 2;
+    const localZ = worldZ + worldSize / 2;
+    if (localX < 0 || localZ < 0 || localX > worldSize || localZ > worldSize) return null;
+
+    const pixelX = Math.min(config.tileSize * config.tilesPerSide - 1.001, localX / config.unitSize);
+    const pixelY = Math.min(config.tileSize * config.tilesPerSide - 1.001, localZ / config.unitSize);
+    const tileX = Math.floor(pixelX / config.tileSize);
+    const tileY = Math.floor(pixelY / config.tileSize);
+    const sampleX = pixelX - tileX * config.tileSize;
+    const sampleY = pixelY - tileY * config.tileSize;
+    const samples = await this.readTile({ x: tileX, y: tileY, d: 0 });
+
+    const x0 = Math.max(0, Math.min(config.tileSize - 1, Math.floor(sampleX)));
+    const y0 = Math.max(0, Math.min(config.tileSize - 1, Math.floor(sampleY)));
+    const x1 = Math.min(config.tileSize - 1, x0 + 1);
+    const y1 = Math.min(config.tileSize - 1, y0 + 1);
+    const tx = sampleX - x0;
+    const ty = sampleY - y0;
+    const h00 = samples[y0 * config.tileSize + x0];
+    const h10 = samples[y0 * config.tileSize + x1];
+    const h01 = samples[y1 * config.tileSize + x0];
+    const h11 = samples[y1 * config.tileSize + x1];
+    const top = h00 + (h10 - h00) * tx;
+    const bottom = h01 + (h11 - h01) * tx;
+    return r16ToElevation(top + (bottom - top) * ty, config.worldHeight);
   }
 
   async exportToDirectory(directory: FileSystemDirectoryHandle): Promise<void> {

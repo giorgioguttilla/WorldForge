@@ -96,3 +96,12 @@ export function getMaxLodDepth(tilesPerSide: number): number {
 export function r16ToElevation(value: number, worldHeight: number): number {
   return (value / 65535) * worldHeight;
 }
+
+export function metersToWorldUnits(meters: number, config: Pick<WorldConfigInput, 'unit'>): number {
+  const unitsPerMeter: Record<WorldUnit, number> = {
+    foot: 3.280839895,
+    meter: 1,
+    cm: 100
+  };
+  return meters * unitsPerMeter[config.unit];
+}
