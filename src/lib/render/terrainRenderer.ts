@@ -9,17 +9,31 @@ interface TerrainNode {
   inUse: boolean;
 }
 
+interface TileBounds {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  centerX: number;
+  centerZ: number;
+  size: number;
+}
+
 export class TerrainQuadtreeRenderer {
   readonly group = new THREE.Group();
   wireframe = false;
 
   private readonly pool: TerrainNode[] = [];
   private readonly active = new Map<string, TerrainNode>();
-  private readonly maxVisibleTiles = 64;
   private updateQueued = false;
   private lastSelectionId = '';
+  private viewportHeight = 720;
 
   constructor(private readonly manager: TileManager) {}
+
+  setViewportSize(_width: number, height: number): void {
+    this.viewportHeight = Math.max(1, height);
+  }
 
   async update(camera: THREE.Camera): Promise<void> {
     if (this.updateQueued) return;
@@ -87,33 +101,89 @@ export class TerrainQuadtreeRenderer {
     this.manager.setRenderMetrics(0, 0, 0);
   }
 
-  private selectTiles(config: WorldConfig, camera: THREE.Camera): TileKey[] {
-    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
-    let depth: number;
+  setWireframe(enabled: boolean): void {
+    this.wireframe = enabled;
+    for (const node of this.pool) {
+      node.mesh.material.wireframe = enabled;
+      node.mesh.material.needsUpdate = true;
+    }
+  }
 
+  private selectTiles(config: WorldConfig, camera: THREE.Camera): TileKey[] {
+    const maxDepth = Math.log2(config.tilesPerSide);
+    const keys: TileKey[] = [];
+    const root: TileKey = { x: 0, y: 0, d: maxDepth };
+    const visit = (key: TileKey): void => {
+      const bounds = this.getTileBounds(config, key);
+      if (!this.shouldRenderTile(bounds, camera)) return;
+      if (key.d > 0 && this.shouldSubdivide(config, key, bounds, camera)) {
+        const childDepth = key.d - 1;
+        const childX = key.x * 2;
+        const childY = key.y * 2;
+        visit({ x: childX, y: childY, d: childDepth });
+        visit({ x: childX + 1, y: childY, d: childDepth });
+        visit({ x: childX, y: childY + 1, d: childDepth });
+        visit({ x: childX + 1, y: childY + 1, d: childDepth });
+        return;
+      }
+      keys.push(key);
+    };
+
+    visit(root);
+    return keys.sort((a, b) => b.d - a.d || a.y - b.y || a.x - b.x);
+  }
+
+  private shouldRenderTile(bounds: TileBounds, camera: THREE.Camera): boolean {
+    if (!(camera instanceof THREE.OrthographicCamera)) return true;
+
+    const visibleHeight = (camera.top - camera.bottom) / Math.max(camera.zoom, 0.0001);
+    const visibleWidth = (camera.right - camera.left) / Math.max(camera.zoom, 0.0001);
+    const margin = bounds.size * 0.15;
+    const minX = camera.position.x - visibleWidth / 2 - margin;
+    const maxX = camera.position.x + visibleWidth / 2 + margin;
+    const minZ = camera.position.z - visibleHeight / 2 - margin;
+    const maxZ = camera.position.z + visibleHeight / 2 + margin;
+
+    return bounds.maxX >= minX && bounds.minX <= maxX && bounds.maxZ >= minZ && bounds.minZ <= maxZ;
+  }
+
+  private shouldSubdivide(config: WorldConfig, key: TileKey, bounds: TileBounds, camera: THREE.Camera): boolean {
+    if (key.d <= 0) return false;
     if (camera instanceof THREE.OrthographicCamera) {
       const visibleHeight = (camera.top - camera.bottom) / Math.max(camera.zoom, 0.0001);
-      const targetTileWorldSize = Math.max(1, visibleHeight / 2.6);
-      depth = Math.floor(Math.log2(targetTileWorldSize / (config.tileSize * config.unitSize)));
-    } else {
-      const position = camera.position;
-      const distance = Math.max(Math.abs(position.x), Math.abs(position.z), position.y);
-      depth = 0;
-      if (distance > worldSize * 1.2) depth = 2;
-      else if (distance > worldSize * 0.55) depth = 1;
+      const tileScreenPx = (bounds.size / visibleHeight) * this.viewportHeight;
+      return tileScreenPx > 620;
     }
 
-    depth = Math.max(0, depth);
-    depth = Math.min(depth, Math.log2(config.tilesPerSide));
+    const distance = Math.max(1, this.distanceToBounds(camera.position.x, camera.position.z, bounds));
+    const perspective = camera as THREE.PerspectiveCamera;
+    const visibleWorldHeight = 2 * distance * Math.tan(THREE.MathUtils.degToRad(perspective.fov) / 2);
+    const tileScreenPx = (bounds.size / Math.max(1, visibleWorldHeight)) * this.viewportHeight;
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    const nearBias = distance < worldSize * 0.42;
+    return tileScreenPx > (nearBias ? 420 : 560);
+  }
 
-    const side = config.tilesPerSide / 2 ** depth;
-    const keys: TileKey[] = [];
-    for (let y = 0; y < side; y += 1) {
-      for (let x = 0; x < side; x += 1) {
-        keys.push({ x, y, d: depth });
-      }
-    }
-    return keys.slice(0, this.maxVisibleTiles);
+  private getTileBounds(config: WorldConfig, key: TileKey): TileBounds {
+    const size = config.tileSize * config.unitSize * 2 ** key.d;
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    const minX = key.x * size - worldSize / 2;
+    const minZ = key.y * size - worldSize / 2;
+    return {
+      minX,
+      minZ,
+      maxX: minX + size,
+      maxZ: minZ + size,
+      centerX: minX + size / 2,
+      centerZ: minZ + size / 2,
+      size
+    };
+  }
+
+  private distanceToBounds(x: number, z: number, bounds: TileBounds): number {
+    const dx = x < bounds.minX ? bounds.minX - x : x > bounds.maxX ? x - bounds.maxX : 0;
+    const dz = z < bounds.minZ ? bounds.minZ - z : z > bounds.maxZ ? z - bounds.maxZ : 0;
+    return Math.hypot(dx, dz);
   }
 
   private acquireNode(id: string, config: WorldConfig, visible = true): TerrainNode {
@@ -123,6 +193,7 @@ export class TerrainQuadtreeRenderer {
       unused.key = id;
       unused.mesh.visible = visible;
       unused.mesh.material.wireframe = this.wireframe;
+      unused.mesh.material.needsUpdate = true;
       return unused;
     }
 
@@ -167,6 +238,7 @@ export class TerrainQuadtreeRenderer {
     node.mesh.position.set(originX, 0, originZ);
     node.mesh.scale.set(2 ** key.d, 1, 2 ** key.d);
     node.mesh.material.wireframe = this.wireframe;
+    node.mesh.material.needsUpdate = true;
     node.mesh.visible = false;
   }
 

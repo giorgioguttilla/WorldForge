@@ -1,9 +1,9 @@
 import { LodBuilder } from './lodBuilder';
-import { generateNoiseTile } from './noise';
+import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './gpuHeightmapCompute';
 import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
-import { createWorldConfig, getMaxLodDepth, type WorldConfig, type WorldConfigInput } from './worldConfig';
+import { createWorldConfig, getMaxLodDepth, normalizeWorldConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
 
 export interface EditorMetrics extends TileMetricsSnapshot {
   renderedTiles: number;
@@ -11,8 +11,16 @@ export interface EditorMetrics extends TileMetricsSnapshot {
   vertices: number;
   ramUsedMb: number;
   ramLimitMb: number;
+  computeBackend: string;
   lodRebuildMs: number;
   lastGeneratedTiles: number;
+}
+
+export interface BulkProgress {
+  phase: 'generating' | 'building-lod';
+  current: number;
+  total: number;
+  label: string;
 }
 
 export class TileManager {
@@ -27,20 +35,27 @@ export class TileManager {
     vertices: 0,
     ramUsedMb: 0,
     ramLimitMb: 0,
+    computeBackend: 'initializing',
     lodRebuildMs: 0,
     lastGeneratedTiles: 0
   };
+  private computeBackend: HeightmapComputeBackend | null = null;
 
   constructor(store = new HeightmapTileStore()) {
     this.store = store;
   }
 
-  async createWorld(input: WorldConfigInput, options: { replaceProjectId?: string } = {}): Promise<WorldConfig> {
+  async initializeComputeBackend(): Promise<string> {
+    return (await this.getComputeBackend()).label;
+  }
+
+  async createWorld(input: WorldConfigInput, options: { replaceProjectId?: string; onProgress?: (progress: BulkProgress) => void } = {}): Promise<WorldConfig> {
     if (options.replaceProjectId) {
       await this.deleteProject(options.replaceProjectId);
     }
 
     const config = createWorldConfig(input);
+    const compute = await this.getComputeBackend();
     await this.store.openProject(config.id);
     await this.store.writeConfig(config);
     await this.registerProject(config);
@@ -48,19 +63,34 @@ export class TileManager {
 
     const dirty: TileKey[] = [];
     let generated = 0;
+    const fullTileCount = config.tilesPerSide * config.tilesPerSide;
+    const lodTileCount = this.countLodTiles(config.tilesPerSide);
     for (let y = 0; y < config.tilesPerSide; y += 1) {
       for (let x = 0; x < config.tilesPerSide; x += 1) {
         const key = { x, y, d: 0 };
-        const samples = generateNoiseTile(config.tileSize, x, y, 137);
+        const samples = await compute.generateNoiseTile(config.tileSize, x, y, 137);
         await this.store.writeTile(key, samples);
         dirty.push(key);
         generated += 1;
+        options.onProgress?.({
+          phase: 'generating',
+          current: generated,
+          total: fullTileCount,
+          label: `Generating height tiles ${generated} / ${fullTileCount}`
+        });
       }
     }
 
     const start = performance.now();
     const lodBuilder = this.createLodBuilder();
-    await lodBuilder.rebuildFromDirty(dirty);
+    await lodBuilder.rebuildFromDirty(dirty, (rebuilt) => {
+      options.onProgress?.({
+        phase: 'building-lod',
+        current: rebuilt,
+        total: lodTileCount,
+        label: `Building LOD tiles ${rebuilt} / ${lodTileCount}`
+      });
+    });
     this.metrics.lodRebuildMs = performance.now() - start;
     this.metrics.lastGeneratedTiles = generated;
     this.refreshStoreMetrics();
@@ -75,7 +105,7 @@ export class TileManager {
     const projects = await opfsRoot.getDirectoryHandle('worldforge-projects', { create: true });
     try {
       const file = await (await projects.getFileHandle('index.json')).getFile();
-      return JSON.parse(await file.text()) as WorldConfig[];
+      return (JSON.parse(await file.text()) as WorldConfig[]).map((project) => normalizeWorldConfig(project));
     } catch {
       return [];
     }
@@ -85,9 +115,21 @@ export class TileManager {
     await this.store.openProject(projectId);
     const config = await this.store.readConfig();
     this.config = config;
+    localStorage.setItem('worldforge:lastProjectId', config.id);
     this.store.clearCache();
     this.refreshStoreMetrics();
     return config;
+  }
+
+  async openLastProject(): Promise<WorldConfig | null> {
+    const projectId = localStorage.getItem('worldforge:lastProjectId');
+    if (!projectId) return null;
+    try {
+      return await this.openProject(projectId);
+    } catch {
+      localStorage.removeItem('worldforge:lastProjectId');
+      return null;
+    }
   }
 
   async deleteProject(projectId: string): Promise<void> {
@@ -129,9 +171,14 @@ export class TileManager {
         vertices: 0,
         ramUsedMb: 0,
         ramLimitMb: 0,
+        computeBackend: this.computeBackend?.label ?? 'initializing',
         lodRebuildMs: 0,
         lastGeneratedTiles: 0
       };
+    }
+
+    if (localStorage.getItem('worldforge:lastProjectId') === projectId) {
+      localStorage.removeItem('worldforge:lastProjectId');
     }
   }
 
@@ -185,6 +232,21 @@ export class TileManager {
     const memory = (performance as Performance & { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
     this.metrics.ramUsedMb = memory ? memory.usedJSHeapSize / 1024 / 1024 : 0;
     this.metrics.ramLimitMb = memory ? memory.jsHeapSizeLimit / 1024 / 1024 : 0;
+    this.metrics.computeBackend = this.computeBackend?.label ?? this.metrics.computeBackend;
+  }
+
+  private async getComputeBackend(): Promise<HeightmapComputeBackend> {
+    this.computeBackend ??= await createHeightmapComputeBackend();
+    this.metrics.computeBackend = this.computeBackend.label;
+    return this.computeBackend;
+  }
+
+  private countLodTiles(tilesPerSide: number): number {
+    let total = 0;
+    for (let side = tilesPerSide / 2; side >= 1; side /= 2) {
+      total += side * side;
+    }
+    return total;
   }
 
   private requireConfig(): WorldConfig {
@@ -225,5 +287,6 @@ export class TileManager {
     const writable = await handle.createWritable({ keepExistingData: false });
     await writable.write(JSON.stringify(next, null, 2));
     await writable.close();
+    localStorage.setItem('worldforge:lastProjectId', config.id);
   }
 }

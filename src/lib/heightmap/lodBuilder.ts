@@ -52,7 +52,7 @@ export class LodBuilder {
     return [...unique.values()].sort((a, b) => a.d - b.d || a.y - b.y || a.x - b.x);
   }
 
-  async rebuildFromDirty(dirtyTiles: TileKey[]): Promise<number> {
+  async rebuildFromDirty(dirtyTiles: TileKey[], onProgress?: (rebuilt: number) => void): Promise<number> {
     const maxDepth = getMaxLodDepth(this.fullTilesPerSide);
     let rebuilt = 0;
 
@@ -63,6 +63,7 @@ export class LodBuilder {
         const downsampled = downsample2x2Children(this.tileSize, children);
         await this.io.writeTile(parent, downsampled);
         rebuilt += 1;
+        onProgress?.(rebuilt);
       }
     }
 

@@ -54,11 +54,7 @@ export class EditorViewport {
   }
 
   setWireframe(enabled: boolean): void {
-    this.terrain.wireframe = enabled;
-    for (const child of this.terrain.group.children) {
-      const mesh = child as THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
-      if (mesh.material) mesh.material.wireframe = enabled;
-    }
+    this.terrain.setWireframe(enabled);
   }
 
   resize(): void {
@@ -66,6 +62,7 @@ export class EditorViewport {
     const height = this.container.clientHeight;
     this.rendererAdapter?.renderer.setSize(width, height, false);
     this.controller.resize(width, height);
+    this.terrain.setViewportSize(width, height);
   }
 
   dispose(): void {

@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { Crosshair, Download, Eye, FolderOpen, Map, Mountain, Navigation, Plus, UserRound } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldLinearSize, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
-  import { TileManager, type EditorMetrics } from './lib/heightmap/tileManager';
+  import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
 
@@ -12,9 +12,10 @@
   const manager = new TileManager();
 
   let worldInput: WorldConfigInput = { ...DEFAULT_WORLD_INPUT };
-  let showDialog = true;
+  let showDialog = false;
   let replacingExistingWorld = false;
   let confirmedReplace = false;
+  let restoring = true;
   let creating = false;
   let exporting = false;
   let opening = false;
@@ -24,14 +25,19 @@
   let wireframe = false;
   let metrics: EditorMetrics = { ...manager.metrics };
   let configErrors: string[] = [];
+  let bulkProgress: BulkProgress | null = null;
 
   $: totalWorldSize = getWorldLinearSize(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
+  $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
 
   onMount(async () => {
     viewport = new EditorViewport(canvas, container, manager);
     await viewport.init();
     backend = viewport.backend;
+    await manager.initializeComputeBackend();
+    metrics = { ...manager.metrics };
+    await restoreLastWorld();
 
     const resizeObserver = new ResizeObserver(() => viewport?.resize());
     resizeObserver.observe(container);
@@ -68,14 +74,22 @@
     if (configErrors.length > 0) return;
     if (replacingExistingWorld && !confirmedReplace) return;
     creating = true;
+    bulkProgress = { phase: 'generating', current: 0, total: 1, label: 'Preparing world generation' };
     status = 'Generating raw R16 tiles and LODs...';
     try {
       const replaceProjectId = replacingExistingWorld ? manager.config?.id : undefined;
       viewport?.terrain.clear();
-      await manager.createWorld(worldInput, { replaceProjectId });
+      await manager.createWorld(worldInput, {
+        replaceProjectId,
+        onProgress: (progress) => {
+          bulkProgress = progress;
+          status = progress.label;
+        }
+      });
       showDialog = false;
       replacingExistingWorld = false;
       confirmedReplace = false;
+      bulkProgress = null;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
       await viewport?.terrain.update(viewport.controller.activeCamera);
@@ -83,6 +97,29 @@
       status = error instanceof Error ? error.message : 'World creation failed.';
     } finally {
       creating = false;
+      bulkProgress = null;
+    }
+  }
+
+  async function restoreLastWorld() {
+    restoring = true;
+    status = 'Restoring last OPFS world...';
+    try {
+      const restored = await manager.openLastProject();
+      if (!restored) {
+        showDialog = true;
+        status = 'Create a world to begin.';
+        return;
+      }
+      showDialog = false;
+      status = `Editing ${restored.name}.`;
+      metrics = { ...manager.metrics };
+      await viewport?.terrain.update(viewport.controller.activeCamera);
+    } catch (error) {
+      showDialog = true;
+      status = error instanceof Error ? error.message : 'Create a world to begin.';
+    } finally {
+      restoring = false;
     }
   }
 
@@ -191,6 +228,7 @@
     <div class="metric-title">Runtime</div>
     <dl>
       <div><dt>Backend</dt><dd>{backend}</dd></div>
+      <div><dt>Compute</dt><dd>{metrics.computeBackend}</dd></div>
       <div><dt>Tiles</dt><dd>{metrics.renderedTiles}</dd></div>
       <div><dt>Verts</dt><dd>{Math.round(metrics.vertices).toLocaleString()}</dd></div>
       <div><dt>Tris</dt><dd>{Math.round(metrics.triangles).toLocaleString()}</dd></div>
@@ -203,6 +241,13 @@
   </section>
 
   <div class="status">{status}</div>
+
+  {#if bulkProgress || restoring}
+    <div class="progress-panel" aria-label="Bulk operation progress">
+      <div>{bulkProgress?.label ?? 'Restoring world'}</div>
+      <div class="progress-track"><span style={`width: ${restoring ? 38 : bulkProgressPercent}%`}></span></div>
+    </div>
+  {/if}
 
   {#if showDialog}
     <div class="dialog-backdrop">
