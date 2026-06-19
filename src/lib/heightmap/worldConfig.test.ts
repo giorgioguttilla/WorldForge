@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createWorldConfig, getWorldLinearSize, isPowerOfTwo, normalizeWorldConfig, r16ToElevation, validateWorldConfig } from './worldConfig';
+import { createWorldConfig, getWorldAreaSquareMiles, getWorldLinearSize, isPowerOfTwo, normalizeWorldConfig, r16ToElevation, validateWorldConfig } from './worldConfig';
 
 describe('world config', () => {
   it('validates power-of-two sizing', () => {
@@ -20,6 +20,10 @@ describe('world config', () => {
 
   it('computes linear world size from tile count and unit size', () => {
     expect(getWorldLinearSize({ tileSize: 1024, tilesPerSide: 8, unitSize: 0.5 })).toBe(4096);
+  });
+
+  it('computes world area in square miles', () => {
+    expect(getWorldAreaSquareMiles({ tileSize: 5280, tilesPerSide: 2, unitSize: 1, unit: 'foot' })).toBe(4);
   });
 
   it('creates a normalized versioned config', () => {

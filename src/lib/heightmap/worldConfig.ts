@@ -75,6 +75,17 @@ export function getWorldLinearSize(config: Pick<WorldConfigInput, 'tileSize' | '
   return config.tileSize * config.tilesPerSide * config.unitSize;
 }
 
+export function getWorldAreaSquareMiles(config: Pick<WorldConfigInput, 'tileSize' | 'tilesPerSide' | 'unitSize' | 'unit'>): number {
+  const linearSize = getWorldLinearSize(config);
+  const feetPerUnit: Record<WorldUnit, number> = {
+    foot: 1,
+    meter: 3.280839895,
+    cm: 0.03280839895
+  };
+  const milesPerSide = (linearSize * feetPerUnit[config.unit]) / 5280;
+  return milesPerSide * milesPerSide;
+}
+
 export function getMaxLodDepth(tilesPerSide: number): number {
   if (!isPowerOfTwo(tilesPerSide)) {
     throw new Error('LOD depth requires a power-of-two tile count.');

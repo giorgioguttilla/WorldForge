@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { TileManager } from '../heightmap/tileManager';
 import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
-import { TerrainQuadtreeRenderer } from './terrainRenderer';
+import { TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
 
 export class EditorViewport {
   readonly controller: CameraController;
@@ -53,8 +53,8 @@ export class EditorViewport {
     this.controller.setMode(mode);
   }
 
-  setWireframe(enabled: boolean): void {
-    this.terrain.setWireframe(enabled);
+  setVisualizationMode(mode: VisualizationMode): void {
+    this.terrain.setVisualizationMode(mode);
   }
 
   resize(): void {

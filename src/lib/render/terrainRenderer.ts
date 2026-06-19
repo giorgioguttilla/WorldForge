@@ -3,6 +3,13 @@ import type { TileManager } from '../heightmap/tileManager';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
 import type { TileKey } from '../heightmap/tileKey';
 
+export type VisualizationMode = 'wireframe' | 'topo' | 'render';
+
+const TOPO_LOW = new THREE.Color(0x173824);
+const TOPO_MID = new THREE.Color(0x5aa36e);
+const TOPO_HIGH = new THREE.Color(0xe4f6bc);
+const TOPO_COLOR = new THREE.Color();
+
 interface TerrainNode {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
   key: string;
@@ -21,7 +28,7 @@ interface TileBounds {
 
 export class TerrainQuadtreeRenderer {
   readonly group = new THREE.Group();
-  wireframe = false;
+  visualizationMode: VisualizationMode = 'topo';
 
   private readonly pool: TerrainNode[] = [];
   private readonly active = new Map<string, TerrainNode>();
@@ -105,11 +112,10 @@ export class TerrainQuadtreeRenderer {
     this.manager.setRenderMetrics(0, 0, 0);
   }
 
-  setWireframe(enabled: boolean): void {
-    this.wireframe = enabled;
+  setVisualizationMode(mode: VisualizationMode): void {
+    this.visualizationMode = mode;
     for (const node of this.pool) {
-      node.mesh.material.wireframe = enabled;
-      node.mesh.material.needsUpdate = true;
+      this.applyVisualizationMode(node.mesh.material);
     }
   }
 
@@ -196,8 +202,7 @@ export class TerrainQuadtreeRenderer {
       unused.inUse = true;
       unused.key = id;
       unused.mesh.visible = visible;
-      unused.mesh.material.wireframe = this.wireframe;
-      unused.mesh.material.needsUpdate = true;
+      this.applyVisualizationMode(unused.mesh.material);
       return unused;
     }
 
@@ -205,11 +210,11 @@ export class TerrainQuadtreeRenderer {
     const geometry = new THREE.PlaneGeometry(config.tileSize * config.unitSize, config.tileSize * config.unitSize, segments, segments);
     geometry.rotateX(-Math.PI / 2);
     const material = new THREE.MeshStandardMaterial({
-      color: 0x7db294,
+      color: 0xffffff,
       roughness: 0.88,
-      metalness: 0.02,
-      wireframe: this.wireframe
+      metalness: 0.02
     });
+    this.applyVisualizationMode(material);
     const mesh = new THREE.Mesh(geometry, material);
     mesh.frustumCulled = false;
     this.group.add(mesh);
@@ -223,6 +228,7 @@ export class TerrainQuadtreeRenderer {
     const samples = await this.manager.readTile(key);
     const geometry = node.mesh.geometry;
     const positions = geometry.attributes.position as THREE.BufferAttribute;
+    const colors = this.ensureColorAttribute(geometry);
     const tileWorldSize = config.tileSize * config.unitSize * 2 ** key.d;
     const originX = (key.x + 0.5) * tileWorldSize - (config.tilesPerSide * config.tileSize * config.unitSize) / 2;
     const originZ = (key.y + 0.5) * tileWorldSize - (config.tilesPerSide * config.tileSize * config.unitSize) / 2;
@@ -234,15 +240,18 @@ export class TerrainQuadtreeRenderer {
       const v = Math.max(0, Math.min(1, localZ / (config.tileSize * config.unitSize) + 0.5));
       const sx = Math.min(config.tileSize - 1, Math.floor(u * (config.tileSize - 1)));
       const sy = Math.min(config.tileSize - 1, Math.floor(v * (config.tileSize - 1)));
-      positions.setY(i, r16ToElevation(samples[sy * config.tileSize + sx], config.worldHeight));
+      const rawHeight = samples[sy * config.tileSize + sx];
+      const height01 = rawHeight / 65535;
+      positions.setY(i, r16ToElevation(rawHeight, config.worldHeight));
+      this.setTopoColor(colors, i, height01);
     }
 
     positions.needsUpdate = true;
+    colors.needsUpdate = true;
     geometry.computeVertexNormals();
     node.mesh.position.set(originX, 0, originZ);
     node.mesh.scale.set(2 ** key.d, 1, 2 ** key.d);
-    node.mesh.material.wireframe = this.wireframe;
-    node.mesh.material.needsUpdate = true;
+    this.applyVisualizationMode(node.mesh.material);
     node.mesh.visible = false;
   }
 
@@ -264,5 +273,33 @@ export class TerrainQuadtreeRenderer {
       node.mesh.material.dispose();
       this.pool.splice(i, 1);
     }
+  }
+
+  private applyVisualizationMode(material: THREE.MeshStandardMaterial): void {
+    material.wireframe = this.visualizationMode === 'wireframe';
+    material.vertexColors = this.visualizationMode === 'topo';
+    material.color.set(this.visualizationMode === 'render' ? 0xf4f3ee : 0xdff8e9);
+    material.roughness = this.visualizationMode === 'render' ? 0.96 : 0.82;
+    material.metalness = 0;
+    material.needsUpdate = true;
+  }
+
+  private ensureColorAttribute(geometry: THREE.PlaneGeometry): THREE.BufferAttribute {
+    const existing = geometry.getAttribute('color') as THREE.BufferAttribute | undefined;
+    if (existing) return existing;
+    const colors = new Float32Array(geometry.attributes.position.count * 3);
+    const attribute = new THREE.BufferAttribute(colors, 3);
+    geometry.setAttribute('color', attribute);
+    return attribute;
+  }
+
+  private setTopoColor(colors: THREE.BufferAttribute, index: number, height01: number): void {
+    const t = THREE.MathUtils.clamp(height01, 0, 1);
+    if (t < 0.62) {
+      TOPO_COLOR.copy(TOPO_LOW).lerp(TOPO_MID, t / 0.62);
+    } else {
+      TOPO_COLOR.copy(TOPO_MID).lerp(TOPO_HIGH, (t - 0.62) / 0.38);
+    }
+    colors.setXYZ(index, TOPO_COLOR.r, TOPO_COLOR.g, TOPO_COLOR.b);
   }
 }

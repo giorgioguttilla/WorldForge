@@ -71,6 +71,7 @@ button:disabled {
 .brand,
 .toolbar,
 .mode-stack,
+.visual-stack,
 .metrics,
 .status,
 .world-dialog {
@@ -100,7 +101,8 @@ button:disabled {
 }
 
 .toolbar button,
-.mode-stack button {
+.mode-stack button,
+.visual-stack button {
   width: 34px;
   height: 34px;
   display: grid;
@@ -109,20 +111,29 @@ button:disabled {
 }
 
 .toolbar button.active,
-.mode-stack button.active {
+.mode-stack button.active,
+.visual-stack button.active {
   border-color: rgba(125, 178, 148, 0.72);
   background: rgba(60, 117, 84, 0.5);
   color: #dff8e9;
 }
 
-.mode-stack {
+.mode-stack,
+.visual-stack {
   position: absolute;
   left: 14px;
-  top: 68px;
   display: grid;
   gap: 6px;
   padding: 6px;
   border-radius: 8px;
+}
+
+.mode-stack {
+  top: 68px;
+}
+
+.visual-stack {
+  top: 202px;
 }
 
 .metrics {

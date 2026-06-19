@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { Crosshair, Download, Eye, FolderOpen, Map, Mountain, Navigation, Plus, UserRound } from '@lucide/svelte';
-  import { DEFAULT_WORLD_INPUT, getWorldLinearSize, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
+  import { Crosshair, Download, FolderOpen, Map, Mountain, Navigation, Plus, Square, UserRound } from '@lucide/svelte';
+  import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
+  import type { VisualizationMode } from './lib/render/terrainRenderer';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -22,12 +23,12 @@
   let status = 'Create a world to begin.';
   let backend = 'initializing';
   let viewMode: ViewMode = 'free';
-  let wireframe = false;
+  let visualizationMode: VisualizationMode = 'topo';
   let metrics: EditorMetrics = { ...manager.metrics };
   let configErrors: string[] = [];
   let bulkProgress: BulkProgress | null = null;
 
-  $: totalWorldSize = getWorldLinearSize(worldInput);
+  $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
   $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
 
@@ -49,11 +50,6 @@
     const keyHandler = (event: KeyboardEvent) => {
       if (event.code === 'Escape' && showDialog && manager.config) {
         cancelWorldDialog();
-        return;
-      }
-      if (event.code === 'KeyL' && !event.repeat) {
-        wireframe = !wireframe;
-        viewport?.setWireframe(wireframe);
       }
     };
     window.addEventListener('keydown', keyHandler);
@@ -165,6 +161,11 @@
     viewport?.setMode(mode);
   }
 
+  function setVisualizationMode(mode: VisualizationMode) {
+    visualizationMode = mode;
+    viewport?.setVisualizationMode(mode);
+  }
+
   async function exportWorld() {
     if (!manager.config) {
       status = 'Create a world before exporting.';
@@ -192,6 +193,12 @@
     { id: 'ortho', label: 'Ortho top down', icon: Map },
     { id: 'character', label: 'Character stub', icon: UserRound, disabled: false }
   ];
+
+  const visualizations: { id: VisualizationMode; label: string; icon: typeof Crosshair }[] = [
+    { id: 'wireframe', label: 'Wireframe visualization', icon: Crosshair },
+    { id: 'topo', label: 'Topo visualization', icon: Mountain },
+    { id: 'render', label: 'Render visualization', icon: Square }
+  ];
 </script>
 
 <div class="app-shell" bind:this={container}>
@@ -203,9 +210,6 @@
       <button type="button" title="New world" onclick={newWorld}><Plus size={17} /></button>
       <button type="button" title="Open latest OPFS world" onclick={openLatestWorld} disabled={opening}><FolderOpen size={17} /></button>
       <button type="button" title="Export world" onclick={exportWorld} disabled={exporting || !manager.config}><Download size={17} /></button>
-      <button type="button" title="Wireframe toggle (L)" class:active={wireframe} onclick={() => { wireframe = !wireframe; viewport?.setWireframe(wireframe); }}>
-        <Eye size={17} />
-      </button>
     </div>
   </div>
 
@@ -220,6 +224,20 @@
         onclick={() => setViewMode(mode.id)}
       >
         <svelte:component this={mode.icon} size={18} />
+      </button>
+    {/each}
+  </div>
+
+  <div class="visual-stack" aria-label="Visualization mode">
+    {#each visualizations as visualization}
+      <button
+        type="button"
+        class:active={visualizationMode === visualization.id}
+        title={visualization.label}
+        aria-label={visualization.label}
+        onclick={() => setVisualizationMode(visualization.id)}
+      >
+        <svelte:component this={visualization.icon} size={18} />
       </button>
     {/each}
   </div>
@@ -307,8 +325,8 @@
         {/if}
 
         <label>
-          <span>Total world size</span>
-          <input readonly value={`${totalWorldSize.toLocaleString()} ${worldInput.unit} per side`} />
+          <span>Total world area</span>
+          <input readonly value={`${worldAreaSquareMiles.toLocaleString(undefined, { maximumFractionDigits: 2 })} sq mi`} />
         </label>
 
         {#if configErrors.length > 0}
