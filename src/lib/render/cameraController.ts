@@ -49,7 +49,8 @@ export class CameraController {
   }
 
   update(deltaSeconds: number): void {
-    const speed = this.mode === 'ortho' ? 1600 : 900;
+    const shiftMultiplier = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 4 : 1;
+    const speed = (this.mode === 'ortho' ? 1600 : 900) * shiftMultiplier;
     const amount = speed * deltaSeconds;
 
     if (this.mode === 'ortho') {
@@ -106,7 +107,8 @@ export class CameraController {
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
-    if (event.button !== 2) return;
+    if (event.button !== 0) return;
+    event.preventDefault();
     this.dragging = true;
     this.lastX = event.clientX;
     this.lastY = event.clientY;
@@ -121,7 +123,7 @@ export class CameraController {
     this.lastY = event.clientY;
 
     if (this.mode === 'ortho') {
-      const scale = 1 / Math.max(0.2, this.ortho.zoom);
+      const scale = 2 / Math.max(0.2, this.ortho.zoom);
       this.orthoTarget.x -= dx * scale;
       this.orthoTarget.z -= dy * scale;
       this.updateOrthoPosition();
