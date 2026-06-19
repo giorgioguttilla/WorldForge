@@ -84,7 +84,7 @@ export class EditorViewport {
     const delta = Math.min(0.1, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
     this.controller.update(delta);
-    if (this.frame % 20 === 0) void this.terrain.update(this.controller.activeCamera);
+    if (this.frame % 30 === 0) void this.terrain.update(this.controller.activeCamera);
     this.rendererAdapter?.renderer.render(this.scene, this.controller.activeCamera);
     this.frame += 1;
     this.stats.end();

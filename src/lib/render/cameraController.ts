@@ -63,8 +63,8 @@ export class CameraController {
 
     if (this.mode === 'character') return;
 
-    const forward = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw)).normalize();
-    const right = new THREE.Vector3(forward.z, 0, -forward.x).normalize();
+    const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)).normalize();
+    const right = new THREE.Vector3(-forward.z, 0, forward.x).normalize();
     if (this.keys.has('KeyW')) this.perspective.position.addScaledVector(forward, amount);
     if (this.keys.has('KeyS')) this.perspective.position.addScaledVector(forward, -amount);
     if (this.keys.has('KeyA')) this.perspective.position.addScaledVector(right, -amount);

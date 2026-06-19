@@ -38,9 +38,13 @@
 
     const metricsTimer = window.setInterval(() => {
       metrics = { ...manager.metrics };
-    }, 250);
+    }, 500);
 
     const keyHandler = (event: KeyboardEvent) => {
+      if (event.code === 'Escape' && showDialog && manager.config) {
+        cancelWorldDialog();
+        return;
+      }
       if (event.code === 'KeyL' && !event.repeat) {
         wireframe = !wireframe;
         viewport?.setWireframe(wireframe);
@@ -191,6 +195,7 @@
       <div><dt>Verts</dt><dd>{Math.round(metrics.vertices).toLocaleString()}</dd></div>
       <div><dt>Tris</dt><dd>{Math.round(metrics.triangles).toLocaleString()}</dd></div>
       <div><dt>Cache</dt><dd>{metrics.cachedTiles}</dd></div>
+      <div><dt>RAM</dt><dd>{metrics.ramLimitMb > 0 ? `${metrics.ramUsedMb.toFixed(0)} / ${metrics.ramLimitMb.toFixed(0)} MB` : 'n/a'}</dd></div>
       <div><dt>Read avg</dt><dd>{metrics.tileReadAvgMs.toFixed(1)} ms</dd></div>
       <div><dt>Write avg</dt><dd>{metrics.tileWriteAvgMs.toFixed(1)} ms</dd></div>
       <div><dt>LOD</dt><dd>{metrics.lodRebuildMs.toFixed(1)} ms</dd></div>

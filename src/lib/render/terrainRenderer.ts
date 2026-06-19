@@ -17,6 +17,7 @@ export class TerrainQuadtreeRenderer {
   private readonly active = new Map<string, TerrainNode>();
   private readonly maxVisibleTiles = 64;
   private updateQueued = false;
+  private lastSelectionId = '';
 
   constructor(private readonly manager: TileManager) {}
 
@@ -28,26 +29,40 @@ export class TerrainQuadtreeRenderer {
       if (!config) return;
 
       const keys = this.selectTiles(config, camera);
-      const wanted = new Set(keys.map((key) => `${key.d}:${key.x}:${key.y}`));
+      const nextSelectionId = keys.map((key) => `${key.d}:${key.x}:${key.y}`).join('|');
+      if (nextSelectionId === this.lastSelectionId) {
+        this.updateMetrics();
+        return;
+      }
+
+      const nextActive = new Map<string, TerrainNode>();
+      for (const key of keys) {
+        const id = `${key.d}:${key.x}:${key.y}`;
+        const existing = this.active.get(id);
+        if (existing) {
+          nextActive.set(id, existing);
+          continue;
+        }
+        const node = this.acquireNode(id, config, false);
+        await this.populateNode(node, key, config);
+        nextActive.set(id, node);
+      }
+
       for (const [id, node] of this.active) {
-        if (!wanted.has(id)) {
+        if (!nextActive.has(id)) {
           node.inUse = false;
           node.mesh.visible = false;
-          this.active.delete(id);
         }
       }
 
-      for (const key of keys) {
-        const id = `${key.d}:${key.x}:${key.y}`;
-        if (this.active.has(id)) continue;
-        const node = this.acquireNode(id, config);
+      this.active.clear();
+      for (const [id, node] of nextActive) {
+        node.inUse = true;
+        node.mesh.visible = true;
         this.active.set(id, node);
-        await this.populateNode(node, key, config);
       }
-
-      const vertices = [...this.active.values()].reduce((sum, node) => sum + node.mesh.geometry.attributes.position.count, 0);
-      const triangles = [...this.active.values()].reduce((sum, node) => sum + (node.mesh.geometry.index?.count ?? 0) / 3, 0);
-      this.manager.setRenderMetrics(this.active.size, vertices, triangles);
+      this.lastSelectionId = nextSelectionId;
+      this.updateMetrics();
     } finally {
       this.updateQueued = false;
     }
@@ -68,6 +83,7 @@ export class TerrainQuadtreeRenderer {
       node.mesh.visible = false;
     }
     this.active.clear();
+    this.lastSelectionId = '';
     this.manager.setRenderMetrics(0, 0, 0);
   }
 
@@ -77,7 +93,7 @@ export class TerrainQuadtreeRenderer {
 
     if (camera instanceof THREE.OrthographicCamera) {
       const visibleHeight = (camera.top - camera.bottom) / Math.max(camera.zoom, 0.0001);
-      const targetTileWorldSize = Math.max(1, visibleHeight / 6);
+      const targetTileWorldSize = Math.max(1, visibleHeight / 2.6);
       depth = Math.floor(Math.log2(targetTileWorldSize / (config.tileSize * config.unitSize)));
     } else {
       const position = camera.position;
@@ -100,12 +116,12 @@ export class TerrainQuadtreeRenderer {
     return keys.slice(0, this.maxVisibleTiles);
   }
 
-  private acquireNode(id: string, config: WorldConfig): TerrainNode {
+  private acquireNode(id: string, config: WorldConfig, visible = true): TerrainNode {
     const unused = this.pool.find((node) => !node.inUse);
     if (unused) {
       unused.inUse = true;
       unused.key = id;
-      unused.mesh.visible = true;
+      unused.mesh.visible = visible;
       unused.mesh.material.wireframe = this.wireframe;
       return unused;
     }
@@ -122,6 +138,7 @@ export class TerrainQuadtreeRenderer {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.frustumCulled = false;
     this.group.add(mesh);
+    mesh.visible = visible;
     const node = { mesh, key: id, inUse: true };
     this.pool.push(node);
     return node;
@@ -150,6 +167,12 @@ export class TerrainQuadtreeRenderer {
     node.mesh.position.set(originX, 0, originZ);
     node.mesh.scale.set(2 ** key.d, 1, 2 ** key.d);
     node.mesh.material.wireframe = this.wireframe;
-    node.mesh.visible = true;
+    node.mesh.visible = false;
+  }
+
+  private updateMetrics(): void {
+    const vertices = [...this.active.values()].reduce((sum, node) => sum + node.mesh.geometry.attributes.position.count, 0);
+    const triangles = [...this.active.values()].reduce((sum, node) => sum + (node.mesh.geometry.index?.count ?? 0) / 3, 0);
+    this.manager.setRenderMetrics(this.active.size, vertices, triangles);
   }
 }

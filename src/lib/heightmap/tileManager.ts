@@ -9,6 +9,8 @@ export interface EditorMetrics extends TileMetricsSnapshot {
   renderedTiles: number;
   triangles: number;
   vertices: number;
+  ramUsedMb: number;
+  ramLimitMb: number;
   lodRebuildMs: number;
   lastGeneratedTiles: number;
 }
@@ -23,6 +25,8 @@ export class TileManager {
     renderedTiles: 0,
     triangles: 0,
     vertices: 0,
+    ramUsedMb: 0,
+    ramLimitMb: 0,
     lodRebuildMs: 0,
     lastGeneratedTiles: 0
   };
@@ -123,6 +127,8 @@ export class TileManager {
         renderedTiles: 0,
         triangles: 0,
         vertices: 0,
+        ramUsedMb: 0,
+        ramLimitMb: 0,
         lodRebuildMs: 0,
         lastGeneratedTiles: 0
       };
@@ -176,6 +182,9 @@ export class TileManager {
 
   private refreshStoreMetrics(): void {
     Object.assign(this.metrics, this.store.getMetrics());
+    const memory = (performance as Performance & { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
+    this.metrics.ramUsedMb = memory ? memory.usedJSHeapSize / 1024 / 1024 : 0;
+    this.metrics.ramLimitMb = memory ? memory.jsHeapSizeLimit / 1024 / 1024 : 0;
   }
 
   private requireConfig(): WorldConfig {
