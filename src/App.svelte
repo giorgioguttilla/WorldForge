@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { Crosshair, Download, FolderOpen, Map, Mountain, Navigation, Plus, Square, UserRound } from '@lucide/svelte';
+  import { CircleDot, Crosshair, Download, FolderOpen, Grid3X3, Map, Mountain, Navigation, Plus, Settings, UserRound } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
-  import { EditorViewport } from './lib/render/editorViewport';
+  import { EditorViewport, type HoverCoordinates } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
   import type { VisualizationMode } from './lib/render/terrainRenderer';
 
@@ -24,6 +24,10 @@
   let backend = 'initializing';
   let viewMode: ViewMode = 'free';
   let visualizationMode: VisualizationMode = 'topo';
+  let showRenderSettings = false;
+  let showWater = false;
+  let waterLevel = 0;
+  let hoverCoordinates: HoverCoordinates | null = null;
   let metrics: EditorMetrics = { ...manager.metrics };
   let configErrors: string[] = [];
   let bulkProgress: BulkProgress | null = null;
@@ -33,7 +37,9 @@
   $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
 
   onMount(async () => {
-    viewport = new EditorViewport(canvas, container, manager);
+    viewport = new EditorViewport(canvas, container, manager, (coordinates) => {
+      hoverCoordinates = coordinates;
+    });
     await viewport.init();
     backend = viewport.backend;
     await manager.initializeComputeBackend();
@@ -88,6 +94,7 @@
       bulkProgress = null;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
+      applyWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'World creation failed.';
@@ -110,6 +117,7 @@
       showDialog = false;
       status = `Editing ${restored.name}.`;
       metrics = { ...manager.metrics };
+      applyWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       showDialog = true;
@@ -148,6 +156,7 @@
       showDialog = false;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
+      applyWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'Open failed.';
@@ -164,6 +173,16 @@
   function setVisualizationMode(mode: VisualizationMode) {
     visualizationMode = mode;
     viewport?.setVisualizationMode(mode);
+  }
+
+  function applyWaterSettings() {
+    const maxHeight = manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight;
+    waterLevel = Math.max(0, Math.min(maxHeight, waterLevel));
+    viewport?.setWater({ visible: showWater, level: waterLevel });
+  }
+
+  function formatCoordinate(value: number | null | undefined) {
+    return value === null || value === undefined ? '-' : value.toFixed(1);
   }
 
   async function exportWorld() {
@@ -195,9 +214,9 @@
   ];
 
   const visualizations: { id: VisualizationMode; label: string; icon: typeof Crosshair }[] = [
-    { id: 'wireframe', label: 'Wireframe visualization', icon: Crosshair },
+    { id: 'wireframe', label: 'Wireframe visualization', icon: Grid3X3 },
     { id: 'topo', label: 'Topo visualization', icon: Mountain },
-    { id: 'render', label: 'Render visualization', icon: Square }
+    { id: 'render', label: 'Material visualization', icon: CircleDot }
   ];
 </script>
 
@@ -210,6 +229,9 @@
       <button type="button" title="New world" onclick={newWorld}><Plus size={17} /></button>
       <button type="button" title="Open latest OPFS world" onclick={openLatestWorld} disabled={opening}><FolderOpen size={17} /></button>
       <button type="button" title="Export world" onclick={exportWorld} disabled={exporting || !manager.config}><Download size={17} /></button>
+      <button type="button" title="Rendering settings" class:active={showRenderSettings} onclick={() => { showRenderSettings = !showRenderSettings; }}>
+        <Settings size={17} />
+      </button>
     </div>
   </div>
 
@@ -224,6 +246,7 @@
         onclick={() => setViewMode(mode.id)}
       >
         <svelte:component this={mode.icon} size={18} />
+        <span class="icon-tooltip" role="tooltip">{mode.label}</span>
       </button>
     {/each}
   </div>
@@ -238,6 +261,7 @@
         onclick={() => setVisualizationMode(visualization.id)}
       >
         <svelte:component this={visualization.icon} size={18} />
+        <span class="icon-tooltip" role="tooltip">{visualization.label}</span>
       </button>
     {/each}
   </div>
@@ -257,6 +281,42 @@
       <div><dt>LOD</dt><dd>{metrics.lodRebuildMs.toFixed(1)} ms</dd></div>
     </dl>
   </section>
+
+  {#if showRenderSettings}
+    <section class="render-settings" aria-label="Rendering settings">
+      <div class="metric-title">Rendering</div>
+      <label class="toggle-row">
+        <input type="checkbox" bind:checked={showWater} onchange={applyWaterSettings} />
+        <span>Show water</span>
+      </label>
+      <label>
+        <span>Water level</span>
+        <input
+          type="range"
+          min="0"
+          max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
+          step="1"
+          bind:value={waterLevel}
+          oninput={applyWaterSettings}
+        />
+      </label>
+      <input
+        type="number"
+        min="0"
+        max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
+        step="1"
+        bind:value={waterLevel}
+        oninput={applyWaterSettings}
+      />
+    </section>
+  {/if}
+
+  <div class="coordinates" aria-label="Mouse world coordinates">
+    x: {formatCoordinate(hoverCoordinates?.x)}
+    y: {formatCoordinate(hoverCoordinates?.y)}
+    z: {formatCoordinate(hoverCoordinates?.z)}
+    {hoverCoordinates?.unit ?? manager.config?.unit ?? DEFAULT_WORLD_INPUT.unit}
+  </div>
 
   <div class="status">{status}</div>
 

@@ -50,6 +50,7 @@ describe('world config', () => {
   });
 
   it('converts meters into active world units', () => {
+    expect(metersToWorldUnits(2, { unit: 'foot' })).toBeCloseTo(6.56168);
     expect(metersToWorldUnits(2, { unit: 'meter' })).toBe(2);
     expect(metersToWorldUnits(2, { unit: 'cm' })).toBe(200);
   });
