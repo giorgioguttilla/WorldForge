@@ -31,6 +31,7 @@
   let metrics: EditorMetrics = { ...manager.metrics };
   let configErrors: string[] = [];
   let bulkProgress: BulkProgress | null = null;
+  let waterSaveTimer: number | null = null;
 
   $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
@@ -63,12 +64,14 @@
     return () => {
       window.clearInterval(metricsTimer);
       window.removeEventListener('keydown', keyHandler);
+      if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
       resizeObserver.disconnect();
       viewport?.dispose();
     };
   });
 
   onDestroy(() => {
+    if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
     viewport?.dispose();
   });
 
@@ -94,7 +97,7 @@
       bulkProgress = null;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
-      applyWaterSettings();
+      loadWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'World creation failed.';
@@ -117,7 +120,7 @@
       showDialog = false;
       status = `Editing ${restored.name}.`;
       metrics = { ...manager.metrics };
-      applyWaterSettings();
+      loadWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       showDialog = true;
@@ -156,7 +159,7 @@
       showDialog = false;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
-      applyWaterSettings();
+      loadWaterSettings();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'Open failed.';
@@ -175,10 +178,44 @@
     viewport?.setVisualizationMode(mode);
   }
 
-  function applyWaterSettings() {
+  function loadWaterSettings() {
+    const water = manager.config?.water ?? { visible: false, level: 0 };
+    showWater = water.visible;
+    waterLevel = water.level;
+    applyWaterSettings(false);
+  }
+
+  function applyWaterSettings(persist = true) {
     const maxHeight = manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight;
     waterLevel = Math.max(0, Math.min(maxHeight, waterLevel));
     viewport?.setWater({ visible: showWater, level: waterLevel });
+    if (persist) scheduleWaterSettingsSave();
+  }
+
+  function scheduleWaterSettingsSave() {
+    if (!manager.config) return;
+    if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
+    waterSaveTimer = window.setTimeout(() => {
+      waterSaveTimer = null;
+      void saveWaterSettings();
+    }, 250);
+  }
+
+  async function saveWaterSettings() {
+    if (!manager.config) return;
+    try {
+      await manager.updateWaterConfig({ visible: showWater, level: waterLevel });
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'Water settings save failed.';
+    }
+  }
+
+  async function flushWaterSettingsSave() {
+    if (waterSaveTimer !== null) {
+      window.clearTimeout(waterSaveTimer);
+      waterSaveTimer = null;
+      await saveWaterSettings();
+    }
   }
 
   function formatCoordinate(value: number | null | undefined) {
@@ -194,6 +231,7 @@
       status = 'Export requires a browser with the File System Access API.';
       return;
     }
+    await flushWaterSettingsSave();
     exporting = true;
     status = 'Exporting PNG tiles...';
     try {
@@ -286,7 +324,7 @@
     <section class="render-settings" aria-label="Rendering settings">
       <div class="metric-title">Rendering</div>
       <label class="toggle-row">
-        <input type="checkbox" bind:checked={showWater} onchange={applyWaterSettings} />
+        <input type="checkbox" bind:checked={showWater} onchange={() => applyWaterSettings()} />
         <span>Show water</span>
       </label>
       <label>
@@ -297,7 +335,7 @@
           max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
           step="1"
           bind:value={waterLevel}
-          oninput={applyWaterSettings}
+          oninput={() => applyWaterSettings()}
         />
       </label>
       <input
@@ -306,7 +344,7 @@
         max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
         step="1"
         bind:value={waterLevel}
-        oninput={applyWaterSettings}
+        oninput={() => applyWaterSettings()}
       />
     </section>
   {/if}

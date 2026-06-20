@@ -3,7 +3,7 @@ import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './g
 import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
-import { createWorldConfig, getMaxLodDepth, normalizeWorldConfig, r16ToElevation, type WorldConfig, type WorldConfigInput } from './worldConfig';
+import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
 
 export interface EditorMetrics extends TileMetricsSnapshot {
   renderedTiles: number;
@@ -131,6 +131,19 @@ export class TileManager {
       localStorage.removeItem('worldforge:lastProjectId');
       return null;
     }
+  }
+
+  async updateWaterConfig(water: WaterConfig): Promise<WorldConfig> {
+    const config = this.requireConfig();
+    const updated: WorldConfig = {
+      ...config,
+      water: normalizeWaterConfig(water),
+      updatedAt: new Date().toISOString()
+    };
+    await this.store.writeConfig(updated);
+    await this.registerProject(updated);
+    this.config = updated;
+    return updated;
   }
 
   async deleteProject(projectId: string): Promise<void> {

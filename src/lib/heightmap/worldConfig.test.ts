@@ -40,6 +40,7 @@ describe('world config', () => {
       id: 'world-test',
       name: 'Test World',
       worldHeight: 512,
+      water: { visible: false, level: 0 },
       version: 1
     });
   });
@@ -70,5 +71,24 @@ describe('world config', () => {
     });
 
     expect(config.worldHeight).toBe(900);
+    expect(config.water).toEqual({ visible: false, level: 0 });
+  });
+
+  it('normalizes saved water config', () => {
+    const config = normalizeWorldConfig({
+      id: 'water',
+      name: 'Water',
+      tileSize: 32,
+      unitSize: 1,
+      unit: 'foot',
+      tilesPerSide: 2,
+      worldHeight: 500,
+      water: { visible: true, level: 125 },
+      createdAt: 'now',
+      updatedAt: 'now',
+      version: 1
+    });
+
+    expect(config.water).toEqual({ visible: true, level: 125 });
   });
 });

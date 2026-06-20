@@ -1,5 +1,10 @@
 export type WorldUnit = 'foot' | 'meter' | 'cm';
 
+export interface WaterConfig {
+  visible: boolean;
+  level: number;
+}
+
 export interface WorldConfig {
   id: string;
   name: string;
@@ -8,6 +13,7 @@ export interface WorldConfig {
   unit: WorldUnit;
   tilesPerSide: number;
   worldHeight: number;
+  water: WaterConfig;
   createdAt: string;
   updatedAt: string;
   version: 1;
@@ -57,17 +63,26 @@ export function createWorldConfig(input: WorldConfigInput, id = crypto.randomUUI
     ...input,
     id,
     name: input.name.trim(),
+    water: { visible: false, level: 0 },
     createdAt: now,
     updatedAt: now,
     version: 1
   };
 }
 
-export function normalizeWorldConfig(config: WorldConfig | (Omit<WorldConfig, 'worldHeight'> & { maxElevation?: number })): WorldConfig {
-  const maybeLegacy = config as WorldConfig & { maxElevation?: number };
+export function normalizeWaterConfig(water?: Partial<WaterConfig>): WaterConfig {
+  return {
+    visible: Boolean(water?.visible),
+    level: Number.isFinite(water?.level) ? Number(water?.level) : 0
+  };
+}
+
+export function normalizeWorldConfig(config: WorldConfig | (Omit<WorldConfig, 'worldHeight' | 'water'> & { maxElevation?: number; worldHeight?: number; water?: Partial<WaterConfig> })): WorldConfig {
+  const maybeLegacy = config as WorldConfig & { maxElevation?: number; water?: Partial<WaterConfig> };
   return {
     ...maybeLegacy,
-    worldHeight: maybeLegacy.worldHeight ?? maybeLegacy.maxElevation ?? DEFAULT_WORLD_INPUT.worldHeight
+    worldHeight: maybeLegacy.worldHeight ?? maybeLegacy.maxElevation ?? DEFAULT_WORLD_INPUT.worldHeight,
+    water: normalizeWaterConfig(maybeLegacy.water)
   };
 }
 

@@ -11,7 +11,7 @@ export async function createRenderer(canvas: HTMLCanvasElement): Promise<Rendere
       const webgpu = await import('three/webgpu');
       const WebGPURenderer = webgpu.WebGPURenderer as typeof THREE.WebGLRenderer | undefined;
       if (WebGPURenderer) {
-        const renderer = new WebGPURenderer({ canvas, antialias: true }) as THREE.WebGLRenderer;
+        const renderer = new WebGPURenderer({ canvas, antialias: true, logarithmicDepthBuffer: true }) as THREE.WebGLRenderer;
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         await (renderer as unknown as { init?: () => Promise<void> }).init?.();
         return { renderer, backend: 'webgpu' };
@@ -21,7 +21,7 @@ export async function createRenderer(canvas: HTMLCanvasElement): Promise<Rendere
     }
   }
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   return { renderer, backend: 'webgl' };
 }
