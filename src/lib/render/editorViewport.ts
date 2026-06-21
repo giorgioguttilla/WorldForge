@@ -5,6 +5,9 @@ import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
 import { TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
 
+const TERRAIN_UPDATE_INTERVAL_FRAMES = 8;
+const ENABLE_TERRAIN_RAYCAST = false;
+
 export interface HoverCoordinates {
   x: number;
   y: number;
@@ -75,14 +78,17 @@ export class EditorViewport {
     this.stats.showPanel(0);
     this.stats.dom.classList.add('stats-panel');
     this.container.appendChild(this.stats.dom);
-    this.canvas.addEventListener('pointermove', this.onPointerMove);
-    this.canvas.addEventListener('pointerleave', this.onPointerLeave);
+    if (ENABLE_TERRAIN_RAYCAST) {
+      this.canvas.addEventListener('pointermove', this.onPointerMove);
+      this.canvas.addEventListener('pointerleave', this.onPointerLeave);
+    }
     this.resize();
     this.animate();
   }
 
   setMode(mode: ViewMode): void {
     this.controller.setMode(mode);
+    this.terrain.setViewMode(mode);
   }
 
   setVisualizationMode(mode: VisualizationMode): void {
@@ -107,8 +113,10 @@ export class EditorViewport {
     this.stats.dom.remove();
     this.controller.dispose();
     this.terrain.dispose();
-    this.canvas.removeEventListener('pointermove', this.onPointerMove);
-    this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    if (ENABLE_TERRAIN_RAYCAST) {
+      this.canvas.removeEventListener('pointermove', this.onPointerMove);
+      this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    }
     this.water.geometry.dispose();
     this.water.material.dispose();
     this.rendererAdapter?.renderer.dispose();
@@ -122,7 +130,7 @@ export class EditorViewport {
     const delta = Math.min(0.1, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
     this.controller.update(delta);
-    if (this.frame % 30 === 0) void this.terrain.update(this.controller.activeCamera);
+    if (this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
     this.rendererAdapter?.renderer.render(this.scene, this.controller.activeCamera);
     this.frame += 1;
     this.stats.end();
@@ -136,7 +144,7 @@ export class EditorViewport {
       -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1)
     );
     this.raycaster.setFromCamera(pointer, this.controller.activeCamera);
-    const intersections = this.raycaster.intersectObjects(this.terrain.group.children, false);
+    const intersections = this.raycaster.intersectObjects(this.terrain.getRaycastTargets(), false);
     const hit = intersections.find((intersection) => intersection.object.visible);
     if (!hit) {
       this.onHoverCoordinates(null);
