@@ -566,11 +566,10 @@ export class TerrainQuadtreeRenderer {
 
   private getCameraSignature(camera: THREE.Camera): string {
     const p = camera.position;
-    const r = camera.rotation;
     if (camera instanceof THREE.OrthographicCamera) {
       return `o:${p.x.toFixed(1)}:${p.y.toFixed(1)}:${p.z.toFixed(1)}:${camera.zoom.toFixed(3)}`;
     }
-    return `p:${p.x.toFixed(1)}:${p.y.toFixed(1)}:${p.z.toFixed(1)}:${r.x.toFixed(3)}:${r.y.toFixed(3)}:${r.z.toFixed(3)}`;
+    return `p:${p.x.toFixed(1)}:${p.y.toFixed(1)}:${p.z.toFixed(1)}`;
   }
 
   private trimUnusedPool(): void {
