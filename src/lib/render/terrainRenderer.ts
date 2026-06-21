@@ -14,7 +14,6 @@ const PERSPECTIVE_SUBDIVIDE_SCREEN_PX: Record<Exclude<ViewMode, 'ortho'>, { near
 };
 const MAX_RENDER_TILE_CACHE_ENTRIES = 80;
 const SPARE_POOL_NODES = 128;
-const MAX_CHUNK_BUILDS_PER_SELECTION = 24;
 const MAX_CONCURRENT_CHUNK_BUILDS = 4;
 const CHUNK_WORKER_COUNT = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
 
@@ -98,6 +97,7 @@ export class TerrainQuadtreeRenderer {
   private readonly pool: TerrainNode[] = [];
   private readonly freeNodes: TerrainNode[] = [];
   private readonly active = new Map<string, TerrainNode>();
+  private readonly staged = new Map<string, TerrainNode>();
   private readonly tileCache = new Map<string, RenderTileCacheEntry>();
   private readonly workers: ChunkWorkerState[] = [];
   private readonly material = new THREE.MeshStandardMaterial({
@@ -107,9 +107,9 @@ export class TerrainQuadtreeRenderer {
   });
   private updateQueued = false;
   private updateRequested = false;
-  private updateRevision = 0;
   private lastSelectionId = '';
   private lastCameraSignature = '';
+  private stagedSelectionId = '';
   private viewportHeight = 720;
   private viewMode: ViewMode = 'free';
   private readonly sparePoolNodes = SPARE_POOL_NODES;
@@ -127,7 +127,6 @@ export class TerrainQuadtreeRenderer {
   }
 
   async update(camera: THREE.Camera): Promise<void> {
-    this.updateRevision += 1;
     if (this.updateQueued) {
       this.updateRequested = true;
       return;
@@ -137,7 +136,7 @@ export class TerrainQuadtreeRenderer {
     try {
       do {
         this.updateRequested = false;
-        await this.updateSelection(camera, this.updateRevision);
+        await this.updateSelection(camera);
       } while (this.updateRequested);
     } finally {
       this.updateQueued = false;
@@ -158,6 +157,7 @@ export class TerrainQuadtreeRenderer {
     this.pool.length = 0;
     this.freeNodes.length = 0;
     this.active.clear();
+    this.staged.clear();
     this.tileCache.clear();
     for (const state of this.workers) state.tileCache.clear();
   }
@@ -170,10 +170,12 @@ export class TerrainQuadtreeRenderer {
     this.pool.length = 0;
     this.freeNodes.length = 0;
     this.active.clear();
+    this.staged.clear();
     this.tileCache.clear();
     for (const state of this.workers) state.tileCache.clear();
     this.lastSelectionId = '';
     this.lastCameraSignature = '';
+    this.stagedSelectionId = '';
     this.manager.setRenderMetrics(0, 0, 0);
   }
 
@@ -190,18 +192,19 @@ export class TerrainQuadtreeRenderer {
     this.viewMode = mode;
     this.lastSelectionId = '';
     this.lastCameraSignature = '';
+    this.releaseStagedNodes();
   }
 
   getRaycastTargets(): THREE.Object3D[] {
     return [...this.active.values()].map((node) => node.mesh);
   }
 
-  private async updateSelection(camera: THREE.Camera, revision: number): Promise<void> {
+  private async updateSelection(camera: THREE.Camera): Promise<void> {
     const config = this.manager.config;
     if (!config) return;
 
     const cameraSignature = this.getCameraSignature(camera);
-    if (cameraSignature === this.lastCameraSignature) {
+    if (cameraSignature === this.lastCameraSignature && this.stagedSelectionId === '') {
       this.updateMetrics();
       return;
     }
@@ -210,67 +213,56 @@ export class TerrainQuadtreeRenderer {
     const nextSelectionId = keys.map((key) => `${key.lod}:${key.x}:${key.y}`).join('|');
     if (nextSelectionId === this.lastSelectionId) {
       this.lastCameraSignature = cameraSignature;
+      this.releaseStagedNodes();
       this.updateMetrics();
       return;
+    }
+    if (this.stagedSelectionId !== nextSelectionId) {
+      this.releaseStagedNodes();
+      this.stagedSelectionId = nextSelectionId;
     }
 
     const nextActive = new Map<string, TerrainNode>();
     const builds: Promise<void>[] = [];
-    let builtThisSelection = 0;
-    let partialSelection = false;
     for (const key of keys) {
-      if (revision !== this.updateRevision) return;
       const id = `${key.lod}:${key.x}:${key.y}`;
       const existing = this.active.get(id);
       if (existing) {
         nextActive.set(id, existing);
         continue;
       }
+      const staged = this.staged.get(id);
+      if (staged) {
+        nextActive.set(id, staged);
+        continue;
+      }
       const node = this.acquireNode(id, config, false);
       builds.push(
         this.populateNode(node, key, config)
           .then(() => {
-            if (revision !== this.updateRevision) {
-              node.inUse = false;
-              node.mesh.visible = false;
-              this.freeNodes.push(node);
+            if (this.stagedSelectionId !== nextSelectionId) {
+              this.releaseNode(node);
               return;
             }
             nextActive.set(id, node);
             node.inUse = true;
-            node.mesh.visible = true;
-            this.active.set(id, node);
-            this.updateMetrics();
+            node.mesh.visible = false;
+            this.staged.set(id, node);
           })
           .catch((error) => {
             console.error('Failed to build terrain chunk.', error);
-            node.inUse = false;
-            node.mesh.visible = false;
-            this.freeNodes.push(node);
+            this.releaseNode(node);
           })
       );
-      builtThisSelection += 1;
-      if (builtThisSelection >= MAX_CHUNK_BUILDS_PER_SELECTION) {
-        partialSelection = true;
-        break;
-      }
       if (builds.length >= MAX_CONCURRENT_CHUNK_BUILDS) {
         await Promise.all(builds.splice(0));
-        if (revision !== this.updateRevision) return;
       }
     }
     await Promise.all(builds);
 
-    if (partialSelection) {
-      this.updateMetrics();
-      return;
-    }
-
     for (const [id, node] of this.active) {
       if (!nextActive.has(id)) {
-        node.inUse = false;
-        node.mesh.visible = false;
-        this.freeNodes.push(node);
+        this.releaseNode(node);
       }
     }
 
@@ -280,6 +272,8 @@ export class TerrainQuadtreeRenderer {
       node.mesh.visible = true;
       this.active.set(id, node);
     }
+    this.staged.clear();
+    this.stagedSelectionId = '';
     this.lastSelectionId = nextSelectionId;
     this.lastCameraSignature = cameraSignature;
     this.trimUnusedPool();
@@ -433,10 +427,11 @@ export class TerrainQuadtreeRenderer {
     const chunkStartY = key.y * CHUNK_SEGMENTS_PER_SIDE * 2 ** key.lod;
     const chunkEndX = chunkStartX + CHUNK_SEGMENTS_PER_SIDE * 2 ** key.lod;
     const chunkEndY = chunkStartY + CHUNK_SEGMENTS_PER_SIDE * 2 ** key.lod;
-    const minSampleX = Math.floor(THREE.MathUtils.clamp(chunkStartX / sampleScale, 0, lodSamplesPerSide - 1));
-    const minSampleY = Math.floor(THREE.MathUtils.clamp(chunkStartY / sampleScale, 0, lodSamplesPerSide - 1));
-    const maxSampleX = Math.ceil(THREE.MathUtils.clamp(chunkEndX / sampleScale, 0, lodSamplesPerSide - 1));
-    const maxSampleY = Math.ceil(THREE.MathUtils.clamp(chunkEndY / sampleScale, 0, lodSamplesPerSide - 1));
+    const normalSamplePadding = 2 ** key.lod;
+    const minSampleX = Math.floor(THREE.MathUtils.clamp((chunkStartX - normalSamplePadding) / sampleScale, 0, lodSamplesPerSide - 1));
+    const minSampleY = Math.floor(THREE.MathUtils.clamp((chunkStartY - normalSamplePadding) / sampleScale, 0, lodSamplesPerSide - 1));
+    const maxSampleX = Math.ceil(THREE.MathUtils.clamp((chunkEndX + normalSamplePadding) / sampleScale, 0, lodSamplesPerSide - 1));
+    const maxSampleY = Math.ceil(THREE.MathUtils.clamp((chunkEndY + normalSamplePadding) / sampleScale, 0, lodSamplesPerSide - 1));
     const tilesPerSide = config.tilesPerSide / 2 ** tileDepth;
     const minTileX = Math.min(tilesPerSide - 1, Math.floor(minSampleX / config.tileSize));
     const minTileY = Math.min(tilesPerSide - 1, Math.floor(minSampleY / config.tileSize));
@@ -589,6 +584,22 @@ export class TerrainQuadtreeRenderer {
       this.pool.splice(i, 1);
       const freeIndex = this.freeNodes.indexOf(node);
       if (freeIndex >= 0) this.freeNodes.splice(freeIndex, 1);
+    }
+  }
+
+  private releaseStagedNodes(): void {
+    for (const node of this.staged.values()) {
+      this.releaseNode(node);
+    }
+    this.staged.clear();
+    this.stagedSelectionId = '';
+  }
+
+  private releaseNode(node: TerrainNode): void {
+    node.inUse = false;
+    node.mesh.visible = false;
+    if (!this.freeNodes.includes(node)) {
+      this.freeNodes.push(node);
     }
   }
 

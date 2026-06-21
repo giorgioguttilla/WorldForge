@@ -97,7 +97,7 @@ function buildChunk(request: BuildChunkRequest): BuildChunkResponse {
     }
   }
 
-  writeNormals(heights, normals, verticesPerSide, config.unitSize);
+  writeNormals(request, normals, verticesPerSide);
 
   return {
     type: 'built',
@@ -144,16 +144,27 @@ function sampleRawHeightAtLod(tileSize: number, tilesPerSideAtDepthZero: number,
   return samples[localY * tileSize + localX];
 }
 
-function writeNormals(heights: Float32Array, normals: Float32Array, verticesPerSide: number, unitSize: number): void {
+function writeNormals(request: BuildChunkRequest, normals: Float32Array, verticesPerSide: number): void {
+  const { chunkSegments, config, key, lodSamplesPerSide, sampleScale, tileDepth } = request;
+  const halfChunk = (chunkSegments * config.unitSize) / 2;
+  const fullSampleStep = 2 ** key.lod;
+  const sampleContext = { lodSamplesPerSide, sampleScale, tileDepth };
+
   for (let y = 0; y < verticesPerSide; y += 1) {
+    const localZ = y * config.unitSize - halfChunk;
     for (let x = 0; x < verticesPerSide; x += 1) {
+      const localX = x * config.unitSize - halfChunk;
       const index = y * verticesPerSide + x;
-      const left = heights[y * verticesPerSide + Math.max(0, x - 1)];
-      const right = heights[y * verticesPerSide + Math.min(verticesPerSide - 1, x + 1)];
-      const up = heights[Math.max(0, y - 1) * verticesPerSide + x];
-      const down = heights[Math.min(verticesPerSide - 1, y + 1) * verticesPerSide + x];
+      const chunkSampleX = localX / config.unitSize + chunkSegments / 2;
+      const chunkSampleY = localZ / config.unitSize + chunkSegments / 2;
+      const fullSampleX = (key.x * chunkSegments + chunkSampleX) * fullSampleStep;
+      const fullSampleY = (key.y * chunkSegments + chunkSampleY) * fullSampleStep;
+      const left = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX - fullSampleStep, fullSampleY, sampleContext), config.worldHeight);
+      const right = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX + fullSampleStep, fullSampleY, sampleContext), config.worldHeight);
+      const up = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX, fullSampleY - fullSampleStep, sampleContext), config.worldHeight);
+      const down = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX, fullSampleY + fullSampleStep, sampleContext), config.worldHeight);
       const nx = left - right;
-      const ny = unitSize * 2;
+      const ny = config.unitSize * 2;
       const nz = up - down;
       const length = Math.hypot(nx, ny, nz) || 1;
       normals[index * 3] = nx / length;
@@ -161,6 +172,10 @@ function writeNormals(heights: Float32Array, normals: Float32Array, verticesPerS
       normals[index * 3 + 2] = nz / length;
     }
   }
+}
+
+function rawToElevation(rawHeight: number, worldHeight: number): number {
+  return (rawHeight / 65535) * worldHeight;
 }
 
 function setTopoColor(colors: Float32Array, index: number, height01: number): void {
