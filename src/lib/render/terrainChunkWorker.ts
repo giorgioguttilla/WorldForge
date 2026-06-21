@@ -39,11 +39,22 @@ interface BuildChunkError {
   message: string;
 }
 
-const tileCache = new Map<string, Uint16Array>();
+const tileCacheByNumber = new Map<number, Uint16Array>();
 
 const TOPO_LOW = { r: 0x17 / 255, g: 0x38 / 255, b: 0x24 / 255 };
 const TOPO_MID = { r: 0x5a / 255, g: 0xa3 / 255, b: 0x6e / 255 };
 const TOPO_HIGH = { r: 0xe4 / 255, g: 0xf6 / 255, b: 0xbc / 255 };
+const R16_TO_UNIT = 1 / 65535;
+
+interface SampleContext {
+  tileSize: number;
+  tilesPerSideAtDepthZero: number;
+  tileDepth: number;
+  sampleScale: number;
+  lodSamplesPerSide: number;
+  maxLodSample: number;
+  tilesPerSideAtDepth: number;
+}
 
 self.onmessage = (event: MessageEvent<BuildChunkRequest>): void => {
   const message = event.data;
@@ -51,7 +62,8 @@ self.onmessage = (event: MessageEvent<BuildChunkRequest>): void => {
 
   try {
     for (const tile of message.tiles) {
-      tileCache.set(tile.id, new Uint16Array(tile.samples));
+      const samples = new Uint16Array(tile.samples);
+      tileCacheByNumber.set(tileIdToNumber(tile.id), samples);
     }
 
     const response = buildChunk(message);
@@ -74,26 +86,27 @@ function buildChunk(request: BuildChunkRequest): BuildChunkResponse {
   const colors = new Float32Array(vertexCount * 3);
   const normals = new Float32Array(vertexCount * 3);
   const halfChunk = (chunkSegments * config.unitSize) / 2;
+  const fullSampleStep = 2 ** key.lod;
+  const sampleOriginX = key.x * chunkSegments * fullSampleStep;
+  const sampleOriginY = key.y * chunkSegments * fullSampleStep;
+  const heightScale = config.worldHeight * R16_TO_UNIT;
+  const sampleContext = makeSampleContext(config.tileSize, config.tilesPerSide, tileDepth, sampleScale, lodSamplesPerSide);
   let maxRadiusSq = 0;
 
   for (let y = 0; y < verticesPerSide; y += 1) {
     const localZ = y * config.unitSize - halfChunk;
+    const fullSampleY = sampleOriginY + y * fullSampleStep;
+    const rowOffset = y * verticesPerSide;
     for (let x = 0; x < verticesPerSide; x += 1) {
       const localX = x * config.unitSize - halfChunk;
-      const index = y * verticesPerSide + x;
-      const chunkSampleX = localX / config.unitSize + chunkSegments / 2;
-      const chunkSampleY = localZ / config.unitSize + chunkSegments / 2;
-      const fullSampleX = (key.x * chunkSegments + chunkSampleX) * 2 ** key.lod;
-      const fullSampleY = (key.y * chunkSegments + chunkSampleY) * 2 ** key.lod;
-      const rawHeight = sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX, fullSampleY, {
-        lodSamplesPerSide,
-        sampleScale,
-        tileDepth
-      });
-      const height = (rawHeight / 65535) * config.worldHeight;
+      const index = rowOffset + x;
+      const fullSampleX = sampleOriginX + x * fullSampleStep;
+      const rawHeight = sampleRawHeight(fullSampleX, fullSampleY, sampleContext);
+      const height = rawHeight * heightScale;
       heights[index] = height;
-      setTopoColor(colors, index, rawHeight / 65535);
-      maxRadiusSq = Math.max(maxRadiusSq, localX * localX + height * height + localZ * localZ);
+      setTopoColor(colors, index, rawHeight * R16_TO_UNIT);
+      const radiusSq = localX * localX + height * height + localZ * localZ;
+      if (radiusSq > maxRadiusSq) maxRadiusSq = radiusSq;
     }
   }
 
@@ -109,89 +122,100 @@ function buildChunk(request: BuildChunkRequest): BuildChunkResponse {
   };
 }
 
-function sampleRawHeight(
-  tileSize: number,
-  tilesPerSideAtDepthZero: number,
-  fullSampleX: number,
-  fullSampleY: number,
-  context: { tileDepth: number; sampleScale: number; lodSamplesPerSide: number }
-): number {
-  const x = clamp(fullSampleX / context.sampleScale, 0, context.lodSamplesPerSide - 1);
-  const y = clamp(fullSampleY / context.sampleScale, 0, context.lodSamplesPerSide - 1);
+function makeSampleContext(tileSize: number, tilesPerSideAtDepthZero: number, tileDepth: number, sampleScale: number, lodSamplesPerSide: number): SampleContext {
+  return {
+    tileSize,
+    tilesPerSideAtDepthZero,
+    tileDepth,
+    sampleScale,
+    lodSamplesPerSide,
+    maxLodSample: lodSamplesPerSide - 1,
+    tilesPerSideAtDepth: tilesPerSideAtDepthZero / 2 ** tileDepth
+  };
+}
+
+function sampleRawHeight(fullSampleX: number, fullSampleY: number, context: SampleContext): number {
+  const x = clamp(fullSampleX / context.sampleScale, 0, context.maxLodSample);
+  const y = clamp(fullSampleY / context.sampleScale, 0, context.maxLodSample);
   const x0 = Math.floor(x);
   const y0 = Math.floor(y);
-  const x1 = Math.min(context.lodSamplesPerSide - 1, x0 + 1);
-  const y1 = Math.min(context.lodSamplesPerSide - 1, y0 + 1);
+  const x1 = x0 < context.maxLodSample ? x0 + 1 : x0;
+  const y1 = y0 < context.maxLodSample ? y0 + 1 : y0;
   const tx = x - x0;
   const ty = y - y0;
-  const h00 = sampleRawHeightAtLod(tileSize, tilesPerSideAtDepthZero, context.tileDepth, x0, y0);
-  const h10 = sampleRawHeightAtLod(tileSize, tilesPerSideAtDepthZero, context.tileDepth, x1, y0);
-  const h01 = sampleRawHeightAtLod(tileSize, tilesPerSideAtDepthZero, context.tileDepth, x0, y1);
-  const h11 = sampleRawHeightAtLod(tileSize, tilesPerSideAtDepthZero, context.tileDepth, x1, y1);
+  const h00 = sampleRawHeightAtLod(context, x0, y0);
+  const h10 = sampleRawHeightAtLod(context, x1, y0);
+  const h01 = sampleRawHeightAtLod(context, x0, y1);
+  const h11 = sampleRawHeightAtLod(context, x1, y1);
   const top = h00 + (h10 - h00) * tx;
   const bottom = h01 + (h11 - h01) * tx;
   return top + (bottom - top) * ty;
 }
 
-function sampleRawHeightAtLod(tileSize: number, tilesPerSideAtDepthZero: number, tileDepth: number, sampleX: number, sampleY: number): number {
-  const tilesPerSide = tilesPerSideAtDepthZero / 2 ** tileDepth;
-  const tileX = Math.min(tilesPerSide - 1, Math.floor(sampleX / tileSize));
-  const tileY = Math.min(tilesPerSide - 1, Math.floor(sampleY / tileSize));
-  const localX = Math.min(tileSize - 1, sampleX - tileX * tileSize);
-  const localY = Math.min(tileSize - 1, sampleY - tileY * tileSize);
-  const samples = tileCache.get(`${tileDepth}:${tileX}:${tileY}`);
-  if (!samples) throw new Error(`Missing worker tile ${tileDepth}:${tileX}:${tileY}.`);
-  return samples[localY * tileSize + localX];
+function sampleRawHeightAtLod(context: SampleContext, sampleX: number, sampleY: number): number {
+  const tileX = Math.min(context.tilesPerSideAtDepth - 1, Math.floor(sampleX / context.tileSize));
+  const tileY = Math.min(context.tilesPerSideAtDepth - 1, Math.floor(sampleY / context.tileSize));
+  const localX = Math.min(context.tileSize - 1, sampleX - tileX * context.tileSize);
+  const localY = Math.min(context.tileSize - 1, sampleY - tileY * context.tileSize);
+  const samples = tileCacheByNumber.get(tileKeyToNumber(context.tileDepth, tileX, tileY));
+  if (!samples) throw new Error(`Missing worker tile ${context.tileDepth}:${tileX}:${tileY}.`);
+  return samples[localY * context.tileSize + localX];
+}
+
+function tileIdToNumber(id: string): number {
+  const [depth, x, y] = id.split(':').map(Number);
+  return tileKeyToNumber(depth, x, y);
+}
+
+function tileKeyToNumber(depth: number, x: number, y: number): number {
+  return depth * 1073741824 + y * 32768 + x;
 }
 
 function writeNormals(request: BuildChunkRequest, normals: Float32Array, verticesPerSide: number): void {
   const { chunkSegments, config, key, lodSamplesPerSide, sampleScale, tileDepth } = request;
   const halfChunk = (chunkSegments * config.unitSize) / 2;
   const fullSampleStep = 2 ** key.lod;
-  const sampleContext = { lodSamplesPerSide, sampleScale, tileDepth };
+  const sampleOriginX = key.x * chunkSegments * fullSampleStep;
+  const sampleOriginY = key.y * chunkSegments * fullSampleStep;
+  const heightScale = config.worldHeight * R16_TO_UNIT;
+  const sampleContext = makeSampleContext(config.tileSize, config.tilesPerSide, tileDepth, sampleScale, lodSamplesPerSide);
+  const ny = config.unitSize * 2;
 
   for (let y = 0; y < verticesPerSide; y += 1) {
-    const localZ = y * config.unitSize - halfChunk;
+    const fullSampleY = sampleOriginY + y * fullSampleStep;
+    const rowOffset = y * verticesPerSide;
     for (let x = 0; x < verticesPerSide; x += 1) {
-      const localX = x * config.unitSize - halfChunk;
-      const index = y * verticesPerSide + x;
-      const chunkSampleX = localX / config.unitSize + chunkSegments / 2;
-      const chunkSampleY = localZ / config.unitSize + chunkSegments / 2;
-      const fullSampleX = (key.x * chunkSegments + chunkSampleX) * fullSampleStep;
-      const fullSampleY = (key.y * chunkSegments + chunkSampleY) * fullSampleStep;
-      const left = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX - fullSampleStep, fullSampleY, sampleContext), config.worldHeight);
-      const right = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX + fullSampleStep, fullSampleY, sampleContext), config.worldHeight);
-      const up = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX, fullSampleY - fullSampleStep, sampleContext), config.worldHeight);
-      const down = rawToElevation(sampleRawHeight(config.tileSize, config.tilesPerSide, fullSampleX, fullSampleY + fullSampleStep, sampleContext), config.worldHeight);
+      const index = rowOffset + x;
+      const fullSampleX = sampleOriginX + x * fullSampleStep;
+      const left = sampleRawHeight(fullSampleX - fullSampleStep, fullSampleY, sampleContext) * heightScale;
+      const right = sampleRawHeight(fullSampleX + fullSampleStep, fullSampleY, sampleContext) * heightScale;
+      const up = sampleRawHeight(fullSampleX, fullSampleY - fullSampleStep, sampleContext) * heightScale;
+      const down = sampleRawHeight(fullSampleX, fullSampleY + fullSampleStep, sampleContext) * heightScale;
       const nx = left - right;
-      const ny = config.unitSize * 2;
       const nz = up - down;
-      const length = Math.hypot(nx, ny, nz) || 1;
-      normals[index * 3] = nx / length;
-      normals[index * 3 + 1] = ny / length;
-      normals[index * 3 + 2] = nz / length;
+      const inverseLength = 1 / (Math.sqrt(nx * nx + ny * ny + nz * nz) || 1);
+      const normalOffset = index * 3;
+      normals[normalOffset] = nx * inverseLength;
+      normals[normalOffset + 1] = ny * inverseLength;
+      normals[normalOffset + 2] = nz * inverseLength;
     }
   }
 }
 
-function rawToElevation(rawHeight: number, worldHeight: number): number {
-  return (rawHeight / 65535) * worldHeight;
-}
-
 function setTopoColor(colors: Float32Array, index: number, height01: number): void {
   const t = clamp(height01, 0, 1);
-  const color = t < 0.62 ? lerpColor(TOPO_LOW, TOPO_MID, t / 0.62) : lerpColor(TOPO_MID, TOPO_HIGH, (t - 0.62) / 0.38);
-  colors[index * 3] = color.r;
-  colors[index * 3 + 1] = color.g;
-  colors[index * 3 + 2] = color.b;
-}
-
-function lerpColor(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }, t: number): { r: number; g: number; b: number } {
-  return {
-    r: a.r + (b.r - a.r) * t,
-    g: a.g + (b.g - a.g) * t,
-    b: a.b + (b.b - a.b) * t
-  };
+  const colorOffset = index * 3;
+  if (t < 0.62) {
+    const u = t / 0.62;
+    colors[colorOffset] = TOPO_LOW.r + (TOPO_MID.r - TOPO_LOW.r) * u;
+    colors[colorOffset + 1] = TOPO_LOW.g + (TOPO_MID.g - TOPO_LOW.g) * u;
+    colors[colorOffset + 2] = TOPO_LOW.b + (TOPO_MID.b - TOPO_LOW.b) * u;
+  } else {
+    const u = (t - 0.62) / 0.38;
+    colors[colorOffset] = TOPO_MID.r + (TOPO_HIGH.r - TOPO_MID.r) * u;
+    colors[colorOffset + 1] = TOPO_MID.g + (TOPO_HIGH.g - TOPO_MID.g) * u;
+    colors[colorOffset + 2] = TOPO_MID.b + (TOPO_HIGH.b - TOPO_MID.b) * u;
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {

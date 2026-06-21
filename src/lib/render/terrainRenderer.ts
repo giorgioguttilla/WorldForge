@@ -391,9 +391,10 @@ export class TerrainQuadtreeRenderer {
     const colors = this.ensureColorAttribute(geometry);
     const normals = geometry.attributes.normal as THREE.BufferAttribute;
     const heights = new Float32Array(built.heights);
+    const positionArray = positions.array as Float32Array;
 
     for (let i = 0; i < positions.count; i += 1) {
-      positions.setY(i, heights[i]);
+      positionArray[i * 3 + 1] = heights[i];
     }
 
     colors.array.set(new Float32Array(built.colors));
