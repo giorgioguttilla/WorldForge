@@ -1,6 +1,7 @@
 import { R16HeightmapCodec } from './r16Codec';
 import { tilePath, type TileKey } from './tileKey';
 import { normalizeWorldConfig, type WorldConfig } from './worldConfig';
+import { normalizeAuthoringDocument, type AuthoringDocumentV1 } from '../authoring/authoringDocument';
 
 export interface TileMetricsSnapshot {
   cachedTiles: number;
@@ -49,6 +50,30 @@ export class HeightmapTileStore {
     const root = this.requireRoot();
     const file = await (await root.getFileHandle('world.config.json')).getFile();
     return normalizeWorldConfig(JSON.parse(await file.text()));
+  }
+
+  async writeAuthoringDocument(document: AuthoringDocumentV1): Promise<void> {
+    const root = this.requireRoot();
+    const handle = await root.getFileHandle('authoring.json', { create: true });
+    const writable = await handle.createWritable({ keepExistingData: false });
+    await writable.write(JSON.stringify(document, null, 2));
+    await writable.close();
+  }
+
+  async readAuthoringDocument(worldId: string): Promise<AuthoringDocumentV1> {
+    const root = this.requireRoot();
+    try {
+      const file = await (await root.getFileHandle('authoring.json')).getFile();
+      return normalizeAuthoringDocument(JSON.parse(await file.text()), worldId);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotFoundError') {
+        return normalizeAuthoringDocument(null, worldId);
+      }
+      if (error instanceof SyntaxError) {
+        return normalizeAuthoringDocument(null, worldId);
+      }
+      throw error;
+    }
   }
 
   async writeTile(key: TileKey, samples: Uint16Array, options: TileAccessOptions = {}): Promise<void> {

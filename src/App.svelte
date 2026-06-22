@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { CircleDot, Crosshair, Download, FolderOpen, Grid3X3, Map, Mountain, Navigation, Plus, Settings, UserRound } from '@lucide/svelte';
+  import { CircleDot, Crosshair, Download, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
-  import { EditorViewport, type HoverCoordinates } from './lib/render/editorViewport';
+  import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
   import type { VisualizationMode } from './lib/render/terrainRenderer';
+  import { createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
+  import { distanceToPolyline, pointInPolygon } from './lib/authoring/geometry';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -32,16 +34,37 @@
   let configErrors: string[] = [];
   let bulkProgress: BulkProgress | null = null;
   let waterSaveTimer: number | null = null;
+  let authoringSaveTimer: number | null = null;
+  let authoringDocument: AuthoringDocumentV1 | null = null;
+  let activeWorldId: string | null = null;
+  let activeTool: 'select' | 'landformArea' | 'mountainSpline' = 'select';
+  let selectedPrimitiveId: string | null = null;
+  let selectedAnchorId: string | null = null;
+  let showAuthoring = true;
+  let draftAnchors: AnchorV1[] = [];
+  let bakeState: 'clean' | 'stale' | 'failed' | 'baking' = 'clean';
+  let undoStack: AuthoringDocumentV1[] = [];
+  let redoStack: AuthoringDocumentV1[] = [];
+  let draggingAnchor: { primitiveId: string; anchorId: string } | null = null;
+  let dragStarted = false;
 
   $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
   $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
+  $: selectedPrimitive = authoringDocument?.primitives.find((primitive) => primitive.id === selectedPrimitiveId) ?? null;
+  $: canFinishMountain = activeTool === 'mountainSpline' && draftAnchors.length >= 2;
+  $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
 
   onMount(async () => {
     viewport = new EditorViewport(canvas, container, manager, (coordinates) => {
       hoverCoordinates = coordinates;
     });
     await viewport.init();
+    viewport.setAuthoringInputHandlers({
+      pointerDown: handleAuthoringPointerDown,
+      pointerMove: handleAuthoringPointerMove,
+      pointerUp: handleAuthoringPointerUp
+    });
     backend = viewport.backend;
     await manager.initializeComputeBackend();
     metrics = { ...manager.metrics };
@@ -57,6 +80,31 @@
     const keyHandler = (event: KeyboardEvent) => {
       if (event.code === 'Escape' && showDialog && manager.config) {
         cancelWorldDialog();
+        return;
+      }
+      if (event.code === 'Escape' && draftAnchors.length > 0) {
+        cancelDraft();
+        event.preventDefault();
+        return;
+      }
+      if (event.code === 'Enter' && canFinishMountain) {
+        finishMountainDraft();
+        event.preventDefault();
+        return;
+      }
+      if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
+        deleteSelection();
+        event.preventDefault();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && event.code === 'KeyZ' && !event.shiftKey) {
+        undoAuthoring();
+        event.preventDefault();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && (event.code === 'KeyY' || (event.code === 'KeyZ' && event.shiftKey))) {
+        redoAuthoring();
+        event.preventDefault();
       }
     };
     window.addEventListener('keydown', keyHandler);
@@ -65,6 +113,7 @@
       window.clearInterval(metricsTimer);
       window.removeEventListener('keydown', keyHandler);
       if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
+      if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
       resizeObserver.disconnect();
       viewport?.dispose();
     };
@@ -72,6 +121,7 @@
 
   onDestroy(() => {
     if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
+    if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
     viewport?.dispose();
   });
 
@@ -98,6 +148,7 @@
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
       loadWaterSettings();
+      await loadAuthoringDocument();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'World creation failed.';
@@ -121,6 +172,7 @@
       status = `Editing ${restored.name}.`;
       metrics = { ...manager.metrics };
       loadWaterSettings();
+      await loadAuthoringDocument();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       showDialog = true;
@@ -160,6 +212,7 @@
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
       loadWaterSettings();
+      await loadAuthoringDocument();
       await viewport?.terrain.update(viewport.controller.activeCamera);
     } catch (error) {
       status = error instanceof Error ? error.message : 'Open failed.';
@@ -218,6 +271,297 @@
     }
   }
 
+  async function loadAuthoringDocument() {
+    if (!manager.config) {
+      authoringDocument = null;
+      activeWorldId = null;
+      syncAuthoringViewport();
+      return;
+    }
+    activeWorldId = manager.config.id;
+    try {
+      authoringDocument = await manager.loadAuthoringDocument();
+    } catch {
+      authoringDocument = createEmptyAuthoringDocument(manager.config.id);
+    }
+    selectedPrimitiveId = null;
+    selectedAnchorId = null;
+    draftAnchors = [];
+    undoStack = [];
+    redoStack = [];
+    bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
+    syncAuthoringViewport();
+  }
+
+  function syncAuthoringViewport() {
+    viewport?.setAuthoringDocument(authoringDocument);
+    viewport?.setAuthoringSelection({ primitiveId: selectedPrimitiveId, anchorId: selectedAnchorId });
+    viewport?.setAuthoringPreview(draftAnchors);
+    viewport?.setAuthoringVisible(showAuthoring);
+  }
+
+  function commitAuthoring(next: AuthoringDocumentV1, options: { stale?: boolean; undo?: boolean } = {}) {
+    const stale = options.stale ?? true;
+    const pushUndo = options.undo ?? true;
+    if (authoringDocument && pushUndo) {
+      undoStack = [...undoStack.slice(-24), cloneDocument(authoringDocument)];
+      redoStack = [];
+    }
+    authoringDocument = cloneDocument(next);
+    if (stale) bakeState = 'stale';
+    syncAuthoringViewport();
+    scheduleAuthoringSave();
+  }
+
+  function scheduleAuthoringSave() {
+    if (!authoringDocument || !manager.config) return;
+    if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
+    authoringSaveTimer = window.setTimeout(() => {
+      authoringSaveTimer = null;
+      void saveAuthoringDocument();
+    }, 250);
+  }
+
+  async function saveAuthoringDocument() {
+    if (!authoringDocument || !manager.config) return;
+    try {
+      authoringDocument = await manager.saveAuthoringDocument(authoringDocument);
+      syncAuthoringViewport();
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'Authoring save failed.';
+    }
+  }
+
+  async function flushAuthoringSave() {
+    if (authoringSaveTimer !== null) {
+      window.clearTimeout(authoringSaveTimer);
+      authoringSaveTimer = null;
+      await saveAuthoringDocument();
+    }
+  }
+
+  function setActiveTool(tool: 'select' | 'landformArea' | 'mountainSpline') {
+    if (tool !== activeTool) cancelDraft();
+    activeTool = tool;
+  }
+
+  function cancelDraft() {
+    draftAnchors = [];
+    draggingAnchor = null;
+    dragStarted = false;
+    syncAuthoringViewport();
+  }
+
+  function handleAuthoringPointerDown(point: AuthoringPointerPoint): boolean {
+    if (!authoringDocument || !manager.config || showDialog) return false;
+    if (activeTool === 'landformArea') {
+      const threshold = hitThreshold();
+      if (draftAnchors.length >= 3 && Math.hypot(point.x - draftAnchors[0].x, point.z - draftAnchors[0].z) <= threshold) {
+        const primitive = createLandformArea(draftAnchors, waterLevel, countPrimitiveType('landformArea') + 1);
+        draftAnchors = [];
+        selectedPrimitiveId = primitive.id;
+        selectedAnchorId = null;
+        commitAuthoring({ ...authoringDocument, primitives: [...authoringDocument.primitives, primitive] });
+        return true;
+      }
+      draftAnchors = [...draftAnchors, createAnchor(point.x, point.z)];
+      syncAuthoringViewport();
+      return true;
+    }
+    if (activeTool === 'mountainSpline') {
+      draftAnchors = [...draftAnchors, createAnchor(point.x, point.z)];
+      syncAuthoringViewport();
+      return true;
+    }
+
+    const anchorHit = findAnchorHit(point.x, point.z);
+    if (anchorHit) {
+      selectedPrimitiveId = anchorHit.primitiveId;
+      selectedAnchorId = anchorHit.anchorId;
+      draggingAnchor = anchorHit;
+      dragStarted = false;
+      syncAuthoringViewport();
+      return true;
+    }
+    const primitive = findPrimitiveHit(point.x, point.z);
+    selectedPrimitiveId = primitive?.id ?? null;
+    selectedAnchorId = null;
+    syncAuthoringViewport();
+    return Boolean(primitive);
+  }
+
+  function handleAuthoringPointerMove(point: AuthoringPointerPoint): boolean {
+    if (!authoringDocument || !draggingAnchor) return false;
+    const next = cloneDocument(authoringDocument);
+    const primitive = next.primitives.find((item) => item.id === draggingAnchor?.primitiveId);
+    const anchor = primitive?.anchors.find((item) => item.id === draggingAnchor?.anchorId);
+    if (!primitive || !anchor) return false;
+    if (!dragStarted && authoringDocument) {
+      undoStack = [...undoStack.slice(-24), cloneDocument(authoringDocument)];
+      redoStack = [];
+      dragStarted = true;
+    }
+    anchor.x = point.x;
+    anchor.z = point.z;
+    primitive.updatedAt = new Date().toISOString();
+    authoringDocument = next;
+    bakeState = 'stale';
+    syncAuthoringViewport();
+    scheduleAuthoringSave();
+    return true;
+  }
+
+  function handleAuthoringPointerUp(_point: AuthoringPointerPoint): boolean {
+    const handled = Boolean(draggingAnchor);
+    draggingAnchor = null;
+    dragStarted = false;
+    return handled;
+  }
+
+  function finishMountainDraft() {
+    if (!authoringDocument || draftAnchors.length < 2) return;
+    const primitive = createMountainSpline(draftAnchors, countPrimitiveType('mountainSpline') + 1);
+    draftAnchors = [];
+    selectedPrimitiveId = primitive.id;
+    selectedAnchorId = null;
+    commitAuthoring({ ...authoringDocument, primitives: [...authoringDocument.primitives, primitive] });
+  }
+
+  function deleteSelection() {
+    if (!authoringDocument || !selectedPrimitiveId) return;
+    const primitive = authoringDocument.primitives.find((item) => item.id === selectedPrimitiveId);
+    if (!primitive) return;
+    if (selectedAnchorId && primitive.anchors.length > minimumAnchorCount(primitive)) {
+      const nextPrimitive = {
+        ...primitive,
+        updatedAt: new Date().toISOString(),
+        anchors: primitive.anchors.filter((anchor) => anchor.id !== selectedAnchorId)
+      } as PrimitiveV1;
+      selectedAnchorId = null;
+      commitAuthoring(replacePrimitive(nextPrimitive));
+      return;
+    }
+    selectedPrimitiveId = null;
+    selectedAnchorId = null;
+    commitAuthoring({ ...authoringDocument, primitives: authoringDocument.primitives.filter((item) => item.id !== primitive.id) });
+  }
+
+  function updateSelectedPrimitive(patch: Partial<PrimitiveV1>) {
+    if (!authoringDocument || !selectedPrimitive) return;
+    const nextPrimitive = {
+      ...selectedPrimitive,
+      ...patch,
+      updatedAt: new Date().toISOString()
+    } as PrimitiveV1;
+    commitAuthoring(replacePrimitive(nextPrimitive));
+  }
+
+  function replacePrimitive(primitive: PrimitiveV1): AuthoringDocumentV1 {
+    const document = authoringDocument ?? createEmptyAuthoringDocument(manager.config?.id ?? 'unknown');
+    return {
+      ...document,
+      primitives: document.primitives.map((item) => item.id === primitive.id ? primitive : item)
+    };
+  }
+
+  function undoAuthoring() {
+    if (!authoringDocument || undoStack.length === 0) return;
+    const previous = undoStack[undoStack.length - 1];
+    redoStack = [...redoStack, cloneDocument(authoringDocument)];
+    undoStack = undoStack.slice(0, -1);
+    authoringDocument = cloneDocument(previous);
+    selectedPrimitiveId = null;
+    selectedAnchorId = null;
+    bakeState = 'stale';
+    syncAuthoringViewport();
+    scheduleAuthoringSave();
+  }
+
+  function redoAuthoring() {
+    if (!authoringDocument || redoStack.length === 0) return;
+    const next = redoStack[redoStack.length - 1];
+    undoStack = [...undoStack, cloneDocument(authoringDocument)];
+    redoStack = redoStack.slice(0, -1);
+    authoringDocument = cloneDocument(next);
+    selectedPrimitiveId = null;
+    selectedAnchorId = null;
+    bakeState = 'stale';
+    syncAuthoringViewport();
+    scheduleAuthoringSave();
+  }
+
+  async function bakeAuthoring() {
+    if (!authoringDocument || !manager.config || bakeState === 'baking') return;
+    await flushWaterSettingsSave();
+    await flushAuthoringSave();
+    bakeState = 'baking';
+    bulkProgress = { phase: 'baking', current: 0, total: 1, label: 'Preparing structural bake' };
+    status = 'Baking structural terrain...';
+    try {
+      authoringDocument = await manager.bakeAuthoringDocument(authoringDocument, waterLevel, (progress) => {
+        bulkProgress = progress;
+        status = progress.label;
+      });
+      bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
+      status = bakeState === 'failed' ? authoringDocument.lastBake?.error ?? 'Bake failed.' : 'Bake complete.';
+      metrics = { ...manager.metrics };
+      viewport?.refreshTerrain();
+      syncAuthoringViewport();
+    } catch (error) {
+      bakeState = 'failed';
+      status = error instanceof Error ? error.message : 'Bake failed.';
+    } finally {
+      bulkProgress = null;
+    }
+  }
+
+  function findAnchorHit(x: number, z: number): { primitiveId: string; anchorId: string } | null {
+    let best: { primitiveId: string; anchorId: string; distance: number } | null = null;
+    const threshold = hitThreshold();
+    for (const primitive of authoringDocument?.primitives ?? []) {
+      for (const anchor of primitive.anchors) {
+        const distance = Math.hypot(x - anchor.x, z - anchor.z);
+        if (distance <= threshold && (!best || distance < best.distance)) {
+          best = { primitiveId: primitive.id, anchorId: anchor.id, distance };
+        }
+      }
+    }
+    return best ? { primitiveId: best.primitiveId, anchorId: best.anchorId } : null;
+  }
+
+  function findPrimitiveHit(x: number, z: number): PrimitiveV1 | null {
+    const threshold = hitThreshold();
+    const primitives = [...(authoringDocument?.primitives ?? [])].reverse();
+    for (const primitive of primitives) {
+      if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInPolygon(x, z, primitive.anchors)) return primitive;
+      if (primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, primitive.type === 'landformArea') <= threshold) return primitive;
+    }
+    return null;
+  }
+
+  function countPrimitiveType(type: PrimitiveV1['type']) {
+    return authoringDocument?.primitives.filter((primitive) => primitive.type === type).length ?? 0;
+  }
+
+  function hitThreshold() {
+    const config = manager.config;
+    if (!config) return 30;
+    return Math.max(24, config.tileSize * config.tilesPerSide * config.unitSize * 0.006);
+  }
+
+  function minimumAnchorCount(primitive: PrimitiveV1) {
+    return primitive.type === 'landformArea' ? 3 : 2;
+  }
+
+  function cloneDocument(document: AuthoringDocumentV1): AuthoringDocumentV1 {
+    return structuredClone(document);
+  }
+
+  function isTextInput(target: EventTarget | null) {
+    const element = target as HTMLElement | null;
+    return element?.tagName === 'INPUT' || element?.tagName === 'SELECT' || element?.tagName === 'TEXTAREA';
+  }
+
   function formatCoordinate(value: number | null | undefined) {
     return value === null || value === undefined ? '-' : value.toFixed(1);
   }
@@ -255,6 +599,12 @@
     { id: 'wireframe', label: 'Wireframe visualization', icon: Grid3X3 },
     { id: 'topo', label: 'Topo visualization', icon: Mountain },
     { id: 'render', label: 'Material visualization', icon: CircleDot }
+  ];
+
+  const authoringTools: { id: 'select' | 'landformArea' | 'mountainSpline'; label: string; icon: typeof Crosshair }[] = [
+    { id: 'select', label: 'Select primitive', icon: MousePointer2 },
+    { id: 'landformArea', label: 'Landform area', icon: Paintbrush },
+    { id: 'mountainSpline', label: 'Mountain spline', icon: Route }
   ];
 </script>
 
@@ -304,6 +654,33 @@
     {/each}
   </div>
 
+  <div class="authoring-stack" aria-label="Authoring tools">
+    {#each authoringTools as tool}
+      <button
+        type="button"
+        class:active={activeTool === tool.id}
+        disabled={!hasAuthoringWorld}
+        title={hasAuthoringWorld ? tool.label : 'Create or open a world first'}
+        aria-label={tool.label}
+        onclick={() => setActiveTool(tool.id)}
+      >
+        <svelte:component this={tool.icon} size={18} />
+        <span class="icon-tooltip" role="tooltip">{tool.label}</span>
+      </button>
+    {/each}
+    <button
+      type="button"
+      class:active={showAuthoring}
+      disabled={!hasAuthoringWorld}
+      title={hasAuthoringWorld ? (showAuthoring ? 'Hide authoring overlays' : 'Show authoring overlays') : 'Create or open a world first'}
+      aria-label={showAuthoring ? 'Hide authoring overlays' : 'Show authoring overlays'}
+      onclick={() => { showAuthoring = !showAuthoring; syncAuthoringViewport(); }}
+    >
+      {#if showAuthoring}<Eye size={18} />{:else}<EyeOff size={18} />{/if}
+      <span class="icon-tooltip" role="tooltip">{showAuthoring ? 'Hide overlays' : 'Show overlays'}</span>
+    </button>
+  </div>
+
   <section class="metrics" aria-label="Editor metrics">
     <div class="metric-title">Runtime</div>
     <dl>
@@ -346,6 +723,91 @@
         bind:value={waterLevel}
         oninput={() => applyWaterSettings()}
       />
+    </section>
+  {/if}
+
+  {#if hasAuthoringWorld && authoringDocument}
+    <section class="authoring-panel" aria-label="Authoring inspector">
+      <div class="panel-header">
+        <div>
+          <div class="metric-title">Authoring</div>
+          <div class={`bake-pill ${bakeState}`}>{bakeState}</div>
+        </div>
+        <div class="panel-actions">
+          <button type="button" title="Undo" disabled={undoStack.length === 0} onclick={undoAuthoring}><Undo2 size={16} /></button>
+          <button type="button" title="Redo" disabled={redoStack.length === 0} onclick={redoAuthoring}><Redo2 size={16} /></button>
+          <button type="button" title="Bake terrain" disabled={bakeState === 'baking'} onclick={() => void bakeAuthoring()}><Hammer size={16} /></button>
+        </div>
+      </div>
+
+      {#if activeTool === 'landformArea' && draftAnchors.length > 0}
+        <div class="draft-row">
+          <span>{draftAnchors.length} anchors</span>
+          <button type="button" onclick={cancelDraft}>Cancel</button>
+        </div>
+      {:else if activeTool === 'mountainSpline' && draftAnchors.length > 0}
+        <div class="draft-row">
+          <span>{draftAnchors.length} anchors</span>
+          <button type="button" disabled={!canFinishMountain} onclick={finishMountainDraft}>Finish</button>
+          <button type="button" onclick={cancelDraft}>Cancel</button>
+        </div>
+      {/if}
+
+      {#if selectedPrimitive}
+        <label>
+          <span>Name</span>
+          <input value={selectedPrimitive.name} oninput={(event) => updateSelectedPrimitive({ name: event.currentTarget.value } as Partial<PrimitiveV1>)} />
+        </label>
+        <label class="toggle-row">
+          <input type="checkbox" checked={selectedPrimitive.enabled} onchange={(event) => updateSelectedPrimitive({ enabled: event.currentTarget.checked } as Partial<PrimitiveV1>)} />
+          <span>Enabled</span>
+        </label>
+
+        {#if selectedPrimitive.type === 'landformArea'}
+          <label>
+            <span>Mode</span>
+            <select value={selectedPrimitive.mode} onchange={(event) => updateSelectedPrimitive({ mode: event.currentTarget.value as LandformModeV1 } as Partial<PrimitiveV1>)}>
+              <option value="land">land</option>
+              <option value="water">water</option>
+              <option value="plateau">plateau</option>
+            </select>
+          </label>
+          <div class="field-grid compact">
+            <label>
+              <span>Elevation</span>
+              <input type="number" step="1" value={selectedPrimitive.elevation} oninput={(event) => updateSelectedPrimitive({ elevation: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+            <label>
+              <span>Priority</span>
+              <input type="number" step="1" value={selectedPrimitive.priority} oninput={(event) => updateSelectedPrimitive({ priority: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+          </div>
+          <label>
+            <span>Edge smoothness</span>
+            <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+          </label>
+        {:else}
+          <div class="field-grid compact">
+            <label>
+              <span>Height</span>
+              <input type="number" min="0" step="1" value={selectedPrimitive.height} oninput={(event) => updateSelectedPrimitive({ height: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+            <label>
+              <span>Width</span>
+              <input type="number" min="0" step="1" value={selectedPrimitive.width} oninput={(event) => updateSelectedPrimitive({ width: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+          </div>
+          <label>
+            <span>Edge smoothness</span>
+            <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+          </label>
+        {/if}
+        <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Delete</button>
+      {:else}
+        <div class="empty-inspector">
+          {authoringDocument.primitives.length} primitives
+        </div>
+      {/if}
     </section>
   {/if}
 

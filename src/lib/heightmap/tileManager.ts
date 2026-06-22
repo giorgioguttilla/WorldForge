@@ -4,6 +4,8 @@ import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
 import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
+import { createEmptyAuthoringDocument, type AuthoringDocumentV1 } from '../authoring/authoringDocument';
+import { bakeStructuralAuthoring, createFailedBakeMetadata, type BakeProgress } from '../authoring/structuralBake';
 
 export interface EditorMetrics extends TileMetricsSnapshot {
   renderedTiles: number;
@@ -17,7 +19,7 @@ export interface EditorMetrics extends TileMetricsSnapshot {
 }
 
 export interface BulkProgress {
-  phase: 'generating' | 'building-lod';
+  phase: 'generating' | 'building-lod' | BakeProgress['phase'];
   current: number;
   total: number;
   label: string;
@@ -58,6 +60,7 @@ export class TileManager {
     const compute = await this.getComputeBackend();
     await this.store.openProject(config.id);
     await this.store.writeConfig(config);
+    await this.store.writeAuthoringDocument(createEmptyAuthoringDocument(config.id));
     await this.registerProject(config);
     this.config = config;
 
@@ -144,6 +147,57 @@ export class TileManager {
     await this.registerProject(updated);
     this.config = updated;
     return updated;
+  }
+
+  async loadAuthoringDocument(): Promise<AuthoringDocumentV1> {
+    const config = this.requireConfig();
+    return this.store.readAuthoringDocument(config.id);
+  }
+
+  async saveAuthoringDocument(document: AuthoringDocumentV1): Promise<AuthoringDocumentV1> {
+    const config = this.requireConfig();
+    const normalized: AuthoringDocumentV1 = {
+      ...document,
+      version: 1,
+      worldId: config.id
+    };
+    await this.store.writeAuthoringDocument(normalized);
+    return normalized;
+  }
+
+  async bakeAuthoringDocument(document: AuthoringDocumentV1, waterLevel: number, onProgress?: (progress: BulkProgress) => void): Promise<AuthoringDocumentV1> {
+    const config = this.requireConfig();
+    const normalized: AuthoringDocumentV1 = {
+      ...document,
+      version: 1,
+      worldId: config.id
+    };
+    try {
+      const start = performance.now();
+      const result = await bakeStructuralAuthoring(
+        config,
+        normalized,
+        waterLevel,
+        {
+          readTile: (key) => this.store.readTile(key, config.tileSize, { cache: false }),
+          writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false })
+        },
+        onProgress
+      );
+      this.metrics.lodRebuildMs = performance.now() - start;
+      this.metrics.lastGeneratedTiles = result.dirtyTiles.length;
+      const baked = { ...normalized, lastBake: result.metadata };
+      await this.store.writeAuthoringDocument(baked);
+      this.store.clearCache();
+      this.refreshStoreMetrics();
+      return baked;
+    } catch (error) {
+      const failed = { ...normalized, lastBake: createFailedBakeMetadata(config, normalized, waterLevel, error) };
+      await this.store.writeAuthoringDocument(failed);
+      this.store.clearCache();
+      this.refreshStoreMetrics();
+      return failed;
+    }
   }
 
   async deleteProject(projectId: string): Promise<void> {

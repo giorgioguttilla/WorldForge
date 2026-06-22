@@ -4,6 +4,8 @@ import type { TileManager } from '../heightmap/tileManager';
 import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
 import { TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
+import { AuthoringOverlay, type AuthoringSelection } from './authoringOverlay';
+import type { AnchorV1, AuthoringDocumentV1 } from '../authoring/authoringDocument';
 
 const TERRAIN_UPDATE_INTERVAL_FRAMES = 8;
 const ENABLE_TERRAIN_RAYCAST = false;
@@ -20,9 +22,22 @@ export interface WaterSettings {
   level: number;
 }
 
+export interface AuthoringPointerPoint {
+  x: number;
+  z: number;
+  event: PointerEvent;
+}
+
+export interface AuthoringPointerHandlers {
+  pointerDown(point: AuthoringPointerPoint): boolean;
+  pointerMove(point: AuthoringPointerPoint): boolean;
+  pointerUp(point: AuthoringPointerPoint): boolean;
+}
+
 export class EditorViewport {
   readonly controller: CameraController;
   readonly terrain: TerrainQuadtreeRenderer;
+  readonly authoringOverlay = new AuthoringOverlay();
   readonly stats = new Stats();
   backend: 'webgpu' | 'webgl' = 'webgl';
 
@@ -34,6 +49,8 @@ export class EditorViewport {
   private frame = 0;
   private disposed = false;
   private waterSettings: WaterSettings = { visible: false, level: 0 };
+  private authoringHandlers: AuthoringPointerHandlers | null = null;
+  private authoringPointerId: number | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -65,6 +82,7 @@ export class EditorViewport {
     this.scene.fog = new THREE.FogExp2(0x0c1116, 0.000045);
     this.scene.add(this.terrain.group);
     this.scene.add(this.water);
+    this.scene.add(this.authoringOverlay.group);
     this.scene.add(new THREE.HemisphereLight(0xcdeaff, 0x30402d, 1.8));
 
     const sun = new THREE.DirectionalLight(0xffffff, 2.4);
@@ -82,6 +100,9 @@ export class EditorViewport {
       this.canvas.addEventListener('pointermove', this.onPointerMove);
       this.canvas.addEventListener('pointerleave', this.onPointerLeave);
     }
+    this.canvas.addEventListener('pointerdown', this.onAuthoringPointerDown);
+    window.addEventListener('pointermove', this.onAuthoringPointerMove);
+    window.addEventListener('pointerup', this.onAuthoringPointerUp);
     this.resize();
     this.animate();
   }
@@ -117,9 +138,38 @@ export class EditorViewport {
       this.canvas.removeEventListener('pointermove', this.onPointerMove);
       this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
     }
+    this.canvas.removeEventListener('pointerdown', this.onAuthoringPointerDown);
+    window.removeEventListener('pointermove', this.onAuthoringPointerMove);
+    window.removeEventListener('pointerup', this.onAuthoringPointerUp);
     this.water.geometry.dispose();
     this.water.material.dispose();
+    this.authoringOverlay.dispose();
     this.rendererAdapter?.renderer.dispose();
+  }
+
+  setAuthoringInputHandlers(handlers: AuthoringPointerHandlers | null): void {
+    this.authoringHandlers = handlers;
+  }
+
+  setAuthoringDocument(document: AuthoringDocumentV1 | null): void {
+    this.authoringOverlay.setDocument(document);
+  }
+
+  setAuthoringSelection(selection: AuthoringSelection): void {
+    this.authoringOverlay.setSelection(selection);
+  }
+
+  setAuthoringPreview(anchors: AnchorV1[]): void {
+    this.authoringOverlay.setPreviewAnchors(anchors);
+  }
+
+  setAuthoringVisible(visible: boolean): void {
+    this.authoringOverlay.setVisible(visible);
+  }
+
+  refreshTerrain(): void {
+    this.terrain.clear();
+    void this.terrain.update(this.controller.activeCamera);
   }
 
   private animate = (): void => {
@@ -162,6 +212,37 @@ export class EditorViewport {
     this.onHoverCoordinates?.(null);
   };
 
+  private readonly onAuthoringPointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0 || !this.authoringHandlers) return;
+    const point = this.projectPointerToAuthoringPlane(event);
+    if (!point) return;
+    if (!this.authoringHandlers.pointerDown(point)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.authoringPointerId = event.pointerId;
+    this.canvas.setPointerCapture(event.pointerId);
+  };
+
+  private readonly onAuthoringPointerMove = (event: PointerEvent): void => {
+    if (!this.authoringHandlers || this.authoringPointerId !== event.pointerId) return;
+    const point = this.projectPointerToAuthoringPlane(event);
+    if (!point) return;
+    if (this.authoringHandlers.pointerMove(point)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
+  private readonly onAuthoringPointerUp = (event: PointerEvent): void => {
+    if (!this.authoringHandlers || this.authoringPointerId !== event.pointerId) return;
+    const point = this.projectPointerToAuthoringPlane(event);
+    if (point && this.authoringHandlers.pointerUp(point)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    this.authoringPointerId = null;
+  };
+
   private addGizmo(): void {
     const axes = new THREE.AxesHelper(550);
     axes.position.set(-900, 20, -900);
@@ -176,5 +257,19 @@ export class EditorViewport {
     const planeSize = Math.max(worldSize * 3, 10000);
     this.water.position.set(0, this.waterSettings.level, 0);
     this.water.scale.set(planeSize, 1, planeSize);
+    this.authoringOverlay.setWaterLevel(this.waterSettings.level);
+  }
+
+  private projectPointerToAuthoringPlane(event: PointerEvent): AuthoringPointerPoint | null {
+    const rect = this.canvas.getBoundingClientRect();
+    const pointer = new THREE.Vector2(
+      ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1,
+      -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1)
+    );
+    this.raycaster.setFromCamera(pointer, this.controller.activeCamera);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.waterSettings.level);
+    const hit = new THREE.Vector3();
+    if (!this.raycaster.ray.intersectPlane(plane, hit)) return null;
+    return { x: hit.x, z: hit.z, event };
   }
 }
