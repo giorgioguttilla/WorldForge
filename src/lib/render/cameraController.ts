@@ -27,6 +27,7 @@ export class CameraController {
   private characterGrounded = false;
   private characterVelocityY = 0;
   private characterGroundPending = false;
+  private dragPointerId: number | null = null;
 
   constructor(
     private readonly dom: HTMLElement,
@@ -133,9 +134,10 @@ export class CameraController {
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
-    if (event.button !== 0) return;
+    if (event.button !== 2) return;
     event.preventDefault();
     this.dragging = true;
+    this.dragPointerId = event.pointerId;
     this.lastX = event.clientX;
     this.lastY = event.clientY;
     this.dom.setPointerCapture(event.pointerId);
@@ -163,8 +165,10 @@ export class CameraController {
     }
   };
 
-  private readonly onPointerUp = (): void => {
+  private readonly onPointerUp = (event: PointerEvent): void => {
+    if (this.dragPointerId !== null && event.pointerId !== this.dragPointerId) return;
     this.dragging = false;
+    this.dragPointerId = null;
   };
 
   private readonly onWheel = (event: WheelEvent): void => {
