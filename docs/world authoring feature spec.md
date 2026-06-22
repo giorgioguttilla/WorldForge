@@ -36,6 +36,8 @@ Already implemented:
 
 V1 should build on these systems. Authoring data should live beside the existing world config and tile stores without breaking the current OPFS project layout.
 
+Implementation is split into milestone sub-specs under [world-authoring-milestones](./world-authoring-milestones/README.md). The milestone specs are the execution plan; this document remains the broader product and architecture target.
+
 ---
 
 ## Core Design Principles
