@@ -15,7 +15,7 @@ interface LandformCandidate {
 }
 
 export function evaluateStructuralHeight(config: WorldConfig, document: AuthoringDocumentV1, worldX: number, worldZ: number, waterLevel: number): StructuralEvaluation {
-  const baseElevation = clamp(waterLevel + config.worldHeight * 0.05, 0, config.worldHeight);
+  const baseElevation = 0;
   const landforms = document.primitives.filter((primitive): primitive is LandformAreaV1 => (
     primitive.enabled && primitive.type === 'landformArea' && primitive.anchors.length >= 3
   ));

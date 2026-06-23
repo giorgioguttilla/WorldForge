@@ -87,6 +87,7 @@ export class AuthoringOverlay {
       this.addAnchors(primitive.anchors, selected ? 0xffffff : 0x75c28f, selected);
       return;
     }
+    this.addSplineBody(primitive.anchors, selected ? 0xffffff : 0xd59a6f, selected);
     this.addPolyline(primitive.anchors, false, selected ? 0xffffff : 0xd59a6f, selected, false);
     this.addAnchors(primitive.anchors, selected ? 0xffffff : 0xd59a6f, selected);
   }
@@ -123,6 +124,32 @@ export class AuthoringOverlay {
     const line = new THREE.Line(geometry, material);
     line.renderOrder = 23;
     this.track(line);
+  }
+
+  private addSplineBody(anchors: AnchorV1[], color: number, selected: boolean): void {
+    if (anchors.length < 2) return;
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: selected ? 0.34 : 0.22,
+      depthTest: false,
+      depthWrite: false
+    });
+    for (let i = 0; i < anchors.length - 1; i += 1) {
+      const a = anchors[i];
+      const b = anchors[i + 1];
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const length = Math.hypot(dx, dz);
+      if (length <= 0) continue;
+      const geometry = new THREE.CylinderGeometry(selected ? 13 : 9, selected ? 13 : 9, length, 10, 1);
+      geometry.rotateZ(Math.PI / 2);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set((a.x + b.x) / 2, 0, (a.z + b.z) / 2);
+      mesh.rotation.y = -Math.atan2(dz, dx);
+      mesh.renderOrder = 22;
+      this.track(mesh);
+    }
   }
 
   private addAnchors(anchors: AnchorV1[], color: number, selectedPrimitive: boolean): void {

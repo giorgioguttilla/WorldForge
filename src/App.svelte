@@ -87,6 +87,11 @@
         event.preventDefault();
         return;
       }
+      if (event.code === 'Escape' && (selectedPrimitiveId || selectedAnchorId)) {
+        clearSelection();
+        event.preventDefault();
+        return;
+      }
       if (event.code === 'Enter' && canFinishMountain) {
         finishMountainDraft();
         event.preventDefault();
@@ -383,7 +388,7 @@
       syncAuthoringViewport();
       return true;
     }
-    const primitive = findPrimitiveHit(point.x, point.z);
+    const primitive = cyclePrimitiveHit(point.x, point.z);
     selectedPrimitiveId = primitive?.id ?? null;
     selectedAnchorId = null;
     syncAuthoringViewport();
@@ -444,6 +449,12 @@
     selectedPrimitiveId = null;
     selectedAnchorId = null;
     commitAuthoring({ ...authoringDocument, primitives: authoringDocument.primitives.filter((item) => item.id !== primitive.id) });
+  }
+
+  function clearSelection() {
+    selectedPrimitiveId = null;
+    selectedAnchorId = null;
+    syncAuthoringViewport();
   }
 
   function updateSelectedPrimitive(patch: Partial<PrimitiveV1>) {
@@ -530,13 +541,30 @@
   }
 
   function findPrimitiveHit(x: number, z: number): PrimitiveV1 | null {
+    return findPrimitiveHits(x, z)[0] ?? null;
+  }
+
+  function cyclePrimitiveHit(x: number, z: number): PrimitiveV1 | null {
+    const hits = findPrimitiveHits(x, z);
+    if (hits.length === 0) return null;
+    const selectedIndex = hits.findIndex((primitive) => primitive.id === selectedPrimitiveId);
+    if (selectedIndex < 0) return hits[0];
+    return hits[(selectedIndex + 1) % hits.length];
+  }
+
+  function findPrimitiveHits(x: number, z: number): PrimitiveV1[] {
     const threshold = hitThreshold();
-    const primitives = [...(authoringDocument?.primitives ?? [])].reverse();
-    for (const primitive of primitives) {
-      if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInPolygon(x, z, primitive.anchors)) return primitive;
-      if (primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, primitive.type === 'landformArea') <= threshold) return primitive;
-    }
-    return null;
+    return [...(authoringDocument?.primitives ?? [])]
+      .map((primitive, index) => ({ primitive, index }))
+      .filter(({ primitive }) => primitiveContainsPoint(primitive, x, z, threshold))
+      .sort((a, b) => b.index - a.index)
+      .map(({ primitive }) => primitive);
+  }
+
+  function primitiveContainsPoint(primitive: PrimitiveV1, x: number, z: number, threshold: number) {
+    if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInPolygon(x, z, primitive.anchors)) return true;
+    if (primitive.type === 'mountainSpline' && primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, false) <= threshold * 1.6) return true;
+    return primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, primitive.type === 'landformArea') <= threshold;
   }
 
   function countPrimitiveType(type: PrimitiveV1['type']) {

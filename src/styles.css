@@ -121,7 +121,7 @@ button:disabled {
   position: absolute;
   left: calc(100% + 9px);
   top: 50%;
-  z-index: 20;
+  z-index: 80;
   min-width: max-content;
   max-width: 190px;
   transform: translateY(-50%) translateX(-4px);
@@ -161,6 +161,7 @@ button:disabled {
 .visual-stack,
 .authoring-stack {
   position: absolute;
+  z-index: 90;
   left: 14px;
   display: grid;
   gap: 6px;
@@ -224,6 +225,7 @@ button:disabled {
 
 .authoring-panel {
   position: absolute;
+  z-index: 40;
   left: 68px;
   top: 68px;
   width: 280px;

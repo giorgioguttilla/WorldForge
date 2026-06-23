@@ -39,6 +39,16 @@ function land(id: string, elevation: number, priority: number, createdAt: string
 }
 
 describe('authoring geometry', () => {
+  it('uses zero elevation when no primitives influence a sample', () => {
+    const document: AuthoringDocumentV1 = {
+      version: 1,
+      worldId: 'world',
+      primitives: []
+    };
+
+    expect(evaluateStructuralHeight(config, document, 0, 0, 100).elevation).toBe(0);
+  });
+
   it('resolves landform overlaps by priority and then later primitive order', () => {
     const document: AuthoringDocumentV1 = {
       version: 1,
