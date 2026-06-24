@@ -87,6 +87,7 @@ export class AuthoringOverlay {
       this.addAnchors(primitive.anchors, selected ? 0xffffff : 0x75c28f, selected);
       return;
     }
+    this.addSplineInfluence(primitive.anchors, primitive.width, selected ? 0xffffff : 0xd59a6f, selected);
     this.addSplineBody(primitive.anchors, selected ? 0xffffff : 0xd59a6f, selected);
     this.addPolyline(primitive.anchors, false, selected ? 0xffffff : 0xd59a6f, selected, false);
     this.addAnchors(primitive.anchors, selected ? 0xffffff : 0xd59a6f, selected);
@@ -149,6 +150,44 @@ export class AuthoringOverlay {
       mesh.rotation.y = -Math.atan2(dz, dx);
       mesh.renderOrder = 22;
       this.track(mesh);
+    }
+  }
+
+  private addSplineInfluence(anchors: AnchorV1[], width: number, color: number, selected: boolean): void {
+    if (anchors.length < 2 || width <= 0) return;
+    const radius = width / 2;
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: selected ? 0.13 : 0.08,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false
+    });
+
+    for (let i = 0; i < anchors.length - 1; i += 1) {
+      const a = anchors[i];
+      const b = anchors[i + 1];
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const length = Math.hypot(dx, dz);
+      if (length <= 0) continue;
+      const geometry = new THREE.PlaneGeometry(length, radius * 2, 1, 1);
+      geometry.rotateX(-Math.PI / 2);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set((a.x + b.x) / 2, -0.6, (a.z + b.z) / 2);
+      mesh.rotation.y = -Math.atan2(dz, dx);
+      mesh.renderOrder = 20;
+      this.track(mesh);
+    }
+
+    for (const anchor of anchors) {
+      const geometry = new THREE.CircleGeometry(radius, 36);
+      geometry.rotateX(-Math.PI / 2);
+      const disc = new THREE.Mesh(geometry, material);
+      disc.position.set(anchor.x, -0.6, anchor.z);
+      disc.renderOrder = 20;
+      this.track(disc);
     }
   }
 

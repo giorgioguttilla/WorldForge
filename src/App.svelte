@@ -563,7 +563,9 @@
 
   function primitiveContainsPoint(primitive: PrimitiveV1, x: number, z: number, threshold: number) {
     if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInPolygon(x, z, primitive.anchors)) return true;
-    if (primitive.type === 'mountainSpline' && primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, false) <= threshold * 1.6) return true;
+    if (primitive.type === 'mountainSpline' && primitive.anchors.length >= 2) {
+      return distanceToPolyline(x, z, primitive.anchors, false) <= Math.max(threshold * 1.6, primitive.width / 2);
+    }
     return primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, primitive.type === 'landformArea') <= threshold;
   }
 
