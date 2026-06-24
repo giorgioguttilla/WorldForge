@@ -7,13 +7,6 @@ export interface StructuralEvaluation {
   mountainContribution: number;
 }
 
-interface LandformCandidate {
-  primitive: LandformAreaV1;
-  elevation: number;
-  weight: number;
-  order: number;
-}
-
 export function evaluateStructuralHeight(config: WorldConfig, document: AuthoringDocumentV1, worldX: number, worldZ: number, waterLevel: number): StructuralEvaluation {
   const baseElevation = 0;
   const landforms = document.primitives.filter((primitive): primitive is LandformAreaV1 => (
@@ -23,21 +16,17 @@ export function evaluateStructuralHeight(config: WorldConfig, document: Authorin
     primitive.enabled && primitive.type === 'mountainSpline' && primitive.anchors.length >= 2
   ));
 
-  const candidates: LandformCandidate[] = [];
-  landforms.forEach((primitive, order) => {
+  let elevation = baseElevation;
+  let appliedLandform: LandformAreaV1 | undefined;
+  landforms.map((primitive, order) => ({ primitive, order }))
+    .sort((a, b) => a.primitive.priority - b.primitive.priority || a.order - b.order)
+    .forEach(({ primitive }) => {
     const weight = landformWeightAt(primitive, worldX, worldZ);
     if (weight <= 0) return;
-    candidates.push({
-      primitive,
-      elevation: getLandformTargetElevation(primitive, waterLevel, config.worldHeight),
-      weight,
-      order
-    });
+    elevation = lerp(elevation, getLandformTargetElevation(primitive, waterLevel, config.worldHeight), weight);
+    appliedLandform = primitive;
   });
 
-  candidates.sort((a, b) => b.primitive.priority - a.primitive.priority || b.order - a.order);
-  const selected = candidates[0];
-  let elevation = selected ? lerp(baseElevation, selected.elevation, selected.weight) : baseElevation;
   let mountainContribution = 0;
   for (const primitive of mountains) {
     mountainContribution += mountainWeightAt(primitive, worldX, worldZ) * Math.max(0, primitive.height);
@@ -46,7 +35,7 @@ export function evaluateStructuralHeight(config: WorldConfig, document: Authorin
 
   return {
     elevation,
-    landform: selected?.primitive,
+    landform: appliedLandform,
     mountainContribution
   };
 }

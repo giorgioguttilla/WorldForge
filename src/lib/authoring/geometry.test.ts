@@ -64,6 +64,21 @@ describe('authoring geometry', () => {
     expect(evaluateStructuralHeight(config, document, 0, 0, 100).elevation).toBe(400);
   });
 
+  it('blends landform edges from the previous layered result', () => {
+    const base = land('base', 200, 0, 'a');
+    const top = land('top', 600, 1, 'b');
+    top.edgeSmoothness = 5;
+    const document: AuthoringDocumentV1 = {
+      version: 1,
+      worldId: 'world',
+      primitives: [base, top]
+    };
+
+    const edge = evaluateStructuralHeight(config, document, 9.5, 0, 100).elevation;
+    expect(edge).toBeGreaterThan(200);
+    expect(edge).toBeLessThan(260);
+  });
+
   it('fades landforms near polygon edges', () => {
     const primitive = land('soft', 500, 0, 'a');
     primitive.edgeSmoothness = 5;
