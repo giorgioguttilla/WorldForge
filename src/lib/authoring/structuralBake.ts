@@ -2,7 +2,7 @@ import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
 import type { AuthoringDocumentV1, BakeMetadataV1 } from './authoringDocument';
-import { elevationToR16, evaluateStructuralHeight, stableAuthoringHash } from './geometry';
+import { elevationToR16, evaluatePreparedStructuralHeight, filterPreparedStructuralDocumentForBounds, prepareStructuralDocument, stableAuthoringHash, type PreparedStructuralDocument } from './geometry';
 
 export interface BakeProgress {
   phase: 'baking' | 'building-lod';
@@ -53,10 +53,14 @@ interface BakeWorkerError {
 type BakeWorkerRequest =
   | {
       id: number;
-      type: 'bake-depth-zero-tile';
+      type: 'init-depth-zero-bake';
       config: WorldConfig;
       document: AuthoringDocumentV1;
       waterLevel: number;
+    }
+  | {
+      id: number;
+      type: 'bake-depth-zero-tile';
       tileX: number;
       tileY: number;
     }
@@ -120,15 +124,30 @@ export function createFailedBakeMetadata(config: WorldConfig, document: Authorin
 }
 
 export function bakeDepthZeroTile(config: WorldConfig, document: AuthoringDocumentV1, waterLevel: number, tileX: number, tileY: number): Uint16Array {
+  return bakePreparedDepthZeroTile(config, prepareStructuralDocument(document), waterLevel, tileX, tileY);
+}
+
+export function bakePreparedDepthZeroTile(config: WorldConfig, document: PreparedStructuralDocument, waterLevel: number, tileX: number, tileY: number): Uint16Array {
   const samples = new Uint16Array(config.tileSize * config.tileSize);
   const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+  const tileMinX = tileX * config.tileSize * config.unitSize - worldSize / 2;
+  const tileMinZ = tileY * config.tileSize * config.unitSize - worldSize / 2;
+  const tileMaxX = tileMinX + (config.tileSize - 1) * config.unitSize;
+  const tileMaxZ = tileMinZ + (config.tileSize - 1) * config.unitSize;
+  const prepared = filterPreparedStructuralDocumentForBounds(document, {
+    minX: tileMinX,
+    maxX: tileMaxX,
+    minZ: tileMinZ,
+    maxZ: tileMaxZ
+  });
+
   for (let sampleY = 0; sampleY < config.tileSize; sampleY += 1) {
     for (let sampleX = 0; sampleX < config.tileSize; sampleX += 1) {
       const globalX = tileX * config.tileSize + sampleX;
       const globalY = tileY * config.tileSize + sampleY;
       const worldX = globalX * config.unitSize - worldSize / 2;
       const worldZ = globalY * config.unitSize - worldSize / 2;
-      const { elevation } = evaluateStructuralHeight(config, document, worldX, worldZ, waterLevel);
+      const { elevation } = evaluatePreparedStructuralHeight(config, prepared, worldX, worldZ, waterLevel);
       samples[sampleY * config.tileSize + sampleX] = elevationToR16(elevation, config.worldHeight);
     }
   }
@@ -153,9 +172,10 @@ async function runDepthZeroStructuralPass(
   let written = 0;
   const total = jobs.length;
   if (!canUseBakeWorkers() || total <= 1) {
+    const prepared = prepareStructuralDocument(document);
     for (const job of jobs) {
       const key = { x: job.x, y: job.y, d: 0 };
-      await io.writeTile(key, bakeDepthZeroTile(config, document, waterLevel, job.x, job.y));
+      await io.writeTile(key, bakePreparedDepthZeroTile(config, prepared, waterLevel, job.x, job.y));
       dirtyTiles.push(key);
       written += 1;
       onProgress?.({ phase: 'baking', current: written, total, label: `Baking structural tiles ${written} / ${total}` });
@@ -168,9 +188,6 @@ async function runDepthZeroStructuralPass(
     (job, id) => ({
       id,
       type: 'bake-depth-zero-tile',
-      config,
-      document,
-      waterLevel,
       tileX: job.x,
       tileY: job.y
     }),
@@ -179,7 +196,14 @@ async function runDepthZeroStructuralPass(
       dirtyTiles.push(key);
       written += 1;
       onProgress?.({ phase: 'baking', current: written, total, label: `Baking structural tiles ${written} / ${total}` });
-    }
+    },
+    () => ({
+      id: 0,
+      type: 'init-depth-zero-bake',
+      config,
+      document,
+      waterLevel
+    })
   );
 
   return { id: 'depth-zero-structural', dirtyTiles };
@@ -243,7 +267,8 @@ async function runLodRebuildPass(
 async function runEphemeralWorkerPool<TJob>(
   jobs: TJob[],
   createRequest: (job: TJob, id: number) => BakeWorkerRequest | Promise<BakeWorkerRequest>,
-  handleResult: (result: BakeWorkerResponse) => Promise<void>
+  handleResult: (result: BakeWorkerResponse) => Promise<void>,
+  createInitRequest?: () => BakeWorkerRequest
 ): Promise<void> {
   const concurrency = Math.min(getWorkerConcurrency(), jobs.length);
   let nextJobIndex = 0;
@@ -278,6 +303,8 @@ async function runEphemeralWorkerPool<TJob>(
       worker.onerror = (event) => {
         rejectWorker(new Error(event.message));
       };
+      const initRequest = createInitRequest?.();
+      if (initRequest) worker.postMessage(initRequest);
       runNext();
     })));
   } finally {

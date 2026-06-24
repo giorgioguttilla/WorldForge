@@ -1,15 +1,21 @@
 import type { AuthoringDocumentV1 } from './authoringDocument';
-import { bakeDepthZeroTile } from './structuralBake';
+import { bakePreparedDepthZeroTile } from './structuralBake';
 import type { TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
 import { downsample2x2Children } from '../heightmap/lodBuilder';
+import { prepareStructuralDocument, type PreparedStructuralDocument } from './geometry';
+
+interface InitDepthZeroBakeRequest {
+  id: number;
+  type: 'init-depth-zero-bake';
+  config: WorldConfig;
+  document: AuthoringDocumentV1;
+  waterLevel: number;
+}
 
 interface BakeDepthZeroTileRequest {
   id: number;
   type: 'bake-depth-zero-tile';
-  config: WorldConfig;
-  document: AuthoringDocumentV1;
-  waterLevel: number;
   tileX: number;
   tileY: number;
 }
@@ -22,7 +28,7 @@ interface DownsampleLodTileRequest {
   children: ArrayBuffer[];
 }
 
-type BakeWorkerRequest = BakeDepthZeroTileRequest | DownsampleLodTileRequest;
+type BakeWorkerRequest = InitDepthZeroBakeRequest | BakeDepthZeroTileRequest | DownsampleLodTileRequest;
 
 interface BakeWorkerResponse {
   id: number;
@@ -35,11 +41,23 @@ interface BakeWorkerError {
   error: string;
 }
 
+let depthZeroState: { config: WorldConfig; prepared: PreparedStructuralDocument; waterLevel: number } | null = null;
+
 self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
   const request = event.data;
   try {
+    if (request.type === 'init-depth-zero-bake') {
+      depthZeroState = {
+        config: request.config,
+        prepared: prepareStructuralDocument(request.document),
+        waterLevel: request.waterLevel
+      };
+      return;
+    }
+
     if (request.type === 'bake-depth-zero-tile') {
-      const samples = bakeDepthZeroTile(request.config, request.document, request.waterLevel, request.tileX, request.tileY);
+      if (!depthZeroState) throw new Error('Depth-zero bake worker was not initialized.');
+      const samples = bakePreparedDepthZeroTile(depthZeroState.config, depthZeroState.prepared, depthZeroState.waterLevel, request.tileX, request.tileY);
       const response: BakeWorkerResponse = {
         id: request.id,
         key: { x: request.tileX, y: request.tileY, d: 0 },

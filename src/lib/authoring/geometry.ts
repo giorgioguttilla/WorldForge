@@ -7,29 +7,92 @@ export interface StructuralEvaluation {
   mountainContribution: number;
 }
 
-export function evaluateStructuralHeight(config: WorldConfig, document: AuthoringDocumentV1, worldX: number, worldZ: number, waterLevel: number): StructuralEvaluation {
-  const baseElevation = 0;
-  const landforms = document.primitives.filter((primitive): primitive is LandformAreaV1 => (
-    primitive.enabled && primitive.type === 'landformArea' && primitive.anchors.length >= 3
-  ));
-  const mountains = document.primitives.filter((primitive): primitive is MountainSplineV1 => (
-    primitive.enabled && primitive.type === 'mountainSpline' && primitive.anchors.length >= 2
-  ));
+export interface Bounds2D {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
 
+export interface PreparedLandform {
+  primitive: LandformAreaV1;
+  order: number;
+  xs: number[];
+  zs: number[];
+  bounds: Bounds2D;
+}
+
+export interface PreparedMountain {
+  primitive: MountainSplineV1;
+  xs: number[];
+  zs: number[];
+  bounds: Bounds2D;
+}
+
+export interface PreparedStructuralDocument {
+  landforms: PreparedLandform[];
+  mountains: PreparedMountain[];
+}
+
+export function evaluateStructuralHeight(config: WorldConfig, document: AuthoringDocumentV1, worldX: number, worldZ: number, waterLevel: number): StructuralEvaluation {
+  return evaluatePreparedStructuralHeight(config, prepareStructuralDocument(document), worldX, worldZ, waterLevel);
+}
+
+export function prepareStructuralDocument(document: AuthoringDocumentV1): PreparedStructuralDocument {
+  const landforms = document.primitives
+    .map((primitive, order) => ({ primitive, order }))
+    .filter((entry): entry is { primitive: LandformAreaV1; order: number } => (
+      entry.primitive.enabled && entry.primitive.type === 'landformArea' && entry.primitive.anchors.length >= 3
+    ))
+    .map(({ primitive, order }) => ({
+      primitive,
+      order,
+      ...prepareAnchorArrays(primitive.anchors, 0)
+    }))
+    .sort((a, b) => a.primitive.priority - b.primitive.priority || a.order - b.order);
+
+  const mountains = document.primitives
+    .filter((primitive): primitive is MountainSplineV1 => (
+      primitive.enabled && primitive.type === 'mountainSpline' && primitive.anchors.length >= 2
+    ))
+    .map((primitive) => ({
+      primitive,
+      ...prepareAnchorArrays(primitive.anchors, primitive.width / 2)
+    }));
+
+  return { landforms, mountains };
+}
+
+export function filterPreparedStructuralDocumentForBounds(document: PreparedStructuralDocument, bounds: Bounds2D): PreparedStructuralDocument {
+  return {
+    landforms: document.landforms.filter((landform) => boundsOverlap(landform.bounds, bounds)),
+    mountains: document.mountains.filter((mountain) => boundsOverlap(mountain.bounds, bounds))
+  };
+}
+
+export function evaluatePreparedStructuralHeight(
+  config: WorldConfig,
+  document: PreparedStructuralDocument,
+  worldX: number,
+  worldZ: number,
+  waterLevel: number
+): StructuralEvaluation {
+  const baseElevation = 0;
   let elevation = baseElevation;
   let appliedLandform: LandformAreaV1 | undefined;
-  landforms.map((primitive, order) => ({ primitive, order }))
-    .sort((a, b) => a.primitive.priority - b.primitive.priority || a.order - b.order)
-    .forEach(({ primitive }) => {
-    const weight = landformWeightAt(primitive, worldX, worldZ);
-    if (weight <= 0) return;
+  for (const landform of document.landforms) {
+    const primitive = landform.primitive;
+    if (!boundsContains(landform.bounds, worldX, worldZ)) continue;
+    const weight = preparedLandformWeightAt(landform, worldX, worldZ);
+    if (weight <= 0) continue;
     elevation = lerp(elevation, getLandformTargetElevation(primitive, waterLevel, config.worldHeight), weight);
     appliedLandform = primitive;
-  });
+  }
 
   let mountainContribution = 0;
-  for (const primitive of mountains) {
-    mountainContribution += mountainWeightAt(primitive, worldX, worldZ) * Math.max(0, primitive.height);
+  for (const mountain of document.mountains) {
+    if (!boundsContains(mountain.bounds, worldX, worldZ)) continue;
+    mountainContribution += preparedMountainWeightAt(mountain, worldX, worldZ) * Math.max(0, mountain.primitive.height);
   }
   elevation = clamp(elevation + mountainContribution, 0, config.worldHeight);
 
@@ -60,6 +123,26 @@ export function mountainWeightAt(primitive: MountainSplineV1, x: number, z: numb
   return 1 - smoothstep(fadeStart, halfWidth, distance);
 }
 
+function preparedLandformWeightAt(landform: PreparedLandform, x: number, z: number): number {
+  if (!pointInPreparedPolygon(x, z, landform.xs, landform.zs)) return 0;
+  const edgeDistance = distanceToPreparedPolyline(x, z, landform.xs, landform.zs, true);
+  if (landform.primitive.edgeSmoothness <= 0) return 1;
+  return smoothstep(0, landform.primitive.edgeSmoothness, edgeDistance);
+}
+
+function preparedMountainWeightAt(mountain: PreparedMountain, x: number, z: number): number {
+  const primitive = mountain.primitive;
+  if (primitive.width <= 0) return 0;
+  const halfWidth = primitive.width / 2;
+  const distance = distanceToPreparedPolyline(x, z, mountain.xs, mountain.zs, false);
+  if (distance >= halfWidth) return 0;
+  const edgeSmoothness = Math.max(0, Math.min(primitive.edgeSmoothness, halfWidth));
+  if (edgeSmoothness === 0) return 1 - distance / halfWidth;
+  const fadeStart = Math.max(0, halfWidth - edgeSmoothness);
+  if (distance <= fadeStart) return 1;
+  return 1 - smoothstep(fadeStart, halfWidth, distance);
+}
+
 export function pointInPolygon(x: number, z: number, polygon: AnchorV1[]): boolean {
   let inside = false;
   for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
@@ -72,23 +155,54 @@ export function pointInPolygon(x: number, z: number, polygon: AnchorV1[]): boole
 }
 
 export function distanceToPolyline(x: number, z: number, anchors: AnchorV1[], closed: boolean): number {
-  let best = Number.POSITIVE_INFINITY;
+  let bestSq = Number.POSITIVE_INFINITY;
   const segmentCount = closed ? anchors.length : anchors.length - 1;
   for (let i = 0; i < segmentCount; i += 1) {
     const a = anchors[i];
     const b = anchors[(i + 1) % anchors.length];
-    best = Math.min(best, distanceToSegment(x, z, a.x, a.z, b.x, b.z));
+    bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, a.x, a.z, b.x, b.z));
   }
-  return best;
+  return Math.sqrt(bestSq);
+}
+
+function pointInPreparedPolygon(x: number, z: number, xs: number[], zs: number[]): boolean {
+  let inside = false;
+  for (let i = 0, j = xs.length - 1; i < xs.length; j = i, i += 1) {
+    const zi = zs[i];
+    const zj = zs[j];
+    const intersects = zi > z !== zj > z && x < ((xs[j] - xs[i]) * (z - zi)) / (zj - zi || Number.EPSILON) + xs[i];
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function distanceToPreparedPolyline(x: number, z: number, xs: number[], zs: number[], closed: boolean): number {
+  let bestSq = Number.POSITIVE_INFINITY;
+  const segmentCount = closed ? xs.length : xs.length - 1;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const next = (i + 1) % xs.length;
+    bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, xs[i], zs[i], xs[next], zs[next]));
+  }
+  return Math.sqrt(bestSq);
 }
 
 export function distanceToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
+  return Math.sqrt(distanceToSegmentSq(px, pz, ax, az, bx, bz));
+}
+
+function distanceToSegmentSq(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
   const dx = bx - ax;
   const dz = bz - az;
   const lengthSq = dx * dx + dz * dz;
-  if (lengthSq === 0) return Math.hypot(px - ax, pz - az);
+  if (lengthSq === 0) {
+    const pointDx = px - ax;
+    const pointDz = pz - az;
+    return pointDx * pointDx + pointDz * pointDz;
+  }
   const t = clamp(((px - ax) * dx + (pz - az) * dz) / lengthSq, 0, 1);
-  return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+  const closestDx = px - (ax + dx * t);
+  const closestDz = pz - (az + dz * t);
+  return closestDx * closestDx + closestDz * closestDz;
 }
 
 export function smoothstep(edge0: number, edge1: number, value: number): number {
@@ -126,4 +240,41 @@ function lerp(a: number, b: number, t: number): number {
 function getLandformTargetElevation(primitive: LandformAreaV1, waterLevel: number, worldHeight: number): number {
   if (primitive.mode === 'water') return clamp(Math.min(primitive.elevation, waterLevel - 1), 0, worldHeight);
   return clamp(Math.max(primitive.elevation, waterLevel + 1), 0, worldHeight);
+}
+
+function prepareAnchorArrays(anchors: AnchorV1[], padding: number): { xs: number[]; zs: number[]; bounds: Bounds2D } {
+  const xs: number[] = [];
+  const zs: number[] = [];
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  for (const anchor of anchors) {
+    xs.push(anchor.x);
+    zs.push(anchor.z);
+    minX = Math.min(minX, anchor.x);
+    maxX = Math.max(maxX, anchor.x);
+    minZ = Math.min(minZ, anchor.z);
+    maxZ = Math.max(maxZ, anchor.z);
+  }
+
+  return {
+    xs,
+    zs,
+    bounds: {
+      minX: minX - padding,
+      maxX: maxX + padding,
+      minZ: minZ - padding,
+      maxZ: maxZ + padding
+    }
+  };
+}
+
+function boundsOverlap(a: Bounds2D, b: Bounds2D): boolean {
+  return a.maxX >= b.minX && a.minX <= b.maxX && a.maxZ >= b.minZ && a.minZ <= b.maxZ;
+}
+
+function boundsContains(bounds: Bounds2D, x: number, z: number): boolean {
+  return x >= bounds.minX && x <= bounds.maxX && z >= bounds.minZ && z <= bounds.maxZ;
 }
