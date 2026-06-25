@@ -7,7 +7,7 @@
   import type { ViewMode } from './lib/render/cameraController';
   import type { VisualizationMode } from './lib/render/terrainRenderer';
   import { createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
-  import { distanceToPolyline, pointInPolygon } from './lib/authoring/geometry';
+  import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -562,11 +562,11 @@
   }
 
   function primitiveContainsPoint(primitive: PrimitiveV1, x: number, z: number, threshold: number) {
-    if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInPolygon(x, z, primitive.anchors)) return true;
+    if (primitive.type === 'landformArea' && primitive.anchors.length >= 3 && pointInSplinePolygon(x, z, primitive.anchors, primitive.splineSmoothness)) return true;
     if (primitive.type === 'mountainSpline' && primitive.anchors.length >= 2) {
-      return distanceToPolyline(x, z, primitive.anchors, false) <= Math.max(threshold * 1.6, primitive.width / 2);
+      return distanceToSpline(x, z, primitive.anchors, false, primitive.splineSmoothness) <= Math.max(threshold * 1.6, primitive.width / 2);
     }
-    return primitive.anchors.length >= 2 && distanceToPolyline(x, z, primitive.anchors, primitive.type === 'landformArea') <= threshold;
+    return primitive.anchors.length >= 2 && distanceToSpline(x, z, primitive.anchors, primitive.type === 'landformArea', primitive.splineSmoothness) <= threshold;
   }
 
   function countPrimitiveType(type: PrimitiveV1['type']) {
@@ -816,6 +816,10 @@
             <span>Edge smoothness</span>
             <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
           </label>
+          <label>
+            <span>Curve smoothness</span>
+            <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+          </label>
         {:else}
           <div class="field-grid compact">
             <label>
@@ -830,6 +834,10 @@
           <label>
             <span>Edge smoothness</span>
             <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+          </label>
+          <label>
+            <span>Curve smoothness</span>
+            <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
           </label>
         {/if}
         <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Delete</button>

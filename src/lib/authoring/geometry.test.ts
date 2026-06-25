@@ -28,6 +28,7 @@ function land(id: string, elevation: number, priority: number, createdAt: string
     mode: 'land',
     elevation,
     edgeSmoothness: 0,
+    splineSmoothness: 0,
     priority,
     anchors: [
       { id: `${id}-a`, x: -10, z: -10 },
@@ -99,6 +100,7 @@ describe('authoring geometry', () => {
       height: 300,
       width: 10,
       edgeSmoothness: 5,
+      splineSmoothness: 0.65,
       anchors: [{ id: 'a', x: -10, z: 0 }, { id: 'b', x: 10, z: 0 }]
     };
 
@@ -106,5 +108,29 @@ describe('authoring geometry', () => {
     expect(mountainWeightAt(primitive, 0, 4)).toBeGreaterThan(0);
     expect(mountainWeightAt(primitive, 0, 5)).toBe(0);
     expect(mountainWeightAt(primitive, 0, 6)).toBe(0);
+  });
+
+  it('uses spline smoothness when evaluating mountain control points', () => {
+    const primitive: MountainSplineV1 = {
+      id: 'range',
+      type: 'mountainSpline',
+      name: 'Range',
+      enabled: true,
+      createdAt: 'a',
+      updatedAt: 'a',
+      height: 300,
+      width: 1,
+      edgeSmoothness: 1,
+      splineSmoothness: 1,
+      anchors: [
+        { id: 'a', x: 0, z: 0 },
+        { id: 'b', x: 10, z: 10 },
+        { id: 'c', x: 20, z: 10 },
+        { id: 'd', x: 30, z: 0 }
+      ]
+    };
+
+    expect(mountainWeightAt(primitive, 15, 11.25)).toBeGreaterThan(0.9);
+    expect(mountainWeightAt({ ...primitive, splineSmoothness: 0 }, 15, 11.25)).toBe(0);
   });
 });

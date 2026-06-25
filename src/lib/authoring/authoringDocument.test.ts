@@ -28,6 +28,7 @@ describe('authoring document', () => {
         mode: 'plateau',
         elevation: '120',
         edgeSmoothness: -4,
+        splineSmoothness: '2',
         priority: '3',
         anchors: [{ id: 'a', x: 1, z: 2 }, { id: 'bad', x: 'nope', z: 3 }]
       }]
@@ -41,8 +42,31 @@ describe('authoring document', () => {
       mode: 'plateau',
       elevation: 120,
       edgeSmoothness: 0,
+      splineSmoothness: 1,
       priority: 3,
       anchors: [{ id: 'a', x: 1, z: 2 }]
+    });
+  });
+
+  it('adds default spline smoothness to older primitives', () => {
+    const document = normalizeAuthoringDocument({
+      primitives: [{
+        id: 'mountain-1',
+        type: 'mountainSpline',
+        name: 'Range',
+        enabled: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        height: 100,
+        width: 400,
+        edgeSmoothness: 80,
+        anchors: [{ id: 'a', x: 0, z: 0 }, { id: 'b', x: 100, z: 100 }]
+      }]
+    }, 'world-a');
+
+    expect(document.primitives[0]).toMatchObject({
+      type: 'mountainSpline',
+      splineSmoothness: 0.65
     });
   });
 });

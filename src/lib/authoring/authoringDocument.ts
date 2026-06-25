@@ -1,3 +1,5 @@
+import { DEFAULT_SPLINE_SMOOTHNESS } from './spline';
+
 export type PrimitiveTypeV1 = 'landformArea' | 'mountainSpline';
 export type LandformModeV1 = 'land' | 'water' | 'plateau';
 export type BakeStatusV1 = 'clean' | 'failed';
@@ -22,6 +24,7 @@ export interface LandformAreaV1 extends PrimitiveBaseV1 {
   mode: LandformModeV1;
   elevation: number;
   edgeSmoothness: number;
+  splineSmoothness: number;
   priority: number;
   anchors: AnchorV1[];
 }
@@ -31,6 +34,7 @@ export interface MountainSplineV1 extends PrimitiveBaseV1 {
   height: number;
   width: number;
   edgeSmoothness: number;
+  splineSmoothness: number;
   anchors: AnchorV1[];
 }
 
@@ -55,7 +59,6 @@ export interface AuthoringDocumentV1 {
 }
 
 const LAND_MODES = new Set<LandformModeV1>(['land', 'water', 'plateau']);
-
 export function createEmptyAuthoringDocument(worldId: string): AuthoringDocumentV1 {
   return {
     version: 1,
@@ -99,6 +102,7 @@ export function createLandformArea(anchors: AnchorV1[], waterLevel: number, inde
     mode: 'land',
     elevation: Math.max(0, waterLevel + 80),
     edgeSmoothness: 120,
+    splineSmoothness: DEFAULT_SPLINE_SMOOTHNESS,
     priority: 0,
     anchors
   };
@@ -116,6 +120,7 @@ export function createMountainSpline(anchors: AnchorV1[], index: number): Mounta
     height: 220,
     width: 550,
     edgeSmoothness: 180,
+    splineSmoothness: DEFAULT_SPLINE_SMOOTHNESS,
     anchors
   };
 }
@@ -132,6 +137,7 @@ function normalizePrimitive(value: unknown): PrimitiveV1 | null {
       mode: LAND_MODES.has(value.mode as LandformModeV1) ? (value.mode as LandformModeV1) : 'land',
       elevation: finiteNumber(value.elevation, 0),
       edgeSmoothness: Math.max(0, finiteNumber(value.edgeSmoothness, 0)),
+      splineSmoothness: clamp(finiteNumber(value.splineSmoothness, DEFAULT_SPLINE_SMOOTHNESS), 0, 1),
       priority: finiteNumber(value.priority, 0),
       anchors
     };
@@ -143,6 +149,7 @@ function normalizePrimitive(value: unknown): PrimitiveV1 | null {
       height: finiteNumber(value.height, 0),
       width: Math.max(0, finiteNumber(value.width, 0)),
       edgeSmoothness: Math.max(0, finiteNumber(value.edgeSmoothness, 0)),
+      splineSmoothness: clamp(finiteNumber(value.splineSmoothness, DEFAULT_SPLINE_SMOOTHNESS), 0, 1),
       anchors
     };
   }
@@ -192,6 +199,10 @@ function normalizeBakeMetadata(value: unknown): BakeMetadataV1 | undefined {
 function finiteNumber(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

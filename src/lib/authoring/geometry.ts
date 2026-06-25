@@ -1,5 +1,6 @@
 import type { AnchorV1, AuthoringDocumentV1, LandformAreaV1, MountainSplineV1 } from './authoringDocument';
 import type { WorldConfig } from '../heightmap/worldConfig';
+import { sampleSplineAnchors } from './spline';
 
 export interface StructuralEvaluation {
   elevation: number;
@@ -47,7 +48,7 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
     .map(({ primitive, order }) => ({
       primitive,
       order,
-      ...prepareAnchorArrays(primitive.anchors, 0)
+      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, true, primitive.splineSmoothness), 0)
     }))
     .sort((a, b) => a.primitive.priority - b.primitive.priority || a.order - b.order);
 
@@ -57,7 +58,7 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
     ))
     .map((primitive) => ({
       primitive,
-      ...prepareAnchorArrays(primitive.anchors, primitive.width / 2)
+      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, false, primitive.splineSmoothness), primitive.width / 2)
     }));
 
   return { landforms, mountains };
@@ -105,16 +106,18 @@ export function evaluatePreparedStructuralHeight(
 
 export function landformWeightAt(primitive: LandformAreaV1, x: number, z: number): number {
   if (primitive.anchors.length < 3) return 0;
-  if (!pointInPolygon(x, z, primitive.anchors)) return 0;
-  const edgeDistance = distanceToPolyline(x, z, primitive.anchors, true);
+  const points = sampleSplineAnchors(primitive.anchors, true, primitive.splineSmoothness);
+  if (!pointInSampledPolygon(x, z, points)) return 0;
+  const edgeDistance = distanceToSampledPolyline(x, z, points, true);
   if (primitive.edgeSmoothness <= 0) return 1;
   return smoothstep(0, primitive.edgeSmoothness, edgeDistance);
 }
 
 export function mountainWeightAt(primitive: MountainSplineV1, x: number, z: number): number {
   if (primitive.anchors.length < 2 || primitive.width <= 0) return 0;
+  const points = sampleSplineAnchors(primitive.anchors, false, primitive.splineSmoothness);
   const halfWidth = primitive.width / 2;
-  const distance = distanceToPolyline(x, z, primitive.anchors, false);
+  const distance = distanceToSampledPolyline(x, z, points, false);
   if (distance >= halfWidth) return 0;
   const edgeSmoothness = Math.max(0, Math.min(primitive.edgeSmoothness, halfWidth));
   if (edgeSmoothness === 0) return 1 - distance / halfWidth;
@@ -154,6 +157,10 @@ export function pointInPolygon(x: number, z: number, polygon: AnchorV1[]): boole
   return inside;
 }
 
+export function pointInSplinePolygon(x: number, z: number, polygon: AnchorV1[], smoothness: number): boolean {
+  return pointInSampledPolygon(x, z, sampleSplineAnchors(polygon, true, smoothness));
+}
+
 export function distanceToPolyline(x: number, z: number, anchors: AnchorV1[], closed: boolean): number {
   let bestSq = Number.POSITIVE_INFINITY;
   const segmentCount = closed ? anchors.length : anchors.length - 1;
@@ -163,6 +170,10 @@ export function distanceToPolyline(x: number, z: number, anchors: AnchorV1[], cl
     bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, a.x, a.z, b.x, b.z));
   }
   return Math.sqrt(bestSq);
+}
+
+export function distanceToSpline(x: number, z: number, anchors: AnchorV1[], closed: boolean, smoothness: number): number {
+  return distanceToSampledPolyline(x, z, sampleSplineAnchors(anchors, closed, smoothness), closed);
 }
 
 function pointInPreparedPolygon(x: number, z: number, xs: number[], zs: number[]): boolean {
@@ -176,12 +187,34 @@ function pointInPreparedPolygon(x: number, z: number, xs: number[], zs: number[]
   return inside;
 }
 
+function pointInSampledPolygon(x: number, z: number, polygon: { x: number; z: number }[]): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const pi = polygon[i];
+    const pj = polygon[j];
+    const intersects = pi.z > z !== pj.z > z && x < ((pj.x - pi.x) * (z - pi.z)) / (pj.z - pi.z || Number.EPSILON) + pi.x;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
 function distanceToPreparedPolyline(x: number, z: number, xs: number[], zs: number[], closed: boolean): number {
   let bestSq = Number.POSITIVE_INFINITY;
   const segmentCount = closed ? xs.length : xs.length - 1;
   for (let i = 0; i < segmentCount; i += 1) {
     const next = (i + 1) % xs.length;
     bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, xs[i], zs[i], xs[next], zs[next]));
+  }
+  return Math.sqrt(bestSq);
+}
+
+function distanceToSampledPolyline(x: number, z: number, points: { x: number; z: number }[], closed: boolean): number {
+  let bestSq = Number.POSITIVE_INFINITY;
+  const segmentCount = closed ? points.length : points.length - 1;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, a.x, a.z, b.x, b.z));
   }
   return Math.sqrt(bestSq);
 }
@@ -242,7 +275,7 @@ function getLandformTargetElevation(primitive: LandformAreaV1, waterLevel: numbe
   return clamp(Math.max(primitive.elevation, waterLevel + 1), 0, worldHeight);
 }
 
-function prepareAnchorArrays(anchors: AnchorV1[], padding: number): { xs: number[]; zs: number[]; bounds: Bounds2D } {
+function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: number): { xs: number[]; zs: number[]; bounds: Bounds2D } {
   const xs: number[] = [];
   const zs: number[] = [];
   let minX = Number.POSITIVE_INFINITY;
