@@ -47,7 +47,18 @@
   let undoStack: AuthoringDocumentV1[] = [];
   let redoStack: AuthoringDocumentV1[] = [];
   let draggingAnchor: { primitiveId: string; anchorId: string } | null = null;
+  let shapeTransform: {
+    primitiveId: string;
+    mode: 'translate' | 'rotate';
+    startPoint: { x: number; z: number };
+    pivot: { x: number; z: number };
+    startAngle: number;
+    startPrimitive: PrimitiveV1;
+    startDocument: AuthoringDocumentV1;
+    moved: boolean;
+  } | null = null;
   let dragStarted = false;
+  let authoringSyncFrame: number | null = null;
 
   $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
@@ -120,6 +131,7 @@
       window.removeEventListener('keydown', keyHandler);
       if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
       if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
+      if (authoringSyncFrame !== null) window.cancelAnimationFrame(authoringSyncFrame);
       resizeObserver.disconnect();
       viewport?.dispose();
     };
@@ -128,6 +140,7 @@
   onDestroy(() => {
     if (waterSaveTimer !== null) window.clearTimeout(waterSaveTimer);
     if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
+    if (authoringSyncFrame !== null) window.cancelAnimationFrame(authoringSyncFrame);
     viewport?.dispose();
   });
 
@@ -300,10 +313,22 @@
   }
 
   function syncAuthoringViewport() {
+    if (authoringSyncFrame !== null) {
+      window.cancelAnimationFrame(authoringSyncFrame);
+      authoringSyncFrame = null;
+    }
     viewport?.setAuthoringDocument(authoringDocument);
     viewport?.setAuthoringSelection({ primitiveId: selectedPrimitiveId, anchorId: selectedAnchorId });
     viewport?.setAuthoringPreview(draftAnchors);
     viewport?.setAuthoringVisible(showAuthoring);
+  }
+
+  function scheduleAuthoringViewportSync() {
+    if (authoringSyncFrame !== null) return;
+    authoringSyncFrame = window.requestAnimationFrame(() => {
+      authoringSyncFrame = null;
+      syncAuthoringViewport();
+    });
   }
 
   function commitAuthoring(next: AuthoringDocumentV1, options: { stale?: boolean; undo?: boolean } = {}) {
@@ -354,6 +379,7 @@
   function cancelDraft() {
     draftAnchors = [];
     draggingAnchor = null;
+    shapeTransform = null;
     dragStarted = false;
     syncAuthoringViewport();
   }
@@ -380,6 +406,24 @@
       return true;
     }
 
+    const transformHit = findTransformHandleHit(point.x, point.z);
+    if (transformHit) {
+      selectedPrimitiveId = transformHit.primitive.id;
+      selectedAnchorId = null;
+      shapeTransform = {
+        primitiveId: transformHit.primitive.id,
+        mode: transformHit.mode,
+        startPoint: { x: point.x, z: point.z },
+        pivot: transformHit.controls.pivot,
+        startAngle: Math.atan2(point.z - transformHit.controls.pivot.z, point.x - transformHit.controls.pivot.x),
+        startPrimitive: clonePrimitive(transformHit.primitive),
+        startDocument: cloneDocument(authoringDocument),
+        moved: false
+      };
+      syncAuthoringViewport();
+      return true;
+    }
+
     const anchorHit = findAnchorHit(point.x, point.z);
     if (anchorHit) {
       selectedPrimitiveId = anchorHit.primitiveId;
@@ -397,6 +441,16 @@
   }
 
   function handleAuthoringPointerMove(point: AuthoringPointerPoint): boolean {
+    if (authoringDocument && shapeTransform) {
+      const transformed = transformPrimitive(shapeTransform, point);
+      if (!transformed) return false;
+      authoringDocument = replacePrimitiveInDocument(authoringDocument, transformed);
+      bakeState = 'stale';
+      shapeTransform.moved = true;
+      scheduleAuthoringViewportSync();
+      return true;
+    }
+
     if (!authoringDocument || !draggingAnchor) return false;
     const next = cloneDocument(authoringDocument);
     const primitive = next.primitives.find((item) => item.id === draggingAnchor?.primitiveId);
@@ -418,6 +472,20 @@
   }
 
   function handleAuthoringPointerUp(_point: AuthoringPointerPoint): boolean {
+    if (shapeTransform) {
+      const handled = shapeTransform.moved;
+      if (handled && authoringDocument) {
+        const primitive = authoringDocument.primitives.find((item) => item.id === shapeTransform?.primitiveId);
+        if (primitive) primitive.updatedAt = new Date().toISOString();
+        undoStack = [...undoStack.slice(-24), shapeTransform.startDocument];
+        redoStack = [];
+        scheduleAuthoringSave();
+      }
+      shapeTransform = null;
+      syncAuthoringViewport();
+      return handled;
+    }
+
     const handled = Boolean(draggingAnchor);
     draggingAnchor = null;
     dragStarted = false;
@@ -470,6 +538,10 @@
 
   function replacePrimitive(primitive: PrimitiveV1): AuthoringDocumentV1 {
     const document = authoringDocument ?? createEmptyAuthoringDocument(manager.config?.id ?? 'unknown');
+    return replacePrimitiveInDocument(document, primitive);
+  }
+
+  function replacePrimitiveInDocument(document: AuthoringDocumentV1, primitive: PrimitiveV1): AuthoringDocumentV1 {
     return {
       ...document,
       primitives: document.primitives.map((item) => item.id === primitive.id ? primitive : item)
@@ -479,11 +551,11 @@
   function undoAuthoring() {
     if (!authoringDocument || undoStack.length === 0) return;
     const previous = undoStack[undoStack.length - 1];
+    const previousSelection = { primitiveId: selectedPrimitiveId, anchorId: selectedAnchorId };
     redoStack = [...redoStack, cloneDocument(authoringDocument)];
     undoStack = undoStack.slice(0, -1);
     authoringDocument = cloneDocument(previous);
-    selectedPrimitiveId = null;
-    selectedAnchorId = null;
+    restoreSelection(previousSelection, authoringDocument);
     bakeState = 'stale';
     syncAuthoringViewport();
     scheduleAuthoringSave();
@@ -492,14 +564,20 @@
   function redoAuthoring() {
     if (!authoringDocument || redoStack.length === 0) return;
     const next = redoStack[redoStack.length - 1];
+    const previousSelection = { primitiveId: selectedPrimitiveId, anchorId: selectedAnchorId };
     undoStack = [...undoStack, cloneDocument(authoringDocument)];
     redoStack = redoStack.slice(0, -1);
     authoringDocument = cloneDocument(next);
-    selectedPrimitiveId = null;
-    selectedAnchorId = null;
+    restoreSelection(previousSelection, authoringDocument);
     bakeState = 'stale';
     syncAuthoringViewport();
     scheduleAuthoringSave();
+  }
+
+  function restoreSelection(selection: { primitiveId: string | null; anchorId: string | null }, document: AuthoringDocumentV1) {
+    const primitive = document.primitives.find((item) => item.id === selection.primitiveId);
+    selectedPrimitiveId = primitive?.id ?? null;
+    selectedAnchorId = primitive?.anchors.some((anchor) => anchor.id === selection.anchorId) ? selection.anchorId : null;
   }
 
   async function bakeAuthoring() {
@@ -541,6 +619,24 @@
       }
     }
     return best ? { primitiveId: best.primitiveId, anchorId: best.anchorId } : null;
+  }
+
+  function findTransformHandleHit(x: number, z: number): { primitive: PrimitiveV1; mode: 'translate' | 'rotate'; controls: TransformControls2D } | null {
+    if (!selectedPrimitive || activeTool !== 'select') return null;
+    const controls = getTransformControls(selectedPrimitive);
+    if (!controls) return null;
+    const threshold = hitThreshold();
+    const translateDistance = Math.hypot(x - controls.pivot.x, z - controls.pivot.z);
+    const arrowXDistance = distanceToSegment2D(x, z, controls.pivot.x, controls.pivot.z, controls.pivot.x + controls.arrowLength, controls.pivot.z);
+    const arrowZDistance = distanceToSegment2D(x, z, controls.pivot.x, controls.pivot.z, controls.pivot.x, controls.pivot.z + controls.arrowLength);
+    const translateThreshold = Math.max(22, threshold * 0.8);
+    if (translateDistance <= translateThreshold || arrowXDistance <= translateThreshold || arrowZDistance <= translateThreshold) {
+      return { primitive: selectedPrimitive, mode: 'translate', controls };
+    }
+    const distanceFromPivot = Math.hypot(x - controls.pivot.x, z - controls.pivot.z);
+    const ringThreshold = Math.max(controls.ringWidth * 0.65, threshold * 0.8);
+    if (Math.abs(distanceFromPivot - controls.radius) <= ringThreshold) return { primitive: selectedPrimitive, mode: 'rotate', controls };
+    return null;
   }
 
   function findPrimitiveHit(x: number, z: number): PrimitiveV1 | null {
@@ -588,6 +684,79 @@
 
   function cloneDocument(document: AuthoringDocumentV1): AuthoringDocumentV1 {
     return structuredClone(document);
+  }
+
+  function clonePrimitive(primitive: PrimitiveV1): PrimitiveV1 {
+    return structuredClone(primitive);
+  }
+
+  interface TransformControls2D {
+    pivot: { x: number; z: number };
+    radius: number;
+    ringWidth: number;
+    arrowLength: number;
+  }
+
+  function getTransformControls(primitive: PrimitiveV1): TransformControls2D | null {
+    if (primitive.anchors.length === 0) return null;
+    let x = 0;
+    let z = 0;
+    for (const anchor of primitive.anchors) {
+      x += anchor.x;
+      z += anchor.z;
+    }
+    const pivot = { x: x / primitive.anchors.length, z: z / primitive.anchors.length };
+    const scale = viewport?.getWorldUnitsPerScreenPixelAt(pivot.x, pivot.z) ?? 2;
+    const radius = 48 * scale;
+    const ringWidth = 17 * scale;
+    const arrowLength = 39 * scale;
+    return {
+      pivot,
+      radius,
+      ringWidth,
+      arrowLength
+    };
+  }
+
+  function distanceToSegment2D(px: number, pz: number, ax: number, az: number, bx: number, bz: number) {
+    const dx = bx - ax;
+    const dz = bz - az;
+    const lengthSq = dx * dx + dz * dz;
+    if (lengthSq === 0) return Math.hypot(px - ax, pz - az);
+    const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lengthSq));
+    return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+  }
+
+  function transformPrimitive(transform: NonNullable<typeof shapeTransform>, point: { x: number; z: number }): PrimitiveV1 | null {
+    if (transform.mode === 'translate') {
+      const dx = point.x - transform.startPoint.x;
+      const dz = point.z - transform.startPoint.z;
+      return {
+        ...transform.startPrimitive,
+        anchors: transform.startPrimitive.anchors.map((anchor) => ({
+          ...anchor,
+          x: anchor.x + dx,
+          z: anchor.z + dz
+        }))
+      } as PrimitiveV1;
+    }
+
+    const angle = Math.atan2(point.z - transform.pivot.z, point.x - transform.pivot.x);
+    const delta = angle - transform.startAngle;
+    const cos = Math.cos(delta);
+    const sin = Math.sin(delta);
+    return {
+      ...transform.startPrimitive,
+      anchors: transform.startPrimitive.anchors.map((anchor) => {
+        const dx = anchor.x - transform.pivot.x;
+        const dz = anchor.z - transform.pivot.z;
+        return {
+          ...anchor,
+          x: transform.pivot.x + dx * cos - dz * sin,
+          z: transform.pivot.z + dx * sin + dz * cos
+        };
+      })
+    } as PrimitiveV1;
   }
 
   function isTextInput(target: EventTarget | null) {

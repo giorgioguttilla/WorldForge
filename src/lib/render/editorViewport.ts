@@ -49,6 +49,7 @@ export class EditorViewport {
   private lastFrameTime = performance.now();
   private frame = 0;
   private disposed = false;
+  private lastControlScaleCameraKey = '';
   private waterSettings: WaterSettings = { visible: false, level: 0 };
   private authoringHandlers: AuthoringPointerHandlers | null = null;
   private authoringPointerId: number | null = null;
@@ -168,6 +169,10 @@ export class EditorViewport {
     this.updateTileGrid();
   }
 
+  getWorldUnitsPerScreenPixelAt(x: number, z: number): number {
+    return this.worldUnitsPerScreenPixelAt(new THREE.Vector3(x, this.waterSettings.level + 2, z));
+  }
+
   refreshTerrain(): void {
     this.terrain.clear();
     void this.terrain.update(this.controller.activeCamera);
@@ -181,6 +186,7 @@ export class EditorViewport {
     const delta = Math.min(0.1, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
     this.controller.update(delta);
+    this.updateAuthoringControlScale();
     if (this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
     this.rendererAdapter?.renderer.render(this.scene, this.controller.activeCamera);
     this.frame += 1;
@@ -281,6 +287,43 @@ export class EditorViewport {
 
     this.tileGrid.position.y = this.waterSettings.level + 1;
     this.tileGrid.visible = this.authoringOverlay.group.visible;
+  }
+
+  private updateAuthoringControlScale(): void {
+    const pivot = this.authoringOverlay.getSelectedPivot();
+    if (!pivot) return;
+    const camera = this.controller.activeCamera;
+    const cameraKey = this.getControlScaleCameraKey(camera);
+    if (cameraKey === this.lastControlScaleCameraKey) return;
+    this.lastControlScaleCameraKey = cameraKey;
+    this.authoringOverlay.setControlWorldUnitsPerPixel(this.getWorldUnitsPerScreenPixelAt(pivot.x, pivot.z));
+  }
+
+  private worldUnitsPerScreenPixelAt(point: THREE.Vector3): number {
+    const height = Math.max(1, this.container.clientHeight);
+    const camera = this.controller.activeCamera;
+    camera.updateMatrixWorld();
+    if (camera instanceof THREE.OrthographicCamera) {
+      return (camera.top - camera.bottom) / Math.max(0.0001, camera.zoom) / height;
+    }
+    if (camera instanceof THREE.PerspectiveCamera) {
+      const dx = point.x - camera.position.x;
+      const dy = point.y - camera.position.y;
+      const dz = point.z - camera.position.z;
+      const distance = Math.max(1, Math.hypot(dx, dy, dz));
+      return (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance) / height;
+    }
+    return 2;
+  }
+
+  private getControlScaleCameraKey(camera: THREE.Camera): string {
+    if (camera instanceof THREE.OrthographicCamera) {
+      return `o:${camera.position.x.toFixed(2)}:${camera.position.z.toFixed(2)}:${camera.zoom.toFixed(4)}:${this.container.clientHeight}`;
+    }
+    if (camera instanceof THREE.PerspectiveCamera) {
+      return `p:${camera.position.x.toFixed(2)}:${camera.position.y.toFixed(2)}:${camera.position.z.toFixed(2)}:${camera.quaternion.x.toFixed(4)}:${camera.quaternion.y.toFixed(4)}:${camera.quaternion.z.toFixed(4)}:${camera.quaternion.w.toFixed(4)}:${this.container.clientHeight}`;
+    }
+    return `${this.frame}`;
   }
 
   private disposeTileGrid(): void {
