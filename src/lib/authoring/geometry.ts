@@ -20,6 +20,7 @@ export interface PreparedLandform {
   order: number;
   xs: number[];
   zs: number[];
+  segments: PreparedSegment[];
   bounds: Bounds2D;
 }
 
@@ -27,7 +28,19 @@ export interface PreparedMountain {
   primitive: MountainSplineV1;
   xs: number[];
   zs: number[];
+  segments: PreparedSegment[];
   bounds: Bounds2D;
+}
+
+interface PreparedSegment {
+  ax: number;
+  az: number;
+  bx: number;
+  bz: number;
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
 }
 
 export interface PreparedStructuralDocument {
@@ -48,7 +61,7 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
     .map(({ primitive, order }) => ({
       primitive,
       order,
-      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, true, primitive.splineSmoothness), 0)
+      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, true, primitive.splineSmoothness), 0, true)
     }))
     .sort((a, b) => a.primitive.priority - b.primitive.priority || a.order - b.order);
 
@@ -58,7 +71,7 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
     ))
     .map((primitive) => ({
       primitive,
-      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, false, primitive.splineSmoothness), primitive.width / 2)
+      ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, false, primitive.splineSmoothness), primitive.width / 2, false)
     }));
 
   return { landforms, mountains };
@@ -67,7 +80,10 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
 export function filterPreparedStructuralDocumentForBounds(document: PreparedStructuralDocument, bounds: Bounds2D): PreparedStructuralDocument {
   return {
     landforms: document.landforms.filter((landform) => boundsOverlap(landform.bounds, bounds)),
-    mountains: document.mountains.filter((mountain) => boundsOverlap(mountain.bounds, bounds))
+    mountains: document.mountains
+      .filter((mountain) => boundsOverlap(mountain.bounds, bounds))
+      .map((mountain) => filterPreparedMountainForBounds(mountain, bounds))
+      .filter((mountain): mountain is PreparedMountain => Boolean(mountain))
   };
 }
 
@@ -128,8 +144,8 @@ export function mountainWeightAt(primitive: MountainSplineV1, x: number, z: numb
 
 function preparedLandformWeightAt(landform: PreparedLandform, x: number, z: number): number {
   if (!pointInPreparedPolygon(x, z, landform.xs, landform.zs)) return 0;
-  const edgeDistance = distanceToPreparedPolyline(x, z, landform.xs, landform.zs, true);
   if (landform.primitive.edgeSmoothness <= 0) return 1;
+  const edgeDistance = distanceToPreparedSegments(x, z, landform.segments, landform.primitive.edgeSmoothness);
   return smoothstep(0, landform.primitive.edgeSmoothness, edgeDistance);
 }
 
@@ -137,13 +153,24 @@ function preparedMountainWeightAt(mountain: PreparedMountain, x: number, z: numb
   const primitive = mountain.primitive;
   if (primitive.width <= 0) return 0;
   const halfWidth = primitive.width / 2;
-  const distance = distanceToPreparedPolyline(x, z, mountain.xs, mountain.zs, false);
+  const distance = distanceToPreparedSegments(x, z, mountain.segments, halfWidth);
   if (distance >= halfWidth) return 0;
   const edgeSmoothness = Math.max(0, Math.min(primitive.edgeSmoothness, halfWidth));
   if (edgeSmoothness === 0) return 1 - distance / halfWidth;
   const fadeStart = Math.max(0, halfWidth - edgeSmoothness);
   if (distance <= fadeStart) return 1;
   return 1 - smoothstep(fadeStart, halfWidth, distance);
+}
+
+function filterPreparedMountainForBounds(mountain: PreparedMountain, bounds: Bounds2D): PreparedMountain | null {
+  const padding = mountain.primitive.width / 2;
+  const segments = mountain.segments.filter((segment) => segmentOverlapsBounds(segment, bounds, padding));
+  if (segments.length === 0) return null;
+  return {
+    ...mountain,
+    segments,
+    bounds: boundsFromSegments(segments, padding)
+  };
 }
 
 export function pointInPolygon(x: number, z: number, polygon: AnchorV1[]): boolean {
@@ -198,13 +225,23 @@ function pointInSampledPolygon(x: number, z: number, polygon: { x: number; z: nu
   return inside;
 }
 
-function distanceToPreparedPolyline(x: number, z: number, xs: number[], zs: number[], closed: boolean): number {
+function distanceToPreparedSegments(x: number, z: number, segments: PreparedSegment[], maxDistance: number): number {
   let bestSq = Number.POSITIVE_INFINITY;
-  const segmentCount = closed ? xs.length : xs.length - 1;
-  for (let i = 0; i < segmentCount; i += 1) {
-    const next = (i + 1) % xs.length;
-    bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, xs[i], zs[i], xs[next], zs[next]));
+  const maxDistanceSq = maxDistance * maxDistance;
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i];
+    if (
+      x < segment.minX - maxDistance ||
+      x > segment.maxX + maxDistance ||
+      z < segment.minZ - maxDistance ||
+      z > segment.maxZ + maxDistance
+    ) {
+      continue;
+    }
+    bestSq = Math.min(bestSq, distanceToSegmentSq(x, z, segment.ax, segment.az, segment.bx, segment.bz));
+    if (bestSq === 0) return 0;
   }
+  if (bestSq === Number.POSITIVE_INFINITY || bestSq > maxDistanceSq) return maxDistance + 1;
   return Math.sqrt(bestSq);
 }
 
@@ -275,9 +312,10 @@ function getLandformTargetElevation(primitive: LandformAreaV1, waterLevel: numbe
   return clamp(Math.max(primitive.elevation, waterLevel + 1), 0, worldHeight);
 }
 
-function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: number): { xs: number[]; zs: number[]; bounds: Bounds2D } {
+function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: number, closed: boolean): { xs: number[]; zs: number[]; segments: PreparedSegment[]; bounds: Bounds2D } {
   const xs: number[] = [];
   const zs: number[] = [];
+  const segments: PreparedSegment[] = [];
   let minX = Number.POSITIVE_INFINITY;
   let maxX = Number.NEGATIVE_INFINITY;
   let minZ = Number.POSITIVE_INFINITY;
@@ -292,9 +330,26 @@ function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: numbe
     maxZ = Math.max(maxZ, anchor.z);
   }
 
+  const segmentCount = closed ? anchors.length : anchors.length - 1;
+  for (let i = 0; i < segmentCount; i += 1) {
+    const a = anchors[i];
+    const b = anchors[(i + 1) % anchors.length];
+    segments.push({
+      ax: a.x,
+      az: a.z,
+      bx: b.x,
+      bz: b.z,
+      minX: Math.min(a.x, b.x),
+      maxX: Math.max(a.x, b.x),
+      minZ: Math.min(a.z, b.z),
+      maxZ: Math.max(a.z, b.z)
+    });
+  }
+
   return {
     xs,
     zs,
+    segments,
     bounds: {
       minX: minX - padding,
       maxX: maxX + padding,
@@ -310,4 +365,32 @@ function boundsOverlap(a: Bounds2D, b: Bounds2D): boolean {
 
 function boundsContains(bounds: Bounds2D, x: number, z: number): boolean {
   return x >= bounds.minX && x <= bounds.maxX && z >= bounds.minZ && z <= bounds.maxZ;
+}
+
+function segmentOverlapsBounds(segment: PreparedSegment, bounds: Bounds2D, padding: number): boolean {
+  return (
+    segment.maxX + padding >= bounds.minX &&
+    segment.minX - padding <= bounds.maxX &&
+    segment.maxZ + padding >= bounds.minZ &&
+    segment.minZ - padding <= bounds.maxZ
+  );
+}
+
+function boundsFromSegments(segments: PreparedSegment[], padding: number): Bounds2D {
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  for (const segment of segments) {
+    minX = Math.min(minX, segment.minX);
+    maxX = Math.max(maxX, segment.maxX);
+    minZ = Math.min(minZ, segment.minZ);
+    maxZ = Math.max(maxZ, segment.maxZ);
+  }
+  return {
+    minX: minX - padding,
+    maxX: maxX + padding,
+    minZ: minZ - padding,
+    maxZ: maxZ + padding
+  };
 }
