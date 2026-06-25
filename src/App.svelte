@@ -28,6 +28,7 @@
   let visualizationMode: VisualizationMode = 'topo';
   let showRenderSettings = false;
   let showWater = false;
+  let bakeDebugTelemetry = false;
   let waterLevel = 0;
   let hoverCoordinates: HoverCoordinates | null = null;
   let metrics: EditorMetrics = { ...manager.metrics };
@@ -512,6 +513,8 @@
       authoringDocument = await manager.bakeAuthoringDocument(authoringDocument, waterLevel, (progress) => {
         bulkProgress = progress;
         status = progress.label;
+      }, {
+        debugTelemetry: bakeDebugTelemetry
       });
       bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
       status = bakeState === 'failed' ? authoringDocument.lastBake?.error ?? 'Bake failed.' : 'Bake complete.';
@@ -733,6 +736,10 @@
       <label class="toggle-row">
         <input type="checkbox" bind:checked={showWater} onchange={() => applyWaterSettings()} />
         <span>Show water</span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" bind:checked={bakeDebugTelemetry} />
+        <span>Bake debug telemetry</span>
       </label>
       <label>
         <span>Water level</span>

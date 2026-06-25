@@ -44,6 +44,7 @@ export class EditorViewport {
   private readonly scene = new THREE.Scene();
   private readonly raycaster = new THREE.Raycaster();
   private readonly water: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
+  private tileGrid: THREE.GridHelper | null = null;
   private rendererAdapter: RendererAdapter | null = null;
   private lastFrameTime = performance.now();
   private frame = 0;
@@ -89,8 +90,6 @@ export class EditorViewport {
     sun.position.set(5000, 7000, 3000);
     this.scene.add(sun);
 
-    const grid = new THREE.GridHelper(12000, 48, 0x39515a, 0x1c2a30);
-    this.scene.add(grid);
     this.addGizmo();
 
     this.stats.showPanel(0);
@@ -143,6 +142,7 @@ export class EditorViewport {
     window.removeEventListener('pointerup', this.onAuthoringPointerUp);
     this.water.geometry.dispose();
     this.water.material.dispose();
+    this.disposeTileGrid();
     this.authoringOverlay.dispose();
     this.rendererAdapter?.renderer.dispose();
   }
@@ -165,6 +165,7 @@ export class EditorViewport {
 
   setAuthoringVisible(visible: boolean): void {
     this.authoringOverlay.setVisible(visible);
+    this.updateTileGrid();
   }
 
   refreshTerrain(): void {
@@ -258,6 +259,41 @@ export class EditorViewport {
     this.water.position.set(0, this.waterSettings.level, 0);
     this.water.scale.set(planeSize, 1, planeSize);
     this.authoringOverlay.setWaterLevel(this.waterSettings.level);
+    this.updateTileGrid();
+  }
+
+  private updateTileGrid(): void {
+    const config = this.manager.config;
+    if (!config) {
+      if (this.tileGrid) this.tileGrid.visible = false;
+      return;
+    }
+
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    if (!this.tileGrid || this.tileGrid.userData.worldSize !== worldSize || this.tileGrid.userData.divisions !== config.tilesPerSide) {
+      this.disposeTileGrid();
+      this.tileGrid = new THREE.GridHelper(worldSize, config.tilesPerSide, 0x6f8f9b, 0x2c424a);
+      this.tileGrid.userData.worldSize = worldSize;
+      this.tileGrid.userData.divisions = config.tilesPerSide;
+      this.tileGrid.renderOrder = 19;
+      this.scene.add(this.tileGrid);
+    }
+
+    this.tileGrid.position.y = this.waterSettings.level + 1;
+    this.tileGrid.visible = this.authoringOverlay.group.visible;
+  }
+
+  private disposeTileGrid(): void {
+    if (!this.tileGrid) return;
+    this.scene.remove(this.tileGrid);
+    this.tileGrid.geometry.dispose();
+    const material = this.tileGrid.material;
+    if (Array.isArray(material)) {
+      for (const item of material) item.dispose();
+    } else {
+      material.dispose();
+    }
+    this.tileGrid = null;
   }
 
   private projectPointerToAuthoringPlane(event: PointerEvent): AuthoringPointerPoint | null {

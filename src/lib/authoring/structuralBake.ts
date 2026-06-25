@@ -2,7 +2,17 @@ import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
 import type { AuthoringDocumentV1, BakeMetadataV1 } from './authoringDocument';
-import { elevationToR16, evaluatePreparedStructuralHeight, filterPreparedStructuralDocumentForBounds, prepareStructuralDocument, stableAuthoringHash, type PreparedStructuralDocument } from './geometry';
+import {
+  clamp,
+  elevationToR16,
+  filterPreparedStructuralDocumentForBounds,
+  prepareStructuralDocument,
+  preparedLandformWeightAt,
+  preparedMountainWeightAt,
+  stableAuthoringHash,
+  type Bounds2D,
+  type PreparedStructuralDocument
+} from './geometry';
 
 export interface BakeProgress {
   phase: 'baking' | 'building-lod';
@@ -31,6 +41,10 @@ export interface StructuralBakeResult {
   lodTileCount: number;
 }
 
+export interface StructuralBakeOptions {
+  debugTelemetry?: boolean;
+}
+
 interface DepthZeroPassResult extends BakePassResult {
   dirtyTiles: TileKey[];
 }
@@ -57,6 +71,7 @@ type BakeWorkerRequest =
       config: WorldConfig;
       document: AuthoringDocumentV1;
       waterLevel: number;
+      debugTelemetry?: boolean;
     }
   | {
       id: number;
@@ -77,14 +92,15 @@ export async function bakeStructuralAuthoring(
   document: AuthoringDocumentV1,
   waterLevel: number,
   io: BakeTileIO,
-  onProgress?: (progress: BakeProgress) => void
+  onProgress?: (progress: BakeProgress) => void,
+  options: StructuralBakeOptions = {}
 ): Promise<StructuralBakeResult> {
   const startedAt = new Date().toISOString();
   const tileCount = config.tilesPerSide * config.tilesPerSide;
 
   const depthZeroPass: BakePass<DepthZeroPassResult> = {
     id: 'depth-zero-structural',
-    run: () => runDepthZeroStructuralPass(config, document, waterLevel, io, onProgress)
+    run: () => runDepthZeroStructuralPass(config, document, waterLevel, io, onProgress, options)
   };
   const depthZero = await depthZeroPass.run();
 
@@ -127,8 +143,17 @@ export function bakeDepthZeroTile(config: WorldConfig, document: AuthoringDocume
   return bakePreparedDepthZeroTile(config, prepareStructuralDocument(document), waterLevel, tileX, tileY);
 }
 
-export function bakePreparedDepthZeroTile(config: WorldConfig, document: PreparedStructuralDocument, waterLevel: number, tileX: number, tileY: number): Uint16Array {
+export function bakePreparedDepthZeroTile(
+  config: WorldConfig,
+  document: PreparedStructuralDocument,
+  waterLevel: number,
+  tileX: number,
+  tileY: number,
+  options: StructuralBakeOptions = {}
+): Uint16Array {
+  const start = performance.now();
   const samples = new Uint16Array(config.tileSize * config.tileSize);
+  const elevations = new Float32Array(config.tileSize * config.tileSize);
   const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
   const tileMinX = tileX * config.tileSize * config.unitSize - worldSize / 2;
   const tileMinZ = tileY * config.tileSize * config.unitSize - worldSize / 2;
@@ -141,17 +166,113 @@ export function bakePreparedDepthZeroTile(config: WorldConfig, document: Prepare
     maxZ: tileMaxZ
   });
 
-  for (let sampleY = 0; sampleY < config.tileSize; sampleY += 1) {
-    for (let sampleX = 0; sampleX < config.tileSize; sampleX += 1) {
-      const globalX = tileX * config.tileSize + sampleX;
-      const globalY = tileY * config.tileSize + sampleY;
-      const worldX = globalX * config.unitSize - worldSize / 2;
-      const worldZ = globalY * config.unitSize - worldSize / 2;
-      const { elevation } = evaluatePreparedStructuralHeight(config, prepared, worldX, worldZ, waterLevel);
-      samples[sampleY * config.tileSize + sampleX] = elevationToR16(elevation, config.worldHeight);
+  for (const landform of prepared.landforms) {
+    const primitiveStart = performance.now();
+    let visited = 0;
+    let affected = 0;
+    const range = sampleRangeForBounds(config, worldSize, tileX, tileY, landform.bounds);
+    if (range) {
+      const targetElevation = getLandformTargetElevation(landform.primitive, waterLevel, config.worldHeight);
+      for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
+        const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
+        for (let sampleX = range.minX; sampleX <= range.maxX; sampleX += 1) {
+          visited += 1;
+          const worldX = (tileX * config.tileSize + sampleX) * config.unitSize - worldSize / 2;
+          const weight = preparedLandformWeightAt(landform, worldX, worldZ);
+          if (weight <= 0) continue;
+          const index = sampleY * config.tileSize + sampleX;
+          elevations[index] = lerp(elevations[index], targetElevation, weight);
+          affected += 1;
+        }
+      }
     }
+    logPrimitiveTelemetry(options, 'landform', landform.primitive.name, tileX, tileY, visited, affected, performance.now() - primitiveStart);
   }
+
+  for (const mountain of prepared.mountains) {
+    const primitiveStart = performance.now();
+    let visited = 0;
+    let affected = 0;
+    const range = sampleRangeForBounds(config, worldSize, tileX, tileY, mountain.bounds);
+    const height = Math.max(0, mountain.primitive.height);
+    if (range && height > 0) {
+      for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
+        const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
+        for (let sampleX = range.minX; sampleX <= range.maxX; sampleX += 1) {
+          visited += 1;
+          const worldX = (tileX * config.tileSize + sampleX) * config.unitSize - worldSize / 2;
+          const weight = preparedMountainWeightAt(mountain, worldX, worldZ);
+          if (weight <= 0) continue;
+          const index = sampleY * config.tileSize + sampleX;
+          elevations[index] = clamp(elevations[index] + weight * height, 0, config.worldHeight);
+          affected += 1;
+        }
+      }
+    }
+    logPrimitiveTelemetry(options, 'mountain', mountain.primitive.name, tileX, tileY, visited, affected, performance.now() - primitiveStart);
+  }
+
+  for (let i = 0; i < elevations.length; i += 1) {
+    samples[i] = elevationToR16(elevations[i], config.worldHeight);
+  }
+
+  if (options.debugTelemetry) {
+    console.log('[WorldForge bake tile]', {
+      tile: `${tileX},${tileY}`,
+      landforms: prepared.landforms.length,
+      mountains: prepared.mountains.length,
+      ms: Number((performance.now() - start).toFixed(2))
+    });
+  }
+
   return samples;
+}
+
+function sampleRangeForBounds(
+  config: WorldConfig,
+  worldSize: number,
+  tileX: number,
+  tileY: number,
+  bounds: Bounds2D
+): { minX: number; maxX: number; minY: number; maxY: number } | null {
+  const tileOriginX = tileX * config.tileSize;
+  const tileOriginY = tileY * config.tileSize;
+  const minX = Math.max(0, Math.ceil((bounds.minX + worldSize / 2) / config.unitSize - tileOriginX));
+  const maxX = Math.min(config.tileSize - 1, Math.floor((bounds.maxX + worldSize / 2) / config.unitSize - tileOriginX));
+  const minY = Math.max(0, Math.ceil((bounds.minZ + worldSize / 2) / config.unitSize - tileOriginY));
+  const maxY = Math.min(config.tileSize - 1, Math.floor((bounds.maxZ + worldSize / 2) / config.unitSize - tileOriginY));
+  if (minX > maxX || minY > maxY) return null;
+  return { minX, maxX, minY, maxY };
+}
+
+function logPrimitiveTelemetry(
+  options: StructuralBakeOptions,
+  type: 'landform' | 'mountain',
+  name: string,
+  tileX: number,
+  tileY: number,
+  visited: number,
+  affected: number,
+  ms: number
+): void {
+  if (!options.debugTelemetry) return;
+  console.log('[WorldForge bake primitive]', {
+    tile: `${tileX},${tileY}`,
+    type,
+    name,
+    visited,
+    affected,
+    ms: Number(ms.toFixed(2))
+  });
+}
+
+function getLandformTargetElevation(primitive: { mode: string; elevation: number }, waterLevel: number, worldHeight: number): number {
+  if (primitive.mode === 'water') return clamp(Math.min(primitive.elevation, waterLevel - 1), 0, worldHeight);
+  return clamp(Math.max(primitive.elevation, waterLevel + 1), 0, worldHeight);
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 async function runDepthZeroStructuralPass(
@@ -159,7 +280,8 @@ async function runDepthZeroStructuralPass(
   document: AuthoringDocumentV1,
   waterLevel: number,
   io: BakeTileIO,
-  onProgress?: (progress: BakeProgress) => void
+  onProgress?: (progress: BakeProgress) => void,
+  options: StructuralBakeOptions = {}
 ): Promise<DepthZeroPassResult> {
   const dirtyTiles: TileKey[] = [];
   const jobs: Array<{ x: number; y: number }> = [];
@@ -175,7 +297,7 @@ async function runDepthZeroStructuralPass(
     const prepared = prepareStructuralDocument(document);
     for (const job of jobs) {
       const key = { x: job.x, y: job.y, d: 0 };
-      await io.writeTile(key, bakePreparedDepthZeroTile(config, prepared, waterLevel, job.x, job.y));
+      await io.writeTile(key, bakePreparedDepthZeroTile(config, prepared, waterLevel, job.x, job.y, options));
       dirtyTiles.push(key);
       written += 1;
       onProgress?.({ phase: 'baking', current: written, total, label: `Baking structural tiles ${written} / ${total}` });
@@ -202,7 +324,8 @@ async function runDepthZeroStructuralPass(
       type: 'init-depth-zero-bake',
       config,
       document,
-      waterLevel
+      waterLevel,
+      debugTelemetry: options.debugTelemetry
     })
   );
 

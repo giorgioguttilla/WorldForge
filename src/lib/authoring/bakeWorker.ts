@@ -11,6 +11,7 @@ interface InitDepthZeroBakeRequest {
   config: WorldConfig;
   document: AuthoringDocumentV1;
   waterLevel: number;
+  debugTelemetry?: boolean;
 }
 
 interface BakeDepthZeroTileRequest {
@@ -41,7 +42,7 @@ interface BakeWorkerError {
   error: string;
 }
 
-let depthZeroState: { config: WorldConfig; prepared: PreparedStructuralDocument; waterLevel: number } | null = null;
+let depthZeroState: { config: WorldConfig; prepared: PreparedStructuralDocument; waterLevel: number; debugTelemetry: boolean } | null = null;
 
 self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
   const request = event.data;
@@ -50,14 +51,17 @@ self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
       depthZeroState = {
         config: request.config,
         prepared: prepareStructuralDocument(request.document),
-        waterLevel: request.waterLevel
+        waterLevel: request.waterLevel,
+        debugTelemetry: request.debugTelemetry === true
       };
       return;
     }
 
     if (request.type === 'bake-depth-zero-tile') {
       if (!depthZeroState) throw new Error('Depth-zero bake worker was not initialized.');
-      const samples = bakePreparedDepthZeroTile(depthZeroState.config, depthZeroState.prepared, depthZeroState.waterLevel, request.tileX, request.tileY);
+      const samples = bakePreparedDepthZeroTile(depthZeroState.config, depthZeroState.prepared, depthZeroState.waterLevel, request.tileX, request.tileY, {
+        debugTelemetry: depthZeroState.debugTelemetry
+      });
       const response: BakeWorkerResponse = {
         id: request.id,
         key: { x: request.tileX, y: request.tileY, d: 0 },

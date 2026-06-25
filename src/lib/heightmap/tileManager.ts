@@ -165,7 +165,7 @@ export class TileManager {
     return normalized;
   }
 
-  async bakeAuthoringDocument(document: AuthoringDocumentV1, waterLevel: number, onProgress?: (progress: BulkProgress) => void): Promise<AuthoringDocumentV1> {
+  async bakeAuthoringDocument(document: AuthoringDocumentV1, waterLevel: number, onProgress?: (progress: BulkProgress) => void, options: { debugTelemetry?: boolean } = {}): Promise<AuthoringDocumentV1> {
     const config = this.requireConfig();
     const normalized: AuthoringDocumentV1 = {
       ...document,
@@ -182,7 +182,8 @@ export class TileManager {
           readTile: (key) => this.store.readTile(key, config.tileSize, { cache: false }),
           writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false })
         },
-        onProgress
+        onProgress,
+        options
       );
       this.metrics.lodRebuildMs = performance.now() - start;
       this.metrics.lastGeneratedTiles = result.dirtyTiles.length;

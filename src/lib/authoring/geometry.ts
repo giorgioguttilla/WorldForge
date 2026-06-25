@@ -142,14 +142,14 @@ export function mountainWeightAt(primitive: MountainSplineV1, x: number, z: numb
   return 1 - smoothstep(fadeStart, halfWidth, distance);
 }
 
-function preparedLandformWeightAt(landform: PreparedLandform, x: number, z: number): number {
+export function preparedLandformWeightAt(landform: PreparedLandform, x: number, z: number): number {
   if (!pointInPreparedPolygon(x, z, landform.xs, landform.zs)) return 0;
   if (landform.primitive.edgeSmoothness <= 0) return 1;
   const edgeDistance = distanceToPreparedSegments(x, z, landform.segments, landform.primitive.edgeSmoothness);
   return smoothstep(0, landform.primitive.edgeSmoothness, edgeDistance);
 }
 
-function preparedMountainWeightAt(mountain: PreparedMountain, x: number, z: number): number {
+export function preparedMountainWeightAt(mountain: PreparedMountain, x: number, z: number): number {
   const primitive = mountain.primitive;
   if (primitive.width <= 0) return 0;
   const halfWidth = primitive.width / 2;
