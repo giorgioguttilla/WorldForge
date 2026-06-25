@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { CircleDot, Crosshair, Download, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
+  import { CircleDot, CirclePlus, Crosshair, Download, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
@@ -8,6 +8,9 @@
   import type { VisualizationMode } from './lib/render/terrainRenderer';
   import { createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
+  import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
+
+  type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -38,7 +41,7 @@
   let authoringSaveTimer: number | null = null;
   let authoringDocument: AuthoringDocumentV1 | null = null;
   let activeWorldId: string | null = null;
-  let activeTool: 'select' | 'landformArea' | 'mountainSpline' = 'select';
+  let activeTool: AuthoringTool = 'select';
   let selectedPrimitiveId: string | null = null;
   let selectedAnchorId: string | null = null;
   let showAuthoring = true;
@@ -64,6 +67,7 @@
   $: configErrors = validateWorldConfig(worldInput);
   $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
   $: selectedPrimitive = authoringDocument?.primitives.find((primitive) => primitive.id === selectedPrimitiveId) ?? null;
+  $: selectedAnchor = selectedPrimitive?.anchors.find((anchor) => anchor.id === selectedAnchorId) ?? null;
   $: canFinishMountain = activeTool === 'mountainSpline' && draftAnchors.length >= 2;
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
 
@@ -110,6 +114,11 @@
         return;
       }
       if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
+        deleteSelection();
+        event.preventDefault();
+        return;
+      }
+      if (event.code === 'KeyX' && selectedAnchorId && !isTextInput(event.target)) {
         deleteSelection();
         event.preventDefault();
         return;
@@ -371,7 +380,7 @@
     }
   }
 
-  function setActiveTool(tool: 'select' | 'landformArea' | 'mountainSpline') {
+  function setActiveTool(tool: AuthoringTool) {
     if (tool !== activeTool) cancelDraft();
     activeTool = tool;
   }
@@ -403,6 +412,26 @@
     if (activeTool === 'mountainSpline') {
       draftAnchors = [...draftAnchors, createAnchor(point.x, point.z)];
       syncAuthoringViewport();
+      return true;
+    }
+
+    if (activeTool === 'addPoint') {
+      const insertion = findControlPointInsertion(point.x, point.z);
+      if (insertion) {
+        const anchor = createAnchor(point.x, point.z);
+        const anchors = [...insertion.primitive.anchors];
+        anchors.splice(insertion.insertIndex, 0, anchor);
+        const nextPrimitive = {
+          ...insertion.primitive,
+          anchors,
+          updatedAt: new Date().toISOString()
+        } as PrimitiveV1;
+        selectedPrimitiveId = nextPrimitive.id;
+        selectedAnchorId = anchor.id;
+        commitAuthoring(replacePrimitive(nextPrimitive));
+        return true;
+      }
+      status = 'Click near a shape edge or mountain spline to add a point.';
       return true;
     }
 
@@ -518,6 +547,44 @@
     selectedPrimitiveId = null;
     selectedAnchorId = null;
     commitAuthoring({ ...authoringDocument, primitives: authoringDocument.primitives.filter((item) => item.id !== primitive.id) });
+  }
+
+  function findControlPointInsertion(x: number, z: number): { primitive: PrimitiveV1; insertIndex: number; distance: number } | null {
+    const threshold = Math.max(18, hitThreshold() * 0.75);
+    let best: { primitive: PrimitiveV1; insertIndex: number; distance: number; order: number } | null = null;
+    for (const [order, primitive] of (authoringDocument?.primitives ?? []).entries()) {
+      if (!primitive.enabled) continue;
+      const closed = primitive.type === 'landformArea';
+      if (primitive.anchors.length < minimumAnchorCount(primitive)) continue;
+      if (primitive.splineSmoothness <= 0 || primitive.anchors.length < 3) {
+        const segmentCount = closed ? primitive.anchors.length : primitive.anchors.length - 1;
+        for (let i = 0; i < segmentCount; i += 1) {
+          const a = primitive.anchors[i];
+          const b = primitive.anchors[(i + 1) % primitive.anchors.length];
+          const distance = distanceToSegment2D(x, z, a.x, a.z, b.x, b.z);
+          if (distance > threshold) continue;
+          const insertIndex = i + 1;
+          if (!best || distance < best.distance || (distance === best.distance && order > best.order)) {
+            best = { primitive, insertIndex, distance, order };
+          }
+        }
+        continue;
+      }
+      const samples = sampleSplineAnchorsWithSegments(primitive.anchors, closed, primitive.splineSmoothness);
+      const segmentCount = closed ? samples.length : samples.length - 1;
+      for (let i = 0; i < segmentCount; i += 1) {
+        const a = samples[i];
+        const b = samples[(i + 1) % samples.length];
+        if (a.segmentIndex !== b.segmentIndex && !(closed && i === samples.length - 1)) continue;
+        const distance = distanceToSegment2D(x, z, a.x, a.z, b.x, b.z);
+        if (distance > threshold) continue;
+        const insertIndex = ((a.segmentIndex + 1) % primitive.anchors.length) || primitive.anchors.length;
+        if (!best || distance < best.distance || (distance === best.distance && order > best.order)) {
+          best = { primitive, insertIndex, distance, order };
+        }
+      }
+    }
+    return best ? { primitive: best.primitive, insertIndex: best.insertIndex, distance: best.distance } : null;
   }
 
   function clearSelection() {
@@ -800,11 +867,12 @@
   const visualizations: { id: VisualizationMode; label: string; icon: typeof Crosshair }[] = [
     { id: 'wireframe', label: 'Wireframe visualization', icon: Grid3X3 },
     { id: 'topo', label: 'Topo visualization', icon: Mountain },
-    { id: 'render', label: 'Material visualization', icon: CircleDot }
+    { id: 'render', label: 'Material visualization', icon: Palette }
   ];
 
-  const authoringTools: { id: 'select' | 'landformArea' | 'mountainSpline'; label: string; icon: typeof Crosshair }[] = [
+  const authoringTools: { id: AuthoringTool; label: string; icon: typeof Crosshair }[] = [
     { id: 'select', label: 'Select primitive', icon: MousePointer2 },
+    { id: 'addPoint', label: 'Add control point', icon: CirclePlus },
     { id: 'landformArea', label: 'Landform area', icon: Paintbrush },
     { id: 'mountainSpline', label: 'Mountain spline', icon: Route }
   ];
@@ -968,6 +1036,12 @@
           <input type="checkbox" checked={selectedPrimitive.enabled} onchange={(event) => updateSelectedPrimitive({ enabled: event.currentTarget.checked } as Partial<PrimitiveV1>)} />
           <span>Enabled</span>
         </label>
+        {#if selectedAnchor}
+          <div class="draft-row">
+            <span>Point {selectedPrimitive.anchors.findIndex((anchor) => anchor.id === selectedAnchor.id) + 1}</span>
+            <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Remove point</button>
+          </div>
+        {/if}
 
         {#if selectedPrimitive.type === 'landformArea'}
           <label>
@@ -1016,7 +1090,7 @@
             <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
           </label>
         {/if}
-        <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Delete</button>
+        <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> {selectedAnchor ? 'Delete selection' : 'Delete'}</button>
       {:else}
         <div class="empty-inspector">
           {authoringDocument.primitives.length} primitives

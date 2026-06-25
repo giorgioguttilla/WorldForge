@@ -7,17 +7,31 @@ export interface SplinePoint2D {
   z: number;
 }
 
+export interface SplineSample2D extends SplinePoint2D {
+  segmentIndex: number;
+}
+
 export function normalizeSplineSmoothness(value: unknown): number {
   const number = Number(value);
   return Number.isFinite(number) ? clamp(number, 0, 1) : DEFAULT_SPLINE_SMOOTHNESS;
 }
 
 export function sampleSplineAnchors(anchors: AnchorV1[], closed: boolean, smoothness = DEFAULT_SPLINE_SMOOTHNESS): SplinePoint2D[] {
+  return sampleSplineAnchorsWithSegments(anchors, closed, smoothness).map(({ x, z }) => ({ x, z }));
+}
+
+export function sampleSplineAnchorsWithSegments(anchors: AnchorV1[], closed: boolean, smoothness = DEFAULT_SPLINE_SMOOTHNESS): SplineSample2D[] {
   if (anchors.length === 0) return [];
-  if (anchors.length < 3 || smoothness <= 0) return anchors.map(({ x, z }) => ({ x, z }));
+  if (anchors.length < 3 || smoothness <= 0) {
+    return anchors.map(({ x, z }, index) => ({
+      x,
+      z,
+      segmentIndex: closed ? index : Math.min(index, Math.max(0, anchors.length - 2))
+    }));
+  }
 
   const segmentCount = closed ? anchors.length : anchors.length - 1;
-  const points: SplinePoint2D[] = [];
+  const points: SplineSample2D[] = [];
   const clampedSmoothness = clamp(smoothness, 0, 1);
 
   for (let i = 0; i < segmentCount; i += 1) {
@@ -38,14 +52,15 @@ export function sampleSplineAnchors(anchors: AnchorV1[], closed: boolean, smooth
       };
       points.push({
         x: linear.x + (curved.x - linear.x) * clampedSmoothness,
-        z: linear.z + (curved.z - linear.z) * clampedSmoothness
+        z: linear.z + (curved.z - linear.z) * clampedSmoothness,
+        segmentIndex: i
       });
     }
   }
 
   if (!closed) {
     const last = anchors[anchors.length - 1];
-    points.push({ x: last.x, z: last.z });
+    points.push({ x: last.x, z: last.z, segmentIndex: anchors.length - 2 });
   }
 
   return points;
