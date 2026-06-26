@@ -1,4 +1,5 @@
 import { DEFAULT_SPLINE_SMOOTHNESS } from './spline';
+import { createDefaultNoiseFieldLibrary, normalizeNoiseGraph, type NoiseFieldGraphV1 } from '../noiseGraph';
 
 export type PrimitiveTypeV1 = 'landformArea' | 'mountainSpline';
 export type LandformModeV1 = 'land' | 'water' | 'plateau';
@@ -23,6 +24,7 @@ export interface LandformAreaV1 extends PrimitiveBaseV1 {
   type: 'landformArea';
   mode: LandformModeV1;
   elevation: number;
+  fieldId?: string;
   edgeSmoothness: number;
   splineSmoothness: number;
   priority: number;
@@ -33,6 +35,7 @@ export interface MountainSplineV1 extends PrimitiveBaseV1 {
   type: 'mountainSpline';
   height: number;
   width: number;
+  fieldId?: string;
   edgeSmoothness: number;
   splineSmoothness: number;
   anchors: AnchorV1[];
@@ -54,6 +57,7 @@ export interface BakeMetadataV1 {
 export interface AuthoringDocumentV1 {
   version: 1;
   worldId: string;
+  fieldLibrary: NoiseFieldGraphV1[];
   primitives: PrimitiveV1[];
   lastBake?: BakeMetadataV1;
 }
@@ -63,6 +67,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
   return {
     version: 1,
     worldId,
+    fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: []
   };
 }
@@ -72,9 +77,13 @@ export function normalizeAuthoringDocument(value: unknown, worldId: string): Aut
   const primitives = Array.isArray(value.primitives)
     ? value.primitives.map(normalizePrimitive).filter((primitive): primitive is PrimitiveV1 => Boolean(primitive))
     : [];
+  const normalizedFields = Array.isArray(value.fieldLibrary)
+    ? value.fieldLibrary.map((field, index) => normalizeNoiseGraph(field, `field-${index + 1}`, `Field ${index + 1}`))
+    : [];
   const document: AuthoringDocumentV1 = {
     version: 1,
     worldId,
+    fieldLibrary: mergeDefaultFields(normalizedFields),
     primitives
   };
   const lastBake = normalizeBakeMetadata(value.lastBake);
@@ -136,6 +145,7 @@ function normalizePrimitive(value: unknown): PrimitiveV1 | null {
       type: 'landformArea',
       mode: LAND_MODES.has(value.mode as LandformModeV1) ? (value.mode as LandformModeV1) : 'land',
       elevation: finiteNumber(value.elevation, 0),
+      fieldId: typeof value.fieldId === 'string' && value.fieldId ? value.fieldId : undefined,
       edgeSmoothness: Math.max(0, finiteNumber(value.edgeSmoothness, 0)),
       splineSmoothness: clamp(finiteNumber(value.splineSmoothness, DEFAULT_SPLINE_SMOOTHNESS), 0, 1),
       priority: finiteNumber(value.priority, 0),
@@ -148,12 +158,19 @@ function normalizePrimitive(value: unknown): PrimitiveV1 | null {
       type: 'mountainSpline',
       height: finiteNumber(value.height, 0),
       width: Math.max(0, finiteNumber(value.width, 0)),
+      fieldId: typeof value.fieldId === 'string' && value.fieldId ? value.fieldId : undefined,
       edgeSmoothness: Math.max(0, finiteNumber(value.edgeSmoothness, 0)),
       splineSmoothness: clamp(finiteNumber(value.splineSmoothness, DEFAULT_SPLINE_SMOOTHNESS), 0, 1),
       anchors
     };
   }
   return null;
+}
+
+function mergeDefaultFields(fields: NoiseFieldGraphV1[]): NoiseFieldGraphV1[] {
+  const defaults = createDefaultNoiseFieldLibrary();
+  const seen = new Set(fields.map((field) => field.id));
+  return [...fields, ...defaults.filter((field) => !seen.has(field.id))];
 }
 
 function normalizeBase(value: Record<string, unknown>): PrimitiveBaseV1 | null {

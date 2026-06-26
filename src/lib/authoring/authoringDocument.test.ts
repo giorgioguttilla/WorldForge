@@ -3,11 +3,17 @@ import { createEmptyAuthoringDocument, normalizeAuthoringDocument } from './auth
 
 describe('authoring document', () => {
   it('creates an empty v1 document for a world', () => {
-    expect(createEmptyAuthoringDocument('world-a')).toEqual({
+    const document = createEmptyAuthoringDocument('world-a');
+    expect(document).toMatchObject({
       version: 1,
       worldId: 'world-a',
       primitives: []
     });
+    expect(document.fieldLibrary.map((field) => field.id)).toEqual([
+      'preset-rolling-hills',
+      'preset-mountains',
+      'preset-canyon'
+    ]);
   });
 
   it('normalizes missing or corrupt documents to an empty document', () => {

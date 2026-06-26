@@ -8,11 +8,14 @@ import {
   filterPreparedStructuralDocumentForBounds,
   prepareStructuralDocument,
   preparedLandformWeightAt,
+  preparedLandformSplineSpaceAt,
   preparedMountainWeightAt,
+  preparedMountainSplineSpaceAt,
   stableAuthoringHash,
   type Bounds2D,
   type PreparedStructuralDocument
 } from './geometry';
+import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 
 export interface BakeProgress {
   phase: 'baking' | 'building-lod';
@@ -173,6 +176,11 @@ export function bakePreparedDepthZeroTile(
     const range = sampleRangeForBounds(config, worldSize, tileX, tileY, landform.bounds);
     if (range) {
       const targetElevation = getLandformTargetElevation(landform.primitive, waterLevel, config.worldHeight);
+      const field = getPreparedField(prepared, landform.primitive.fieldId);
+      const fieldContext: NoiseFieldEvaluationContext | null = field ? {
+        cartesian: { x: 0, y: 0 },
+        spline: { x: 0, y: 0 }
+      } : null;
       for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
         const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
         for (let sampleX = range.minX; sampleX <= range.maxX; sampleX += 1) {
@@ -182,6 +190,13 @@ export function bakePreparedDepthZeroTile(
           if (weight <= 0) continue;
           const index = sampleY * config.tileSize + sampleX;
           elevations[index] = lerp(elevations[index], targetElevation, weight);
+          if (field && fieldContext) {
+            fieldContext.cartesian.x = worldX;
+            fieldContext.cartesian.y = worldZ;
+            if (field.usesSpline) preparedLandformSplineSpaceAt(landform, worldX, worldZ, fieldContext.spline);
+            const displacement = field.evaluate(fieldContext);
+            elevations[index] = clamp(elevations[index] + displacement * weight, 0, config.worldHeight);
+          }
           affected += 1;
         }
       }
@@ -196,6 +211,11 @@ export function bakePreparedDepthZeroTile(
     const range = sampleRangeForBounds(config, worldSize, tileX, tileY, mountain.bounds);
     const height = Math.max(0, mountain.primitive.height);
     if (range && height > 0) {
+      const field = getPreparedField(prepared, mountain.primitive.fieldId);
+      const fieldContext: NoiseFieldEvaluationContext | null = field ? {
+        cartesian: { x: 0, y: 0 },
+        spline: { x: 0, y: 0 }
+      } : null;
       for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
         const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
         for (let sampleX = range.minX; sampleX <= range.maxX; sampleX += 1) {
@@ -205,6 +225,13 @@ export function bakePreparedDepthZeroTile(
           if (weight <= 0) continue;
           const index = sampleY * config.tileSize + sampleX;
           elevations[index] = clamp(elevations[index] + weight * height, 0, config.worldHeight);
+          if (field && fieldContext) {
+            fieldContext.cartesian.x = worldX;
+            fieldContext.cartesian.y = worldZ;
+            if (field.usesSpline) preparedMountainSplineSpaceAt(mountain, worldX, worldZ, fieldContext.spline);
+            const displacement = field.evaluate(fieldContext);
+            elevations[index] = clamp(elevations[index] + displacement * weight, 0, config.worldHeight);
+          }
           affected += 1;
         }
       }
@@ -226,6 +253,11 @@ export function bakePreparedDepthZeroTile(
   }
 
   return samples;
+}
+
+function getPreparedField(document: PreparedStructuralDocument, fieldId: string | undefined): CompiledNoiseFieldGraph | null {
+  if (!fieldId) return null;
+  return document.compiledFields.get(fieldId) ?? null;
 }
 
 function sampleRangeForBounds(

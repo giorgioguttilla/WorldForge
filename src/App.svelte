@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { CircleDot, CirclePlus, Crosshair, Download, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
+  import { CircleDot, CirclePlus, Crosshair, Download, Edit3, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
@@ -9,6 +9,8 @@
   import { createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
   import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
+  import NoiseGraphEditor from './lib/noiseGraph/NoiseGraphEditor.svelte';
+  import { createNoiseGraph, type NoiseFieldGraphV1 } from './lib/noiseGraph';
 
   type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
 
@@ -62,11 +64,13 @@
   } | null = null;
   let dragStarted = false;
   let authoringSyncFrame: number | null = null;
+  let editingField: NoiseFieldGraphV1 | null = null;
 
   $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
   $: bulkProgressPercent = bulkProgress ? Math.max(0, Math.min(100, (bulkProgress.current / Math.max(1, bulkProgress.total)) * 100)) : 0;
   $: selectedPrimitive = authoringDocument?.primitives.find((primitive) => primitive.id === selectedPrimitiveId) ?? null;
+  $: selectedField = selectedPrimitive?.fieldId ? authoringDocument?.fieldLibrary.find((field) => field.id === selectedPrimitive.fieldId) ?? null : null;
   $: selectedAnchor = selectedPrimitive?.anchors.find((anchor) => anchor.id === selectedAnchorId) ?? null;
   $: canFinishMountain = activeTool === 'mountainSpline' && draftAnchors.length >= 2;
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
@@ -603,6 +607,51 @@
     commitAuthoring(replacePrimitive(nextPrimitive));
   }
 
+  function setSelectedField(fieldId: string) {
+    if (!selectedPrimitive) return;
+    updateSelectedPrimitive({ fieldId: fieldId || undefined } as Partial<PrimitiveV1>);
+  }
+
+  function createFieldForSelectedPrimitive() {
+    if (!authoringDocument || !selectedPrimitive) return;
+    const graph = createNoiseGraph(crypto.randomUUID(), `${selectedPrimitive.name} Field`);
+    editingField = graph;
+  }
+
+  function editSelectedField() {
+    if (!selectedField) return;
+    editingField = structuredClone(selectedField);
+  }
+
+  function deleteSelectedField() {
+    if (!authoringDocument || !selectedField) return;
+    const deletedId = selectedField.id;
+    const next: AuthoringDocumentV1 = {
+      ...authoringDocument,
+      fieldLibrary: authoringDocument.fieldLibrary.filter((field) => field.id !== deletedId),
+      primitives: authoringDocument.primitives.map((primitive) => primitive.fieldId === deletedId ? { ...primitive, fieldId: undefined, updatedAt: new Date().toISOString() } as PrimitiveV1 : primitive)
+    };
+    selectedAnchorId = null;
+    commitAuthoring(next);
+  }
+
+  function saveEditingField(graph: NoiseFieldGraphV1) {
+    if (!authoringDocument) return;
+    const exists = authoringDocument.fieldLibrary.some((field) => field.id === graph.id);
+    const nextLibrary = exists
+      ? authoringDocument.fieldLibrary.map((field) => field.id === graph.id ? graph : field)
+      : [...authoringDocument.fieldLibrary, graph];
+    const nextDocument = {
+      ...authoringDocument,
+      fieldLibrary: nextLibrary
+    };
+    if (selectedPrimitive && !exists) {
+      nextDocument.primitives = nextDocument.primitives.map((primitive) => primitive.id === selectedPrimitive.id ? { ...primitive, fieldId: graph.id, updatedAt: new Date().toISOString() } as PrimitiveV1 : primitive);
+    }
+    editingField = null;
+    commitAuthoring(nextDocument);
+  }
+
   function replacePrimitive(primitive: PrimitiveV1): AuthoringDocumentV1 {
     const document = authoringDocument ?? createEmptyAuthoringDocument(manager.config?.id ?? 'unknown');
     return replacePrimitiveInDocument(document, primitive);
@@ -1036,6 +1085,22 @@
           <input type="checkbox" checked={selectedPrimitive.enabled} onchange={(event) => updateSelectedPrimitive({ enabled: event.currentTarget.checked } as Partial<PrimitiveV1>)} />
           <span>Enabled</span>
         </label>
+        <div class="field-picker">
+          <label>
+            <span>Noise field</span>
+            <select value={selectedPrimitive.fieldId ?? ''} onchange={(event) => setSelectedField(event.currentTarget.value)}>
+              <option value="">none</option>
+              {#each authoringDocument.fieldLibrary as field}
+                <option value={field.id}>{field.name}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="field-actions">
+            <button type="button" title="Add field" onclick={createFieldForSelectedPrimitive}><Plus size={16} /></button>
+            <button type="button" title="Edit selected field" disabled={!selectedField} onclick={editSelectedField}><Edit3 size={16} /></button>
+            <button type="button" title="Delete selected field" disabled={!selectedField} onclick={deleteSelectedField}><Trash2 size={16} /></button>
+          </div>
+        </div>
         {#if selectedAnchor}
           <div class="draft-row">
             <span>Point {selectedPrimitive.anchors.findIndex((anchor) => anchor.id === selectedAnchor.id) + 1}</span>
@@ -1195,5 +1260,9 @@
         </footer>
       </form>
     </div>
+  {/if}
+
+  {#if editingField}
+    <NoiseGraphEditor graph={editingField} onSave={saveEditingField} onCancel={() => { editingField = null; }} />
   {/if}
 </div>

@@ -1,6 +1,8 @@
 import type { AnchorV1, AuthoringDocumentV1, LandformAreaV1, MountainSplineV1 } from './authoringDocument';
 import type { WorldConfig } from '../heightmap/worldConfig';
 import { sampleSplineAnchors } from './spline';
+import { compileNoiseFieldGraph, type CompiledNoiseFieldGraph } from '../noiseGraph';
+import type { GraphVec2, NoiseFieldGraphV1 } from '../noiseGraph';
 
 export interface StructuralEvaluation {
   elevation: number;
@@ -37,6 +39,8 @@ interface PreparedSegment {
   az: number;
   bx: number;
   bz: number;
+  startDistance: number;
+  length: number;
   minX: number;
   maxX: number;
   minZ: number;
@@ -46,6 +50,8 @@ interface PreparedSegment {
 export interface PreparedStructuralDocument {
   landforms: PreparedLandform[];
   mountains: PreparedMountain[];
+  fieldLibrary: NoiseFieldGraphV1[];
+  compiledFields: Map<string, CompiledNoiseFieldGraph>;
 }
 
 export function evaluateStructuralHeight(config: WorldConfig, document: AuthoringDocumentV1, worldX: number, worldZ: number, waterLevel: number): StructuralEvaluation {
@@ -74,7 +80,13 @@ export function prepareStructuralDocument(document: AuthoringDocumentV1): Prepar
       ...prepareAnchorArrays(sampleSplineAnchors(primitive.anchors, false, primitive.splineSmoothness), primitive.width / 2, false)
     }));
 
-  return { landforms, mountains };
+  const fieldLibrary = Array.isArray(document.fieldLibrary) ? document.fieldLibrary : [];
+  return {
+    landforms,
+    mountains,
+    fieldLibrary,
+    compiledFields: compileFieldLibrary(fieldLibrary)
+  };
 }
 
 export function filterPreparedStructuralDocumentForBounds(document: PreparedStructuralDocument, bounds: Bounds2D): PreparedStructuralDocument {
@@ -83,7 +95,9 @@ export function filterPreparedStructuralDocumentForBounds(document: PreparedStru
     mountains: document.mountains
       .filter((mountain) => boundsOverlap(mountain.bounds, bounds))
       .map((mountain) => filterPreparedMountainForBounds(mountain, bounds))
-      .filter((mountain): mountain is PreparedMountain => Boolean(mountain))
+      .filter((mountain): mountain is PreparedMountain => Boolean(mountain)),
+    fieldLibrary: document.fieldLibrary,
+    compiledFields: document.compiledFields
   };
 }
 
@@ -160,6 +174,35 @@ export function preparedMountainWeightAt(mountain: PreparedMountain, x: number, 
   const fadeStart = Math.max(0, halfWidth - edgeSmoothness);
   if (distance <= fadeStart) return 1;
   return 1 - smoothstep(fadeStart, halfWidth, distance);
+}
+
+export function preparedLandformSplineSpaceAt(_landform: PreparedLandform, x: number, z: number, out: GraphVec2 = { x: 0, y: 0 }): GraphVec2 {
+  out.x = x;
+  out.y = z;
+  return out;
+}
+
+export function preparedMountainSplineSpaceAt(mountain: PreparedMountain, x: number, z: number, out: GraphVec2 = { x: 0, y: 0 }): GraphVec2 {
+  let best: { distanceSq: number; along: number; lateral: number } | null = null;
+  for (const segment of mountain.segments) {
+    const dx = segment.bx - segment.ax;
+    const dz = segment.bz - segment.az;
+    const lengthSq = dx * dx + dz * dz;
+    if (lengthSq <= Number.EPSILON) continue;
+    const t = clamp(((x - segment.ax) * dx + (z - segment.az) * dz) / lengthSq, 0, 1);
+    const closestX = segment.ax + dx * t;
+    const closestZ = segment.az + dz * t;
+    const px = x - closestX;
+    const pz = z - closestZ;
+    const distanceSq = px * px + pz * pz;
+    const side = Math.sign(dx * (z - segment.az) - dz * (x - segment.ax)) || 1;
+    const lateral = Math.sqrt(distanceSq) * side;
+    const along = segment.startDistance + segment.length * t;
+    if (!best || distanceSq < best.distanceSq) best = { distanceSq, along, lateral };
+  }
+  out.x = best ? best.along : x;
+  out.y = best ? best.lateral : z;
+  return out;
 }
 
 function filterPreparedMountainForBounds(mountain: PreparedMountain, bounds: Bounds2D): PreparedMountain | null {
@@ -331,19 +374,24 @@ function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: numbe
   }
 
   const segmentCount = closed ? anchors.length : anchors.length - 1;
+  let distance = 0;
   for (let i = 0; i < segmentCount; i += 1) {
     const a = anchors[i];
     const b = anchors[(i + 1) % anchors.length];
+    const length = Math.hypot(b.x - a.x, b.z - a.z);
     segments.push({
       ax: a.x,
       az: a.z,
       bx: b.x,
       bz: b.z,
+      startDistance: distance,
+      length,
       minX: Math.min(a.x, b.x),
       maxX: Math.max(a.x, b.x),
       minZ: Math.min(a.z, b.z),
       maxZ: Math.max(a.z, b.z)
     });
+    distance += length;
   }
 
   return {
@@ -357,6 +405,15 @@ function prepareAnchorArrays(anchors: { x: number; z: number }[], padding: numbe
       maxZ: maxZ + padding
     }
   };
+}
+
+function compileFieldLibrary(fields: NoiseFieldGraphV1[]): Map<string, CompiledNoiseFieldGraph> {
+  const compiled = new Map<string, CompiledNoiseFieldGraph>();
+  for (const field of fields) {
+    const evaluator = compileNoiseFieldGraph(field);
+    if (evaluator) compiled.set(field.id, evaluator);
+  }
+  return compiled;
 }
 
 function boundsOverlap(a: Bounds2D, b: Bounds2D): boolean {
