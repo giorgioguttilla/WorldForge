@@ -12,7 +12,7 @@ describe('noise graph evaluation', () => {
     const first = evaluateNoiseFieldGraph(rolling, context);
     const second = evaluateNoiseFieldGraph(rolling, context);
     expect(first).toBe(second);
-    expect(first).toBeGreaterThanOrEqual(0);
-    expect(first).toBeLessThanOrEqual(45);
+    expect(first).toBeGreaterThanOrEqual(-1);
+    expect(first).toBeLessThanOrEqual(1);
   });
 });

@@ -189,14 +189,15 @@ export function bakePreparedDepthZeroTile(
           const weight = preparedLandformWeightAt(landform, worldX, worldZ);
           if (weight <= 0) continue;
           const index = sampleY * config.tileSize + sampleX;
-          elevations[index] = lerp(elevations[index], targetElevation, weight);
+          let target = targetElevation;
           if (field && fieldContext) {
             fieldContext.cartesian.x = worldX;
             fieldContext.cartesian.y = worldZ;
             if (field.usesSpline) preparedLandformSplineSpaceAt(landform, worldX, worldZ, fieldContext.spline);
             const displacement = field.evaluate(fieldContext);
-            elevations[index] = clamp(elevations[index] + displacement * weight, 0, config.worldHeight);
+            target += displacement * landform.primitive.noiseScale;
           }
+          elevations[index] = lerp(elevations[index], clamp(target, 0, config.worldHeight), weight);
           affected += 1;
         }
       }
@@ -224,14 +225,14 @@ export function bakePreparedDepthZeroTile(
           const weight = preparedMountainWeightAt(mountain, worldX, worldZ);
           if (weight <= 0) continue;
           const index = sampleY * config.tileSize + sampleX;
-          elevations[index] = clamp(elevations[index] + weight * height, 0, config.worldHeight);
+          let mountainValue = 1;
           if (field && fieldContext) {
             fieldContext.cartesian.x = worldX;
             fieldContext.cartesian.y = worldZ;
             if (field.usesSpline) preparedMountainSplineSpaceAt(mountain, worldX, worldZ, fieldContext.spline);
-            const displacement = field.evaluate(fieldContext);
-            elevations[index] = clamp(elevations[index] + displacement * weight, 0, config.worldHeight);
+            mountainValue = field.evaluate(fieldContext);
           }
+          elevations[index] = clamp(elevations[index] + mountainValue * height * weight, 0, config.worldHeight);
           affected += 1;
         }
       }

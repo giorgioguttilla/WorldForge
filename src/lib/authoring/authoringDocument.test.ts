@@ -47,6 +47,7 @@ describe('authoring document', () => {
       type: 'landformArea',
       mode: 'plateau',
       elevation: 120,
+      noiseScale: 80,
       edgeSmoothness: 0,
       splineSmoothness: 1,
       priority: 3,

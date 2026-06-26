@@ -21,15 +21,18 @@ WorldForge noise fields are JSON-backed node graphs. A field belongs to the clie
 3. Authoring document integration
    - Add `fieldLibrary` to every authoring document.
    - Add `fieldId` to authoring primitives.
+   - Add `noiseScale` to baseline landform primitives.
    - Seed every client document with presets: Rolling Hills, Mountains, Canyon.
    - Keep primitives valid if a referenced field is removed by treating the missing field as no field.
 
 4. Bake integration
    - Prepare field evaluators once per bake document.
    - Pass cartesian position and spline-space position to every evaluation.
-   - For landforms, apply field displacement after the structural elevation target is blended by landform falloff.
-   - For mountains, add field displacement inside the mountain falloff. Empty field preserves the current structural contribution.
-   - Compilation/caching can be added later, but the JSON evaluator is the source of truth.
+   - Baseline landforms evaluate at most one field target per priority layer: `lerp(existingHeight, baseHeight + noiseValue * noiseScale, edgeRamp)`.
+   - Additive mountains contribute on top of the baseline: `existingHeight + noiseValue * shapeHeight * edgeRamp`.
+   - Empty landform fields preserve the existing base-height behavior.
+   - Empty mountain fields preserve the existing additive ridge behavior with `noiseValue = 1`.
+   - Field graphs are compiled to specialized JavaScript functions before bake sampling.
 
 5. Node graph editor
    - Provide a large modal editor for creating and editing field graphs.
@@ -70,7 +73,7 @@ interface NoiseGraphEdgeV1 {
 
 ## Initial Node Set
 
-- `output`: one `float` input named `value`; final result is the evaluated field value. Bake attenuates it by the shape falloff at the sample point.
+- `output`: one `float` input named `value`; final result is the evaluated field value. Baseline shapes scale it by `noiseScale`; additive mountain shapes scale it by `height`. Bake attenuates both by the shape falloff at the sample point.
 - `constFloat`: one `float` output.
 - `cartesianPosition`: `x`, `y`, and `xy` outputs from world-space coordinates.
 - `splinePosition`: `x`, `y`, and `xy` outputs from contour-relative coordinates.
@@ -90,8 +93,8 @@ Cartesian position uses the tile sample's world x/z pair as x/y. Spline-space po
 
 Every client document receives three editable presets:
 
-- Rolling Hills: low-frequency fBM with softened contrast.
-- Mountains: ridged multifractal multiplied by a broad fBM mask.
-- Canyon: stretched ridged/simplex bands shaped through smoothstep.
+- Rolling Hills: low-frequency fBM normalized to roughly `[-1, 1]`.
+- Mountains: ridged multifractal multiplied by a broad fBM mask, normalized to `[0, 1]`.
+- Canyon: stretched ridged/simplex bands shaped through smoothstep, normalized to `[-1, 0]`.
 
 These are ordinary field graphs, not hidden engine presets.

@@ -35,6 +35,7 @@ describe('structural bake', () => {
         updatedAt: 'a',
         mode: 'plateau',
         elevation: 80,
+        noiseScale: 80,
         edgeSmoothness: 0,
         priority: 0,
         anchors: [
@@ -82,7 +83,7 @@ describe('structural bake', () => {
         id: 'field-const',
         name: 'Constant Lift',
         nodes: [
-          { id: 'const', type: 'constFloat', position: { x: 0, y: 0 }, params: { value: 20 } },
+          { id: 'const', type: 'constFloat', position: { x: 0, y: 0 }, params: { value: 1 } },
           { id: 'output', type: 'output', position: { x: 200, y: 0 }, params: {} }
         ],
         edges: [{
@@ -101,6 +102,7 @@ describe('structural bake', () => {
         mode: 'plateau',
         elevation: 50,
         fieldId: 'field-const',
+        noiseScale: 20,
         edgeSmoothness: 0,
         splineSmoothness: 0,
         priority: 0,

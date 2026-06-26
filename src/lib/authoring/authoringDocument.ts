@@ -25,6 +25,7 @@ export interface LandformAreaV1 extends PrimitiveBaseV1 {
   mode: LandformModeV1;
   elevation: number;
   fieldId?: string;
+  noiseScale: number;
   edgeSmoothness: number;
   splineSmoothness: number;
   priority: number;
@@ -110,6 +111,7 @@ export function createLandformArea(anchors: AnchorV1[], waterLevel: number, inde
     updatedAt: now,
     mode: 'land',
     elevation: Math.max(0, waterLevel + 80),
+    noiseScale: 80,
     edgeSmoothness: 120,
     splineSmoothness: DEFAULT_SPLINE_SMOOTHNESS,
     priority: 0,
@@ -146,6 +148,7 @@ function normalizePrimitive(value: unknown): PrimitiveV1 | null {
       mode: LAND_MODES.has(value.mode as LandformModeV1) ? (value.mode as LandformModeV1) : 'land',
       elevation: finiteNumber(value.elevation, 0),
       fieldId: typeof value.fieldId === 'string' && value.fieldId ? value.fieldId : undefined,
+      noiseScale: finiteNumber(value.noiseScale, 80),
       edgeSmoothness: Math.max(0, finiteNumber(value.edgeSmoothness, 0)),
       splineSmoothness: clamp(finiteNumber(value.splineSmoothness, DEFAULT_SPLINE_SMOOTHNESS), 0, 1),
       priority: finiteNumber(value.priority, 0),

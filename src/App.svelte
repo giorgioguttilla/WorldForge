@@ -1128,6 +1128,10 @@
             </label>
           </div>
           <label>
+            <span>Noise scale</span>
+            <input type="number" step="1" value={selectedPrimitive.noiseScale} oninput={(event) => updateSelectedPrimitive({ noiseScale: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+          </label>
+          <label>
             <span>Edge smoothness</span>
             <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
           </label>

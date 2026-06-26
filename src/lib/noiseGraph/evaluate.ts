@@ -1,26 +1,20 @@
 import { createNoise2D } from 'simplex-noise';
-import { getNodeDefinition } from './definitions';
 import { validateNoiseGraph } from './graph';
-import type { GraphVec2, NoiseFieldEvaluationContext, NoiseFieldGraphV1, NoiseGraphNodeV1 } from './types';
+import type { GraphVec2, NoiseFieldEvaluationContext, NoiseFieldGraphV1, NoiseGraphEdgeV1, NoiseGraphNodeV1 } from './types';
 
-type GraphValue = number | GraphVec2;
-
-interface CompiledInput {
-  nodeIndex: number;
-  portId: string;
-}
-
-interface CompiledNode {
-  id: string;
-  type: NoiseGraphNodeV1['type'];
-  inputs: Record<string, CompiledInput | undefined>;
-  params: Record<string, number>;
-}
+type EvaluateFn = (context: NoiseFieldEvaluationContext) => number;
 
 export interface CompiledNoiseFieldGraph {
   readonly id: string;
   readonly usesSpline: boolean;
   evaluate(context: NoiseFieldEvaluationContext): number;
+}
+
+interface CompileState {
+  graph: NoiseFieldGraphV1;
+  nodes: Map<string, NoiseGraphNodeV1>;
+  incoming: Map<string, NoiseGraphEdgeV1>;
+  memo: Map<string, string>;
 }
 
 export function evaluateNoiseFieldGraph(graph: NoiseFieldGraphV1 | null | undefined, context: NoiseFieldEvaluationContext): number {
@@ -30,167 +24,38 @@ export function evaluateNoiseFieldGraph(graph: NoiseFieldGraphV1 | null | undefi
 export function compileNoiseFieldGraph(graph: NoiseFieldGraphV1 | null | undefined): CompiledNoiseFieldGraph | null {
   if (!graph) return null;
   if (validateNoiseGraph(graph).some((issue) => issue.severity === 'error')) return null;
-  const outputIndex = graph.nodes.findIndex((node) => node.type === 'output');
-  if (outputIndex < 0) return null;
-  return new CompiledNoiseGraphEvaluator(graph, outputIndex);
+  const output = graph.nodes.find((node) => node.type === 'output');
+  if (!output) return null;
+  try {
+    return new GeneratedNoiseFieldGraph(graph, output);
+  } catch {
+    return null;
+  }
 }
 
-class CompiledNoiseGraphEvaluator implements CompiledNoiseFieldGraph {
+class GeneratedNoiseFieldGraph implements CompiledNoiseFieldGraph {
   private readonly simplex = new Map<number, (x: number, y: number) => number>();
-  private readonly nodes: CompiledNode[];
-  private readonly valueCache: Array<Record<string, GraphValue | undefined>>;
-  private readonly stampCache: Array<Record<string, number | undefined>>;
-  private generation = 0;
+  private readonly fn: EvaluateFn;
   readonly id: string;
   readonly usesSpline: boolean;
 
-  constructor(
-    graph: NoiseFieldGraphV1,
-    private readonly outputIndex: number
-  ) {
+  constructor(graph: NoiseFieldGraphV1, output: NoiseGraphNodeV1) {
     this.id = graph.id;
     this.usesSpline = graph.nodes.some((node) => node.type === 'splinePosition');
-    const nodeIndex = new Map(graph.nodes.map((node, index) => [node.id, index]));
-    this.nodes = graph.nodes.map((node) => ({ id: node.id, type: node.type, inputs: {}, params: numberParams(node.params) }));
-    this.valueCache = graph.nodes.map(() => ({}));
-    this.stampCache = graph.nodes.map(() => ({}));
-    for (const edge of graph.edges) {
-      const toIndex = nodeIndex.get(edge.to.nodeId);
-      const fromIndex = nodeIndex.get(edge.from.nodeId);
-      if (toIndex === undefined || fromIndex === undefined) continue;
-      this.nodes[toIndex].inputs[edge.to.portId] = { nodeIndex: fromIndex, portId: edge.from.portId };
-    }
+    const state: CompileState = {
+      graph,
+      nodes: new Map(graph.nodes.map((node) => [node.id, node])),
+      incoming: new Map(graph.edges.map((edge) => [`${edge.to.nodeId}:${edge.to.portId}`, edge])),
+      memo: new Map()
+    };
+    const expression = emitInputFloat(state, output, 'value', '1');
+    const source = `"use strict"; return function evaluate(c) { return ${expression}; };`;
+    const factory = new Function('noise', 'clamp', 'smoothstep', source) as (noise: (seed: number, x: number, y: number) => number, clampFn: typeof clamp, smoothstepFn: typeof smoothstep) => EvaluateFn;
+    this.fn = factory((seed, x, y) => this.noise(seed, x, y), clamp, smoothstep);
   }
 
   evaluate(context: NoiseFieldEvaluationContext): number {
-    this.generation = (this.generation + 1) || 1;
-    return this.inputFloat(this.outputIndex, 'value', context, 1);
-  }
-
-  private inputFloat(
-    nodeIndex: number,
-    inputId: string,
-    context: NoiseFieldEvaluationContext,
-    fallback = this.param(nodeIndex, inputId, 0)
-  ): number {
-    const value = this.inputValue(nodeIndex, inputId, context);
-    return typeof value === 'number' ? value : fallback;
-  }
-
-  private inputVec2(
-    nodeIndex: number,
-    inputId: string,
-    context: NoiseFieldEvaluationContext,
-    fallback: GraphVec2
-  ): GraphVec2 {
-    const value = this.inputValue(nodeIndex, inputId, context);
-    return isVec2(value) ? value : fallback;
-  }
-
-  private inputValue(
-    nodeIndex: number,
-    inputId: string,
-    context: NoiseFieldEvaluationContext
-  ): GraphValue | undefined {
-    const source = this.nodes[nodeIndex].inputs[inputId];
-    if (!source) return undefined;
-    return this.outputValue(source.nodeIndex, source.portId, context);
-  }
-
-  private outputValue(
-    nodeIndex: number,
-    outputId: string,
-    context: NoiseFieldEvaluationContext
-  ): GraphValue {
-    if (this.stampCache[nodeIndex][outputId] === this.generation) return this.valueCache[nodeIndex][outputId] as GraphValue;
-    const value = this.computeOutput(nodeIndex, outputId, context);
-    this.valueCache[nodeIndex][outputId] = value;
-    this.stampCache[nodeIndex][outputId] = this.generation;
-    return value;
-  }
-
-  private computeOutput(
-    nodeIndex: number,
-    outputId: string,
-    context: NoiseFieldEvaluationContext
-  ): GraphValue {
-    const node = this.nodes[nodeIndex];
-    if (!getNodeDefinition(node.type)) return 0;
-    if (node.type === 'constFloat') return this.param(nodeIndex, 'value', 1);
-    if (node.type === 'cartesianPosition') return positionOutput(context.cartesian, outputId);
-    if (node.type === 'splinePosition') return positionOutput(context.spline, outputId);
-    if (node.type === 'simplex2d') return this.simplex2d(nodeIndex, context);
-    if (node.type === 'fbm2d') return this.fbm2d(nodeIndex, context, false);
-    if (node.type === 'ridged2d') return this.fbm2d(nodeIndex, context, true);
-    if (node.type === 'add') return this.inputFloat(nodeIndex, 'a', context) + this.inputFloat(nodeIndex, 'b', context);
-    if (node.type === 'subtract') return this.inputFloat(nodeIndex, 'a', context) - this.inputFloat(nodeIndex, 'b', context);
-    if (node.type === 'multiply') return this.inputFloat(nodeIndex, 'a', context, 1) * this.inputFloat(nodeIndex, 'b', context, 1);
-    if (node.type === 'divide') {
-      const divisor = this.inputFloat(nodeIndex, 'b', context, 1);
-      return Math.abs(divisor) <= Number.EPSILON ? 0 : this.inputFloat(nodeIndex, 'a', context, 1) / divisor;
-    }
-    if (node.type === 'clamp') return clamp(this.inputFloat(nodeIndex, 'in', context), this.param(nodeIndex, 'min', 0), this.param(nodeIndex, 'max', 1));
-    if (node.type === 'power') return Math.pow(Math.max(0, this.inputFloat(nodeIndex, 'in', context)), this.param(nodeIndex, 'exponent', 1));
-    if (node.type === 'smoothstep') return smoothstep(this.param(nodeIndex, 'edge0', 0), this.param(nodeIndex, 'edge1', 1), this.inputFloat(nodeIndex, 'in', context));
-    return 0;
-  }
-
-  private noiseInput(
-    nodeIndex: number,
-    context: NoiseFieldEvaluationContext
-  ): GraphVec2 {
-    const xy = this.inputVec2(nodeIndex, 'xy', context, { x: Number.NaN, y: Number.NaN });
-    if (Number.isFinite(xy.x) && Number.isFinite(xy.y)) return xy;
-    return {
-      x: this.inputFloat(nodeIndex, 'x', context, context.cartesian.x),
-      y: this.inputFloat(nodeIndex, 'y', context, context.cartesian.y)
-    };
-  }
-
-  private simplex2d(
-    nodeIndex: number,
-    context: NoiseFieldEvaluationContext
-  ): number {
-    const input = this.noiseInput(nodeIndex, context);
-    const frequency = this.param(nodeIndex, 'frequency', 0.002);
-    const x = ((input.x + this.param(nodeIndex, 'offsetX', 0)) * frequency) / safeScale(this.param(nodeIndex, 'skewX', 1));
-    const y = ((input.y + this.param(nodeIndex, 'offsetY', 0)) * frequency) / safeScale(this.param(nodeIndex, 'skewY', 1));
-    const seed = Math.trunc(this.param(nodeIndex, 'seed', 1));
-    const normalized = this.noise(seed, x, y) * 0.5 + 0.5;
-    return this.remap01(clamp(normalized * this.param(nodeIndex, 'amplitude', 1), 0, 1), nodeIndex);
-  }
-
-  private fbm2d(
-    nodeIndex: number,
-    context: NoiseFieldEvaluationContext,
-    ridged: boolean
-  ): number {
-    const input = this.noiseInput(nodeIndex, context);
-    const octaves = clamp(Math.trunc(this.param(nodeIndex, 'octaves', 5)), 1, 12);
-    const baseFrequency = this.param(nodeIndex, 'frequency', 0.002);
-    const lacunarity = Math.max(0.01, this.param(nodeIndex, 'lacunarity', 2));
-    const gain = Math.max(0, this.param(nodeIndex, 'gain', 0.5));
-    const seed = Math.trunc(this.param(nodeIndex, 'seed', 1));
-    const offsetX = this.param(nodeIndex, 'offsetX', 0);
-    const offsetY = this.param(nodeIndex, 'offsetY', 0);
-    const skewX = safeScale(this.param(nodeIndex, 'skewX', 1));
-    const skewY = safeScale(this.param(nodeIndex, 'skewY', 1));
-    let frequency = baseFrequency;
-    let amplitude = 1;
-    let value = 0;
-    let amplitudeSum = 0;
-    for (let octave = 0; octave < octaves; octave += 1) {
-      const x = ((input.x + offsetX) * frequency) / skewX;
-      const y = ((input.y + offsetY) * frequency) / skewY;
-      const n = this.noise(seed + octave * 1013, x, y);
-      const normalized = ridged ? 1 - Math.abs(n) : n * 0.5 + 0.5;
-      value += normalized * amplitude;
-      amplitudeSum += amplitude;
-      amplitude *= gain;
-      frequency *= lacunarity;
-    }
-    const normalized = amplitudeSum > 0 ? value / amplitudeSum : 0;
-    return this.remap01(clamp(normalized * this.param(nodeIndex, 'amplitude', 1), 0, 1), nodeIndex);
+    return this.fn(context);
   }
 
   private noise(seed: number, x: number, y: number): number {
@@ -201,31 +66,130 @@ class CompiledNoiseGraphEvaluator implements CompiledNoiseFieldGraph {
     }
     return fn(x, y);
   }
-
-  private param(nodeIndex: number, key: string, fallback: number): number {
-    return this.nodes[nodeIndex].params[key] ?? fallback;
-  }
-
-  private remap01(value: number, nodeIndex: number): number {
-    const min = this.param(nodeIndex, 'rangeMin', 0);
-    const max = this.param(nodeIndex, 'rangeMax', 1);
-    return min + value * (max - min);
-  }
 }
 
-function positionOutput(position: GraphVec2, outputId: string): GraphValue {
-  if (outputId === 'x') return position.x;
-  if (outputId === 'y') return position.y;
-  return position;
+function emitInputFloat(state: CompileState, node: NoiseGraphNodeV1, portId: string, fallback: string): string {
+  const edge = state.incoming.get(`${node.id}:${portId}`);
+  if (!edge) return fallback;
+  const source = state.nodes.get(edge.from.nodeId);
+  if (!source) return fallback;
+  const expression = emitOutput(state, source, edge.from.portId);
+  return expression.type === 'float' ? expression.value : fallback;
 }
 
-function numberParams(params: NoiseGraphNodeV1['params']): Record<string, number> {
-  const values: Record<string, number> = {};
-  for (const [key, value] of Object.entries(params)) {
-    const number = Number(value);
-    if (Number.isFinite(number)) values[key] = number;
+function emitInputVec2(state: CompileState, node: NoiseGraphNodeV1, portId: string, fallback: { x: string; y: string }): { x: string; y: string } {
+  const edge = state.incoming.get(`${node.id}:${portId}`);
+  if (!edge) return fallback;
+  const source = state.nodes.get(edge.from.nodeId);
+  if (!source) return fallback;
+  const expression = emitOutput(state, source, edge.from.portId);
+  return expression.type === 'vec2' ? { x: expression.x, y: expression.y } : fallback;
+}
+
+function emitOutput(
+  state: CompileState,
+  node: NoiseGraphNodeV1,
+  portId: string
+): { type: 'float'; value: string } | { type: 'vec2'; x: string; y: string } {
+  const key = `${node.id}:${portId}`;
+  const memo = state.memo.get(key);
+  if (memo) return { type: 'float', value: memo };
+
+  if (node.type === 'cartesianPosition') return emitPosition('c.cartesian', portId);
+  if (node.type === 'splinePosition') return emitPosition('c.spline', portId);
+  if (node.type === 'constFloat') return floatMemo(state, key, numberLiteral(param(node, 'value', 1)));
+  if (node.type === 'simplex2d') return floatMemo(state, key, emitSimplex2d(state, node));
+  if (node.type === 'fbm2d') return floatMemo(state, key, emitFbm2d(state, node, false));
+  if (node.type === 'ridged2d') return floatMemo(state, key, emitFbm2d(state, node, true));
+  if (node.type === 'add') return floatMemo(state, key, `(${emitInputFloat(state, node, 'a', '0')} + ${emitInputFloat(state, node, 'b', '0')})`);
+  if (node.type === 'subtract') return floatMemo(state, key, `(${emitInputFloat(state, node, 'a', '0')} - ${emitInputFloat(state, node, 'b', '0')})`);
+  if (node.type === 'multiply') return floatMemo(state, key, `(${emitInputFloat(state, node, 'a', '1')} * ${emitInputFloat(state, node, 'b', '1')})`);
+  if (node.type === 'divide') {
+    const divisor = emitInputFloat(state, node, 'b', '1');
+    return floatMemo(state, key, `(Math.abs(${divisor}) <= Number.EPSILON ? 0 : (${emitInputFloat(state, node, 'a', '1')} / ${divisor}))`);
   }
-  return values;
+  if (node.type === 'clamp') {
+    return floatMemo(state, key, `clamp(${emitInputFloat(state, node, 'in', '0')}, ${numberLiteral(param(node, 'min', 0))}, ${numberLiteral(param(node, 'max', 1))})`);
+  }
+  if (node.type === 'power') {
+    return floatMemo(state, key, `Math.pow(Math.max(0, ${emitInputFloat(state, node, 'in', '0')}), ${numberLiteral(param(node, 'exponent', 1))})`);
+  }
+  if (node.type === 'smoothstep') {
+    return floatMemo(state, key, `smoothstep(${numberLiteral(param(node, 'edge0', 0))}, ${numberLiteral(param(node, 'edge1', 1))}, ${emitInputFloat(state, node, 'in', '0')})`);
+  }
+  return { type: 'float', value: '0' };
+}
+
+function emitPosition(path: string, portId: string): { type: 'float'; value: string } | { type: 'vec2'; x: string; y: string } {
+  if (portId === 'x') return { type: 'float', value: `${path}.x` };
+  if (portId === 'y') return { type: 'float', value: `${path}.y` };
+  return { type: 'vec2', x: `${path}.x`, y: `${path}.y` };
+}
+
+function emitSimplex2d(state: CompileState, node: NoiseGraphNodeV1): string {
+  const input = noiseInput(state, node);
+  const frequency = param(node, 'frequency', 0.002);
+  const x = `(((${input.x}) + ${numberLiteral(param(node, 'offsetX', 0))}) * ${numberLiteral(frequency)} / ${numberLiteral(safeScale(param(node, 'skewX', 1)))})`;
+  const y = `(((${input.y}) + ${numberLiteral(param(node, 'offsetY', 0))}) * ${numberLiteral(frequency)} / ${numberLiteral(safeScale(param(node, 'skewY', 1)))})`;
+  const normalized = `((noise(${Math.trunc(param(node, 'seed', 1))}, ${x}, ${y}) * 0.5 + 0.5) * ${numberLiteral(param(node, 'amplitude', 1))})`;
+  return remap01(`clamp(${normalized}, 0, 1)`, node);
+}
+
+function emitFbm2d(state: CompileState, node: NoiseGraphNodeV1, ridged: boolean): string {
+  const input = noiseInput(state, node);
+  const octaves = clamp(Math.trunc(param(node, 'octaves', 5)), 1, 12);
+  const lacunarity = Math.max(0.01, param(node, 'lacunarity', 2));
+  const gain = Math.max(0, param(node, 'gain', 0.5));
+  const seed = Math.trunc(param(node, 'seed', 1));
+  const skewX = safeScale(param(node, 'skewX', 1));
+  const skewY = safeScale(param(node, 'skewY', 1));
+  const offsetX = param(node, 'offsetX', 0);
+  const offsetY = param(node, 'offsetY', 0);
+  let frequency = param(node, 'frequency', 0.002);
+  let amplitude = 1;
+  let amplitudeSum = 0;
+  const terms: string[] = [];
+  for (let octave = 0; octave < octaves; octave += 1) {
+    const x = `(((${input.x}) + ${numberLiteral(offsetX)}) * ${numberLiteral(frequency)} / ${numberLiteral(skewX)})`;
+    const y = `(((${input.y}) + ${numberLiteral(offsetY)}) * ${numberLiteral(frequency)} / ${numberLiteral(skewY)})`;
+    const raw = `noise(${seed + octave * 1013}, ${x}, ${y})`;
+    const normalized = ridged ? `(1 - Math.abs(${raw}))` : `(${raw} * 0.5 + 0.5)`;
+    terms.push(`(${normalized} * ${numberLiteral(amplitude)})`);
+    amplitudeSum += amplitude;
+    amplitude *= gain;
+    frequency *= lacunarity;
+  }
+  const value = terms.length > 0 ? `((${terms.join(' + ')}) / ${numberLiteral(amplitudeSum || 1)})` : '0';
+  return remap01(`clamp((${value} * ${numberLiteral(param(node, 'amplitude', 1))}), 0, 1)`, node);
+}
+
+function noiseInput(state: CompileState, node: NoiseGraphNodeV1): { x: string; y: string } {
+  const xy = emitInputVec2(state, node, 'xy', { x: '', y: '' });
+  if (xy.x && xy.y) return xy;
+  return {
+    x: emitInputFloat(state, node, 'x', 'c.cartesian.x'),
+    y: emitInputFloat(state, node, 'y', 'c.cartesian.y')
+  };
+}
+
+function remap01(value: string, node: NoiseGraphNodeV1): string {
+  const min = param(node, 'rangeMin', 0);
+  const max = param(node, 'rangeMax', 1);
+  return `(${numberLiteral(min)} + (${value}) * ${numberLiteral(max - min)})`;
+}
+
+function floatMemo(state: CompileState, key: string, value: string): { type: 'float'; value: string } {
+  state.memo.set(key, value);
+  return { type: 'float', value };
+}
+
+function param(node: NoiseGraphNodeV1, key: string, fallback: number): number {
+  const value = Number(node.params[key]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function numberLiteral(value: number): string {
+  return Number.isFinite(value) ? JSON.stringify(value) : '0';
 }
 
 function smoothstep(edge0: number, edge1: number, value: number): number {
@@ -247,10 +211,6 @@ function seededRandom(seed: number): () => number {
     value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
     return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-function isVec2(value: GraphValue | undefined): value is GraphVec2 {
-  return typeof value === 'object' && value !== null && Number.isFinite(value.x) && Number.isFinite(value.y);
 }
 
 function clamp(value: number, min: number, max: number): number {
