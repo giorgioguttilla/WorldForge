@@ -14,6 +14,8 @@
 
   type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
 
+  const WEBGPU_BAKE_SETTING_KEY = 'worldforge:preferWebGpuBake';
+
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
   let viewport: EditorViewport | null = null;
@@ -34,7 +36,7 @@
   let showRenderSettings = false;
   let showWater = false;
   let bakeDebugTelemetry = false;
-  let preferWebGpuBake = false;
+  let preferWebGpuBake = true;
   let waterLevel = 0;
   let hoverCoordinates: HoverCoordinates | null = null;
   let metrics: EditorMetrics = { ...manager.metrics };
@@ -77,6 +79,7 @@
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
 
   onMount(async () => {
+    preferWebGpuBake = readBooleanSetting(WEBGPU_BAKE_SETTING_KEY, true);
     viewport = new EditorViewport(canvas, container, manager, (coordinates) => {
       hoverCoordinates = coordinates;
     });
@@ -691,6 +694,17 @@
     scheduleAuthoringSave();
   }
 
+  function persistBakeSettings() {
+    localStorage.setItem(WEBGPU_BAKE_SETTING_KEY, preferWebGpuBake ? 'true' : 'false');
+  }
+
+  function readBooleanSetting(key: string, fallback: boolean): boolean {
+    const stored = localStorage.getItem(key);
+    if (stored === 'true') return true;
+    if (stored === 'false') return false;
+    return fallback;
+  }
+
   function restoreSelection(selection: { primitiveId: string | null; anchorId: string | null }, document: AuthoringDocumentV1) {
     const primitive = document.primitives.find((item) => item.id === selection.primitiveId);
     selectedPrimitiveId = primitive?.id ?? null;
@@ -1030,7 +1044,7 @@
         <span>Bake debug telemetry</span>
       </label>
       <label class="toggle-row">
-        <input type="checkbox" bind:checked={preferWebGpuBake} />
+        <input type="checkbox" bind:checked={preferWebGpuBake} onchange={persistBakeSettings} />
         <span>Experimental WebGPU bake</span>
       </label>
       <label>
