@@ -11,15 +11,12 @@ import {
 interface PackedGpuDocument {
   landformCount: number;
   mountainCount: number;
-  landform0: Float32Array;
-  landform1: Float32Array;
-  landform2: Float32Array;
-  mountain0: Float32Array;
-  mountain1: Float32Array;
-  mountain2: Float32Array;
+  landforms: Float32Array;
+  mountains: Float32Array;
   points: Float32Array;
   segments: Float32Array;
   segmentBounds: Float32Array;
+  simplexGradients: Float32Array;
   fieldIds: string[];
 }
 
@@ -31,15 +28,12 @@ interface GpuDepthZeroBake {
 interface GpuDocumentBuffers {
   landformCount: number;
   mountainCount: number;
-  landform0: GPUBuffer;
-  landform1: GPUBuffer;
-  landform2: GPUBuffer;
-  mountain0: GPUBuffer;
-  mountain1: GPUBuffer;
-  mountain2: GPUBuffer;
+  landforms: GPUBuffer;
+  mountains: GPUBuffer;
   points: GPUBuffer;
   segments: GPUBuffer;
   segmentBounds: GPUBuffer;
+  simplexGradients: GPUBuffer;
 }
 
 interface CompileState {
@@ -47,9 +41,24 @@ interface CompileState {
   nodes: Map<string, NoiseGraphNodeV1>;
   incoming: Map<string, NoiseGraphEdgeV1>;
   memo: Map<string, string>;
+  simplexSeedSlots: Map<number, number>;
 }
 
 const WORKGROUP_SIZE = 8;
+const GRAD2 = new Float32Array([
+  1, 1,
+  -1, 1,
+  1, -1,
+  -1, -1,
+  1, 0,
+  -1, 0,
+  1, 0,
+  -1, 0,
+  0, 1,
+  0, -1,
+  0, 1,
+  0, -1
+]);
 
 export function canUseWebGpuStructuralBake(): boolean {
   return typeof navigator !== 'undefined' && Boolean(navigator.gpu);
@@ -63,15 +72,12 @@ export async function tryCreateWebGpuDepthZeroBake(
   if (!canUseWebGpuStructuralBake()) return null;
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) return null;
-  if (adapter.limits.maxStorageBuffersPerShaderStage < 10) return null;
-  const device = await adapter.requestDevice({
-    requiredLimits: {
-      maxStorageBuffersPerShaderStage: 10
-    }
-  });
+  const device = await adapter.requestDevice();
   const prepared = prepareStructuralDocument(document);
-  const packed = packPreparedDocument(prepared, waterLevel, config.worldHeight);
-  const shader = createBakeShader(config, prepared.fieldLibrary);
+  const supportedFields = prepared.fieldLibrary.filter((field) => compileNoiseFieldGraph(field));
+  const simplexSeedSlots = collectSimplexSeedSlots(supportedFields);
+  const packed = packPreparedDocument(prepared, waterLevel, config.worldHeight, supportedFields, simplexSeedSlots);
+  const shader = createBakeShader(config, supportedFields, simplexSeedSlots);
   const module = device.createShaderModule({ label: 'WorldForge structural bake', code: shader });
   const pipeline = device.createComputePipeline({
     label: 'WorldForge structural bake pipeline',
@@ -123,16 +129,13 @@ async function bakeTileWithDevice(
     layout: pipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: buffers.uniform } },
-      { binding: 1, resource: { buffer: documentBuffers.landform0 } },
-      { binding: 2, resource: { buffer: documentBuffers.landform1 } },
-      { binding: 3, resource: { buffer: documentBuffers.landform2 } },
-      { binding: 4, resource: { buffer: documentBuffers.mountain0 } },
-      { binding: 5, resource: { buffer: documentBuffers.mountain1 } },
-      { binding: 6, resource: { buffer: documentBuffers.mountain2 } },
-      { binding: 7, resource: { buffer: documentBuffers.points } },
-      { binding: 8, resource: { buffer: documentBuffers.segments } },
-      { binding: 9, resource: { buffer: documentBuffers.segmentBounds } },
-      { binding: 10, resource: { buffer: buffers.output } }
+      { binding: 1, resource: { buffer: documentBuffers.landforms } },
+      { binding: 2, resource: { buffer: documentBuffers.mountains } },
+      { binding: 3, resource: { buffer: documentBuffers.points } },
+      { binding: 4, resource: { buffer: documentBuffers.segments } },
+      { binding: 5, resource: { buffer: documentBuffers.segmentBounds } },
+      { binding: 6, resource: { buffer: documentBuffers.simplexGradients } },
+      { binding: 7, resource: { buffer: buffers.output } }
     ]
   });
   const encoder = device.createCommandEncoder();
@@ -160,31 +163,28 @@ function createDocumentBuffers(device: GPUDevice, packed: PackedGpuDocument): Gp
   return {
     landformCount: packed.landformCount,
     mountainCount: packed.mountainCount,
-    landform0: createStorageBuffer(device, packed.landform0),
-    landform1: createStorageBuffer(device, packed.landform1),
-    landform2: createStorageBuffer(device, packed.landform2),
-    mountain0: createStorageBuffer(device, packed.mountain0),
-    mountain1: createStorageBuffer(device, packed.mountain1),
-    mountain2: createStorageBuffer(device, packed.mountain2),
+    landforms: createStorageBuffer(device, packed.landforms),
+    mountains: createStorageBuffer(device, packed.mountains),
     points: createStorageBuffer(device, packed.points),
     segments: createStorageBuffer(device, packed.segments),
-    segmentBounds: createStorageBuffer(device, packed.segmentBounds)
+    segmentBounds: createStorageBuffer(device, packed.segmentBounds),
+    simplexGradients: createStorageBuffer(device, packed.simplexGradients)
   };
 }
 
-function packPreparedDocument(document: PreparedStructuralDocument, waterLevel: number, worldHeight: number): PackedGpuDocument {
-  const landform0: number[] = [];
-  const landform1: number[] = [];
-  const landform2: number[] = [];
-  const mountain0: number[] = [];
-  const mountain1: number[] = [];
-  const mountain2: number[] = [];
+function packPreparedDocument(
+  document: PreparedStructuralDocument,
+  waterLevel: number,
+  worldHeight: number,
+  supportedFields: NoiseFieldGraphV1[],
+  simplexSeedSlots: Map<number, number>
+): PackedGpuDocument {
+  const landforms: number[] = [];
+  const mountains: number[] = [];
   const points: number[] = [];
   const segments: number[] = [];
   const segmentBounds: number[] = [];
-  const fieldIds = document.fieldLibrary
-    .filter((field) => compileNoiseFieldGraph(field))
-    .map((field) => field.id);
+  const fieldIds = supportedFields.map((field) => field.id);
 
   for (const landform of document.landforms) {
     const pointOffset = points.length / 2;
@@ -196,9 +196,11 @@ function packPreparedDocument(document: PreparedStructuralDocument, waterLevel: 
       segments.push(segment.ax, segment.az, segment.bx, segment.bz);
       segmentBounds.push(segment.minX, segment.maxX, segment.minZ, segment.maxZ);
     }
-    landform0.push(landform.bounds.minX, landform.bounds.maxX, landform.bounds.minZ, landform.bounds.maxZ);
-    landform1.push(getLandformTargetElevation(landform.primitive.mode, landform.primitive.elevation, waterLevel, worldHeight), landform.primitive.noiseScale, landform.primitive.edgeSmoothness, fieldIndex(fieldIds, landform.primitive.fieldId));
-    landform2.push(pointOffset, landform.xs.length, segmentOffset, landform.segments.length);
+    landforms.push(
+      landform.bounds.minX, landform.bounds.maxX, landform.bounds.minZ, landform.bounds.maxZ,
+      getLandformTargetElevation(landform.primitive.mode, landform.primitive.elevation, waterLevel, worldHeight), landform.primitive.noiseScale, landform.primitive.edgeSmoothness, fieldIndex(fieldIds, landform.primitive.fieldId),
+      pointOffset, landform.xs.length, segmentOffset, landform.segments.length
+    );
   }
 
   for (const mountain of document.mountains) {
@@ -211,30 +213,84 @@ function packPreparedDocument(document: PreparedStructuralDocument, waterLevel: 
       segments.push(segment.ax, segment.az, segment.bx, segment.bz);
       segmentBounds.push(segment.minX, segment.maxX, segment.minZ, segment.maxZ);
     }
-    mountain0.push(mountain.bounds.minX, mountain.bounds.maxX, mountain.bounds.minZ, mountain.bounds.maxZ);
-    mountain1.push(Math.max(0, mountain.primitive.height), mountain.primitive.width, mountain.primitive.edgeSmoothness, fieldIndex(fieldIds, mountain.primitive.fieldId));
-    mountain2.push(pointOffset, mountain.xs.length, segmentOffset, mountain.segments.length);
+    mountains.push(
+      mountain.bounds.minX, mountain.bounds.maxX, mountain.bounds.minZ, mountain.bounds.maxZ,
+      Math.max(0, mountain.primitive.height), mountain.primitive.width, mountain.primitive.edgeSmoothness, fieldIndex(fieldIds, mountain.primitive.fieldId),
+      pointOffset, mountain.xs.length, segmentOffset, mountain.segments.length
+    );
   }
 
   return {
-    landformCount: landform0.length / 4,
-    mountainCount: mountain0.length / 4,
-    landform0: vec4Array(landform0),
-    landform1: vec4Array(landform1),
-    landform2: vec4Array(landform2),
-    mountain0: vec4Array(mountain0),
-    mountain1: vec4Array(mountain1),
-    mountain2: vec4Array(mountain2),
+    landformCount: landforms.length / 12,
+    mountainCount: mountains.length / 12,
+    landforms: vec4Array(landforms),
+    mountains: vec4Array(mountains),
     points: vec2Array(points),
     segments: vec4Array(segments),
     segmentBounds: vec4Array(segmentBounds),
+    simplexGradients: buildSimplexGradientTable(simplexSeedSlots),
     fieldIds
   };
 }
 
-function createBakeShader(config: WorldConfig, fields: NoiseFieldGraphV1[]): string {
-  const supportedFields = fields.filter((field) => compileNoiseFieldGraph(field));
-  const fieldFunctions = supportedFields.map((field, index) => emitFieldFunction(field, index)).join('\n\n');
+function collectSimplexSeedSlots(fields: NoiseFieldGraphV1[]): Map<number, number> {
+  const seeds = new Set<number>();
+  for (const field of fields) {
+    for (const node of field.nodes) {
+      if (node.type === 'simplex2d') {
+        seeds.add(Math.trunc(param(node, 'seed', 1)));
+      }
+      if (node.type === 'fbm2d' || node.type === 'ridged2d') {
+        const baseSeed = Math.trunc(param(node, 'seed', 1));
+        const octaves = Math.max(1, Math.min(12, Math.trunc(param(node, 'octaves', 5))));
+        for (let octave = 0; octave < octaves; octave += 1) {
+          seeds.add(baseSeed + octave * 1013);
+        }
+      }
+    }
+  }
+  return new Map([...seeds].sort((a, b) => a - b).map((seed, index) => [seed, index]));
+}
+
+function buildSimplexGradientTable(seedSlots: Map<number, number>): Float32Array {
+  const slotCount = Math.max(1, seedSlots.size);
+  const values = new Float32Array(slotCount * 512 * 4);
+  if (seedSlots.size === 0) return values;
+  for (const [seed, slot] of seedSlots) {
+    const perm = buildPermutationTable(seededRandom(seed));
+    for (let i = 0; i < 512; i += 1) {
+      const value = perm[i];
+      const gradOffset = (value % 12) * 2;
+      const out = (slot * 512 + i) * 4;
+      values[out] = GRAD2[gradOffset];
+      values[out + 1] = GRAD2[gradOffset + 1];
+      values[out + 2] = value;
+      values[out + 3] = 0;
+    }
+  }
+  return values;
+}
+
+function buildPermutationTable(random: () => number): Uint8Array {
+  const tableSize = 512;
+  const p = new Uint8Array(tableSize);
+  for (let i = 0; i < tableSize / 2; i += 1) {
+    p[i] = i;
+  }
+  for (let i = 0; i < tableSize / 2 - 1; i += 1) {
+    const r = i + ~~(random() * (256 - i));
+    const aux = p[i];
+    p[i] = p[r];
+    p[r] = aux;
+  }
+  for (let i = 256; i < tableSize; i += 1) {
+    p[i] = p[i - 256];
+  }
+  return p;
+}
+
+function createBakeShader(config: WorldConfig, supportedFields: NoiseFieldGraphV1[], simplexSeedSlots: Map<number, number>): string {
+  const fieldFunctions = supportedFields.map((field, index) => emitFieldFunction(field, index, simplexSeedSlots)).join('\n\n');
   const fieldSwitch = supportedFields.length === 0
     ? 'return 0.0;'
     : `switch (fieldIndex) {\n${supportedFields.map((_, index) => `    case ${index}: { return field_${index}(position); }`).join('\n')}\n    default: { return 0.0; }\n  }`;
@@ -254,22 +310,24 @@ struct Vec4Buffer { values: array<vec4<f32>> };
 struct OutputBuffer { values: array<u32> };
 
 @group(0) @binding(0) var<uniform> u: BakeUniforms;
-@group(0) @binding(1) var<storage, read> landform0: Vec4Buffer;
-@group(0) @binding(2) var<storage, read> landform1: Vec4Buffer;
-@group(0) @binding(3) var<storage, read> landform2: Vec4Buffer;
-@group(0) @binding(4) var<storage, read> mountain0: Vec4Buffer;
-@group(0) @binding(5) var<storage, read> mountain1: Vec4Buffer;
-@group(0) @binding(6) var<storage, read> mountain2: Vec4Buffer;
-@group(0) @binding(7) var<storage, read> points: Vec4Buffer;
-@group(0) @binding(8) var<storage, read> segments: Vec4Buffer;
-@group(0) @binding(9) var<storage, read> segmentBounds: Vec4Buffer;
-@group(0) @binding(10) var<storage, read_write> output: OutputBuffer;
+@group(0) @binding(1) var<storage, read> landforms: Vec4Buffer;
+@group(0) @binding(2) var<storage, read> mountains: Vec4Buffer;
+@group(0) @binding(3) var<storage, read> points: Vec4Buffer;
+@group(0) @binding(4) var<storage, read> segments: Vec4Buffer;
+@group(0) @binding(5) var<storage, read> segmentBounds: Vec4Buffer;
+@group(0) @binding(6) var<storage, read> simplexGradients: Vec4Buffer;
+@group(0) @binding(7) var<storage, read_write> output: OutputBuffer;
 
 const TILE_SIZE: u32 = ${Math.trunc(config.tileSize)}u;
 const WORKGROUP_SIZE: u32 = ${WORKGROUP_SIZE}u;
+const F2: f32 = 0.3660254037844386;
+const G2: f32 = 0.21132486540518713;
 
 fn saturate(v: f32) -> f32 { return clamp(v, 0.0, 1.0); }
 fn lerp(a: f32, b: f32, t: f32) -> f32 { return a + (b - a) * t; }
+fn fastFloor(v: f32) -> i32 {
+  return i32(floor(v));
+}
 fn smoothstep_wf(edge0: f32, edge1: f32, value: f32) -> f32 {
   if (edge0 == edge1) { return select(0.0, 1.0, value >= edge1); }
   let t = saturate((value - edge0) / (edge1 - edge0));
@@ -288,20 +346,55 @@ fn terrace_wf(value: f32, steps: f32, softness: f32) -> f32 {
   let rampStart = 1.0 - max(t, 0.000001);
   return lower + (upper - lower) * smoothstep_wf(rampStart, 1.0, local);
 }
-fn hash2(p: vec2<f32>, seed: f32) -> f32 {
-  let h = dot(p + vec2<f32>(seed * 17.17, seed * 0.131), vec2<f32>(127.1, 311.7));
-  return fract(sin(h) * 43758.5453123);
+fn simplexGradient(seedSlot: u32, index: u32) -> vec2<f32> {
+  return simplexGradients.values[seedSlot * 512u + index].xy;
 }
-fn noise2(seed: f32, x: f32, y: f32) -> f32 {
-  let p = vec2<f32>(x, y);
-  let i = floor(p);
-  let f = fract(p);
-  let u2 = f * f * (3.0 - 2.0 * f);
-  let a = hash2(i, seed);
-  let b = hash2(i + vec2<f32>(1.0, 0.0), seed);
-  let c = hash2(i + vec2<f32>(0.0, 1.0), seed);
-  let d = hash2(i + vec2<f32>(1.0, 1.0), seed);
-  return (mix(mix(a, b, u2.x), mix(c, d, u2.x), u2.y) * 2.0) - 1.0;
+fn noise2(seedSlotF: f32, x: f32, y: f32) -> f32 {
+  let seedSlot = u32(seedSlotF);
+  var n0 = 0.0;
+  var n1 = 0.0;
+  var n2 = 0.0;
+  let s = (x + y) * F2;
+  let i = fastFloor(x + s);
+  let j = fastFloor(y + s);
+  let t = f32(i + j) * G2;
+  let x0 = x - (f32(i) - t);
+  let y0 = y - (f32(j) - t);
+  var i1 = 0i;
+  var j1 = 1i;
+  if (x0 > y0) {
+    i1 = 1i;
+    j1 = 0i;
+  }
+  let x1 = x0 - f32(i1) + G2;
+  let y1 = y0 - f32(j1) + G2;
+  let x2 = x0 - 1.0 + 2.0 * G2;
+  let y2 = y0 - 1.0 + 2.0 * G2;
+  let ii = u32(i & 255i);
+  let jj = u32(j & 255i);
+
+  var t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 >= 0.0) {
+    let permJ = u32(simplexGradients.values[seedSlot * 512u + jj].z);
+    let gradient = simplexGradient(seedSlot, ii + permJ);
+    t0 = t0 * t0;
+    n0 = t0 * t0 * dot(gradient, vec2<f32>(x0, y0));
+  }
+  var t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 >= 0.0) {
+    let permJ = u32(simplexGradients.values[seedSlot * 512u + jj + u32(j1)].z);
+    let gradient = simplexGradient(seedSlot, ii + u32(i1) + permJ);
+    t1 = t1 * t1;
+    n1 = t1 * t1 * dot(gradient, vec2<f32>(x1, y1));
+  }
+  var t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 >= 0.0) {
+    let permJ = u32(simplexGradients.values[seedSlot * 512u + jj + 1u].z);
+    let gradient = simplexGradient(seedSlot, ii + 1u + permJ);
+    t2 = t2 * t2;
+    n2 = t2 * t2 * dot(gradient, vec2<f32>(x2, y2));
+  }
+  return 70.0 * (n0 + n1 + n2);
 }
 fn distanceToSegmentSq(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
   let ab = b - a;
@@ -385,12 +478,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var elevation = 0.0;
 
   for (var i = 0u; i < u32(u.landformCount); i = i + 1u) {
-    let bounds = landform0.values[i];
+    let base = i * 3u;
+    let bounds = landforms.values[base];
     if (position.x < bounds.x || position.x > bounds.y || position.y < bounds.z || position.y > bounds.w) {
       continue;
     }
-    let meta1 = landform1.values[i];
-    let meta2 = landform2.values[i];
+    let meta1 = landforms.values[base + 1u];
+    let meta2 = landforms.values[base + 2u];
     let weight = landformWeight(position, meta2, meta1.z);
     if (weight <= 0.0) {
       continue;
@@ -403,12 +497,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 
   for (var i = 0u; i < u32(u.mountainCount); i = i + 1u) {
-    let bounds = mountain0.values[i];
+    let base = i * 3u;
+    let bounds = mountains.values[base];
     if (position.x < bounds.x || position.x > bounds.y || position.y < bounds.z || position.y > bounds.w) {
       continue;
     }
-    let meta1 = mountain1.values[i];
-    let meta2 = mountain2.values[i];
+    let meta1 = mountains.values[base + 1u];
+    let meta2 = mountains.values[base + 2u];
     let weight = mountainWeight(position, meta1, meta2);
     if (weight <= 0.0) {
       continue;
@@ -426,7 +521,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `;
 }
 
-function emitFieldFunction(graph: NoiseFieldGraphV1, index: number): string {
+function emitFieldFunction(graph: NoiseFieldGraphV1, index: number, simplexSeedSlots: Map<number, number>): string {
   if (validateNoiseGraph(graph).some((issue) => issue.severity === 'error')) {
     return `fn field_${index}(position: vec2<f32>) -> f32 { return 0.0; }`;
   }
@@ -436,7 +531,8 @@ function emitFieldFunction(graph: NoiseFieldGraphV1, index: number): string {
     graph,
     nodes: new Map(graph.nodes.map((node) => [node.id, node])),
     incoming: new Map(graph.edges.map((edge) => [`${edge.to.nodeId}:${edge.to.portId}`, edge])),
-    memo: new Map()
+    memo: new Map(),
+    simplexSeedSlots
   };
   const expression = emitInputFloat(state, output, 'value', '1.0');
   return `fn field_${index}(position: vec2<f32>) -> f32 { return ${expression}; }`;
@@ -497,7 +593,7 @@ function emitSimplex2d(state: CompileState, node: NoiseGraphNodeV1): string {
   const frequency = param(node, 'frequency', 0.002);
   const x = `(((${input.x}) + ${numberLiteral(param(node, 'offsetX', 0))}) * ${numberLiteral(frequency)} / ${numberLiteral(safeScale(param(node, 'skewX', 1)))})`;
   const y = `(((${input.y}) + ${numberLiteral(param(node, 'offsetY', 0))}) * ${numberLiteral(frequency)} / ${numberLiteral(safeScale(param(node, 'skewY', 1)))})`;
-  const normalized = `((noise2(${numberLiteral(Math.trunc(param(node, 'seed', 1)))}, ${x}, ${y}) * 0.5 + 0.5) * ${numberLiteral(param(node, 'amplitude', 1))})`;
+  const normalized = `((noise2(${numberLiteral(simplexSeedSlot(state, Math.trunc(param(node, 'seed', 1))))}, ${x}, ${y}) * 0.5 + 0.5) * ${numberLiteral(param(node, 'amplitude', 1))})`;
   return remap01(`clamp(${normalized}, 0.0, 1.0)`, node);
 }
 
@@ -518,7 +614,7 @@ function emitFbm2d(state: CompileState, node: NoiseGraphNodeV1, ridged: boolean)
   for (let octave = 0; octave < octaves; octave += 1) {
     const x = `(((${input.x}) + ${numberLiteral(offsetX)}) * ${numberLiteral(frequency)} / ${numberLiteral(skewX)})`;
     const y = `(((${input.y}) + ${numberLiteral(offsetY)}) * ${numberLiteral(frequency)} / ${numberLiteral(skewY)})`;
-    const raw = `noise2(${numberLiteral(seed + octave * 1013)}, ${x}, ${y})`;
+    const raw = `noise2(${numberLiteral(simplexSeedSlot(state, seed + octave * 1013))}, ${x}, ${y})`;
     const normalized = ridged ? `(1.0 - abs(${raw}))` : `(${raw} * 0.5 + 0.5)`;
     terms.push(`(${normalized} * ${numberLiteral(amplitude)})`);
     amplitudeSum += amplitude;
@@ -547,6 +643,10 @@ function remap01(value: string, node: NoiseGraphNodeV1): string {
 function floatMemo(state: CompileState, key: string, value: string): { type: 'float'; value: string } {
   state.memo.set(key, value);
   return { type: 'float', value };
+}
+
+function simplexSeedSlot(state: CompileState, seed: number): number {
+  return state.simplexSeedSlots.get(seed) ?? 0;
 }
 
 function createStorageBuffer(device: GPUDevice, data: Float32Array): GPUBuffer {
@@ -596,6 +696,17 @@ function numberLiteral(value: number): string {
 
 function safeScale(value: number): number {
   return Math.abs(value) <= Number.EPSILON ? 1 : value;
+}
+
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0 || 1;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 function clamp(value: number, min: number, max: number): number {
