@@ -164,7 +164,7 @@ export class TileManager {
     return normalized;
   }
 
-  async bakeAuthoringDocument(document: AuthoringDocumentV1, waterLevel: number, onProgress?: (progress: BulkProgress) => void, options: { debugTelemetry?: boolean } = {}): Promise<AuthoringDocumentV1> {
+  async bakeAuthoringDocument(document: AuthoringDocumentV1, waterLevel: number, onProgress?: (progress: BulkProgress) => void, options: { debugTelemetry?: boolean; preferWebGpu?: boolean } = {}): Promise<AuthoringDocumentV1> {
     const config = this.requireConfig();
     const normalized: AuthoringDocumentV1 = {
       ...document,

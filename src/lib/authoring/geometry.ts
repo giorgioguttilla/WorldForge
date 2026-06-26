@@ -34,7 +34,7 @@ export interface PreparedMountain {
   bounds: Bounds2D;
 }
 
-interface PreparedSegment {
+export interface PreparedSegment {
   ax: number;
   az: number;
   bx: number;

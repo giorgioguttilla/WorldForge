@@ -14,6 +14,7 @@ import {
   type PreparedStructuralDocument
 } from './geometry';
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
+import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 
 export interface BakeProgress {
   phase: 'baking' | 'building-lod';
@@ -44,6 +45,7 @@ export interface StructuralBakeResult {
 
 export interface StructuralBakeOptions {
   debugTelemetry?: boolean;
+  preferWebGpu?: boolean;
 }
 
 interface DepthZeroPassResult extends BakePassResult {
@@ -320,6 +322,27 @@ async function runDepthZeroStructuralPass(
 
   let written = 0;
   const total = jobs.length;
+  if (options.preferWebGpu) {
+    const gpuBake = await tryCreateWebGpuDepthZeroBake(config, document, waterLevel).catch((error) => {
+      if (options.debugTelemetry) console.warn('[WorldForge WebGPU bake fallback]', error);
+      return null;
+    });
+    if (gpuBake) {
+      try {
+        for (const job of jobs) {
+          const key = { x: job.x, y: job.y, d: 0 };
+          await io.writeTile(key, await gpuBake.bakeTile(job.x, job.y));
+          dirtyTiles.push(key);
+          written += 1;
+          onProgress?.({ phase: 'baking', current: written, total, label: `Baking structural tiles on WebGPU ${written} / ${total}` });
+        }
+        return { id: 'depth-zero-structural', dirtyTiles };
+      } finally {
+        gpuBake.destroy();
+      }
+    }
+  }
+
   if (!canUseBakeWorkers() || total <= 1) {
     const prepared = prepareStructuralDocument(document);
     for (const job of jobs) {
