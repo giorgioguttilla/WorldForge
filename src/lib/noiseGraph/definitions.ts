@@ -29,18 +29,6 @@ export const NOISE_GRAPH_NODE_DEFINITIONS: Record<NoiseGraphNodeTypeV1, NoiseGra
     ],
     defaultParams: {}
   },
-  splinePosition: {
-    type: 'splinePosition',
-    label: 'Spline Position',
-    category: 'Inputs',
-    inputs: [],
-    outputs: [
-      { id: 'x', label: 'X', direction: 'output', valueType: 'float' },
-      { id: 'y', label: 'Y', direction: 'output', valueType: 'float' },
-      { id: 'xy', label: 'XY', direction: 'output', valueType: 'vec2' }
-    ],
-    defaultParams: {}
-  },
   simplex2d: {
     type: 'simplex2d',
     label: 'Simplex 2D',
@@ -96,6 +84,14 @@ export const NOISE_GRAPH_NODE_DEFINITIONS: Record<NoiseGraphNodeTypeV1, NoiseGra
     inputs: [{ id: 'in', label: 'Value', direction: 'input', valueType: 'float' }],
     outputs: [{ id: 'value', label: 'Value', direction: 'output', valueType: 'float' }],
     defaultParams: { exponent: 1 }
+  },
+  terrace: {
+    type: 'terrace',
+    label: 'Terrace',
+    category: 'Math',
+    inputs: [{ id: 'in', label: 'Value', direction: 'input', valueType: 'float' }],
+    outputs: [{ id: 'value', label: 'Value', direction: 'output', valueType: 'float' }],
+    defaultParams: { steps: 5, softness: 0.18 }
   },
   smoothstep: {
     type: 'smoothstep',

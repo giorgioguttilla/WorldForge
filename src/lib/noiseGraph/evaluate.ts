@@ -1,12 +1,11 @@
 import { createNoise2D } from 'simplex-noise';
 import { validateNoiseGraph } from './graph';
-import type { GraphVec2, NoiseFieldEvaluationContext, NoiseFieldGraphV1, NoiseGraphEdgeV1, NoiseGraphNodeV1 } from './types';
+import type { NoiseFieldEvaluationContext, NoiseFieldGraphV1, NoiseGraphEdgeV1, NoiseGraphNodeV1 } from './types';
 
 type EvaluateFn = (context: NoiseFieldEvaluationContext) => number;
 
 export interface CompiledNoiseFieldGraph {
   readonly id: string;
-  readonly usesSpline: boolean;
   evaluate(context: NoiseFieldEvaluationContext): number;
 }
 
@@ -37,11 +36,9 @@ class GeneratedNoiseFieldGraph implements CompiledNoiseFieldGraph {
   private readonly simplex = new Map<number, (x: number, y: number) => number>();
   private readonly fn: EvaluateFn;
   readonly id: string;
-  readonly usesSpline: boolean;
 
   constructor(graph: NoiseFieldGraphV1, output: NoiseGraphNodeV1) {
     this.id = graph.id;
-    this.usesSpline = graph.nodes.some((node) => node.type === 'splinePosition');
     const state: CompileState = {
       graph,
       nodes: new Map(graph.nodes.map((node) => [node.id, node])),
@@ -50,8 +47,13 @@ class GeneratedNoiseFieldGraph implements CompiledNoiseFieldGraph {
     };
     const expression = emitInputFloat(state, output, 'value', '1');
     const source = `"use strict"; return function evaluate(c) { return ${expression}; };`;
-    const factory = new Function('noise', 'clamp', 'smoothstep', source) as (noise: (seed: number, x: number, y: number) => number, clampFn: typeof clamp, smoothstepFn: typeof smoothstep) => EvaluateFn;
-    this.fn = factory((seed, x, y) => this.noise(seed, x, y), clamp, smoothstep);
+    const factory = new Function('noise', 'clamp', 'smoothstep', 'terrace', source) as (
+      noise: (seed: number, x: number, y: number) => number,
+      clampFn: typeof clamp,
+      smoothstepFn: typeof smoothstep,
+      terraceFn: typeof terrace
+    ) => EvaluateFn;
+    this.fn = factory((seed, x, y) => this.noise(seed, x, y), clamp, smoothstep, terrace);
   }
 
   evaluate(context: NoiseFieldEvaluationContext): number {
@@ -96,7 +98,6 @@ function emitOutput(
   if (memo) return { type: 'float', value: memo };
 
   if (node.type === 'cartesianPosition') return emitPosition('c.cartesian', portId);
-  if (node.type === 'splinePosition') return emitPosition('c.spline', portId);
   if (node.type === 'constFloat') return floatMemo(state, key, numberLiteral(param(node, 'value', 1)));
   if (node.type === 'simplex2d') return floatMemo(state, key, emitSimplex2d(state, node));
   if (node.type === 'fbm2d') return floatMemo(state, key, emitFbm2d(state, node, false));
@@ -113,6 +114,9 @@ function emitOutput(
   }
   if (node.type === 'power') {
     return floatMemo(state, key, `Math.pow(Math.max(0, ${emitInputFloat(state, node, 'in', '0')}), ${numberLiteral(param(node, 'exponent', 1))})`);
+  }
+  if (node.type === 'terrace') {
+    return floatMemo(state, key, `terrace(${emitInputFloat(state, node, 'in', '0')}, ${numberLiteral(param(node, 'steps', 5))}, ${numberLiteral(param(node, 'softness', 0.18))})`);
   }
   if (node.type === 'smoothstep') {
     return floatMemo(state, key, `smoothstep(${numberLiteral(param(node, 'edge0', 0))}, ${numberLiteral(param(node, 'edge1', 1))}, ${emitInputFloat(state, node, 'in', '0')})`);
@@ -196,6 +200,20 @@ function smoothstep(edge0: number, edge1: number, value: number): number {
   if (edge0 === edge1) return value >= edge1 ? 1 : 0;
   const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
   return t * t * (3 - 2 * t);
+}
+
+function terrace(value: number, steps: number, softness: number): number {
+  const count = Math.max(1, Math.trunc(steps));
+  const t = clamp(softness, 0, 1);
+  const v = clamp(value, 0, 1);
+  if (t >= 1) return v;
+  const scaled = v * count;
+  const cell = Math.min(count - 1, Math.floor(scaled));
+  const lower = cell / count;
+  const upper = (cell + 1) / count;
+  const local = clamp(scaled - cell, 0, 1);
+  const rampStart = 1 - Math.max(t, Number.EPSILON);
+  return lower + (upper - lower) * smoothstep(rampStart, 1, local);
 }
 
 function safeScale(value: number): number {

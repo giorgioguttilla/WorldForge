@@ -33,6 +33,7 @@ export class HeightmapTileStore {
     if (!navigator.storage?.getDirectory) {
       throw new Error('OPFS is not available in this browser.');
     }
+    this.clearCache();
     const opfsRoot = await navigator.storage.getDirectory();
     const projects = await opfsRoot.getDirectoryHandle('worldforge-projects', { create: true });
     this.root = await projects.getDirectoryHandle(projectId, { create: true });

@@ -90,6 +90,12 @@ interface ChunkWorkerState {
   pending: number;
 }
 
+class StaleTerrainBuildError extends Error {
+  constructor() {
+    super('Stale terrain build.');
+  }
+}
+
 export class TerrainQuadtreeRenderer {
   readonly group = new THREE.Group();
   visualizationMode: VisualizationMode = 'topo';
@@ -114,6 +120,7 @@ export class TerrainQuadtreeRenderer {
   private viewMode: ViewMode = 'free';
   private readonly sparePoolNodes = SPARE_POOL_NODES;
   private nextWorkerRequestId = 1;
+  private generation = 0;
 
   constructor(private readonly manager: TileManager) {
     for (let i = 0; i < CHUNK_WORKER_COUNT; i += 1) {
@@ -163,6 +170,8 @@ export class TerrainQuadtreeRenderer {
   }
 
   clear(): void {
+    this.generation += 1;
+    this.cancelPendingBuilds();
     for (const node of this.pool) {
       this.group.remove(node.mesh);
       node.mesh.geometry.dispose();
@@ -202,6 +211,7 @@ export class TerrainQuadtreeRenderer {
   private async updateSelection(camera: THREE.Camera): Promise<void> {
     const config = this.manager.config;
     if (!config) return;
+    const generation = this.generation;
 
     const cameraSignature = this.getCameraSignature(camera);
     if (cameraSignature === this.lastCameraSignature && this.stagedSelectionId === '') {
@@ -238,8 +248,9 @@ export class TerrainQuadtreeRenderer {
       }
       const node = this.acquireNode(id, config, false);
       builds.push(
-        this.populateNode(node, key, config)
+        this.populateNode(node, key, config, generation)
           .then(() => {
+            if (this.generation !== generation) return;
             if (this.stagedSelectionId !== nextSelectionId) {
               this.releaseNode(node);
               return;
@@ -250,8 +261,9 @@ export class TerrainQuadtreeRenderer {
             this.staged.set(id, node);
           })
           .catch((error) => {
+            if (error instanceof StaleTerrainBuildError) return;
             console.error('Failed to build terrain chunk.', error);
-            this.releaseNode(node);
+            if (this.pool.includes(node)) this.releaseNode(node);
           })
       );
       if (builds.length >= MAX_CONCURRENT_CHUNK_BUILDS) {
@@ -259,6 +271,7 @@ export class TerrainQuadtreeRenderer {
       }
     }
     await Promise.all(builds);
+    if (this.generation !== generation) return;
 
     for (const [id, node] of this.active) {
       if (!nextActive.has(id)) {
@@ -384,8 +397,9 @@ export class TerrainQuadtreeRenderer {
     return node;
   }
 
-  private async populateNode(node: TerrainNode, key: RenderChunkKey, config: WorldConfig): Promise<void> {
-    const built = await this.buildChunkInWorker(config, key);
+  private async populateNode(node: TerrainNode, key: RenderChunkKey, config: WorldConfig, generation: number): Promise<void> {
+    const built = await this.buildChunkInWorker(config, key, generation);
+    if (this.generation !== generation || this.manager.config?.id !== config.id) throw new StaleTerrainBuildError();
     const geometry = node.mesh.geometry;
     const positions = geometry.attributes.position as THREE.BufferAttribute;
     const colors = this.ensureColorAttribute(geometry);
@@ -449,17 +463,18 @@ export class TerrainQuadtreeRenderer {
     return { tileDepth, sampleScale, lodSamplesPerSide, tileKeys };
   }
 
-  private async buildChunkInWorker(config: WorldConfig, key: RenderChunkKey): Promise<WorkerBuildResponse> {
+  private async buildChunkInWorker(config: WorldConfig, key: RenderChunkKey, generation: number): Promise<WorkerBuildResponse> {
     const workerState = this.getNextWorker();
     const plan = this.getChunkSamplingPlan(config, key);
     const tilePayloads = await Promise.all(
       plan.tileKeys.map(async (tileKey): Promise<WorkerTilePayload | null> => {
-        const id = `${tileKey.d}:${tileKey.x}:${tileKey.y}`;
-        if (workerState.tileCache.has(id)) return null;
-        const samples = await this.readTileSamples(tileKey);
+        const cacheId = `${config.id}:${tileKey.d}:${tileKey.x}:${tileKey.y}`;
+        if (workerState.tileCache.has(cacheId)) return null;
+        const samples = await this.readTileSamples(config, tileKey);
+        if (this.generation !== generation || this.manager.config?.id !== config.id) throw new StaleTerrainBuildError();
         const copy = new Uint16Array(samples);
-        workerState.tileCache.add(id);
-        return { id, samples: copy.buffer };
+        workerState.tileCache.add(cacheId);
+        return { id: `${tileKey.d}:${tileKey.x}:${tileKey.y}`, samples: copy.buffer };
       })
     );
     const tiles = tilePayloads.filter((tile): tile is WorkerTilePayload => Boolean(tile));
@@ -487,6 +502,10 @@ export class TerrainQuadtreeRenderer {
       workerState.requests.set(requestId, {
         resolve: (response) => {
           workerState.pending = Math.max(0, workerState.pending - 1);
+          if (this.generation !== generation || this.manager.config?.id !== config.id) {
+            reject(new StaleTerrainBuildError());
+            return;
+          }
           resolve(response);
         },
         reject: (error) => {
@@ -534,8 +553,8 @@ export class TerrainQuadtreeRenderer {
     return this.workers.reduce((best, worker) => (worker.pending < best.pending ? worker : best), this.workers[0]);
   }
 
-  private readTileSamples(key: TileKey): Promise<Uint16Array> {
-    const id = `${key.d}:${key.x}:${key.y}`;
+  private readTileSamples(config: WorldConfig, key: TileKey): Promise<Uint16Array> {
+    const id = `${config.id}:${key.d}:${key.x}:${key.y}`;
     const cached = this.tileCache.get(id);
     if (cached) {
       cached.lastUsed = performance.now();
@@ -593,6 +612,17 @@ export class TerrainQuadtreeRenderer {
     }
     this.staged.clear();
     this.stagedSelectionId = '';
+  }
+
+  private cancelPendingBuilds(): void {
+    for (const state of this.workers) {
+      for (const pending of state.requests.values()) {
+        pending.reject(new StaleTerrainBuildError());
+      }
+      state.requests.clear();
+      state.pending = 0;
+      state.tileCache.clear();
+    }
   }
 
   private releaseNode(node: TerrainNode): void {

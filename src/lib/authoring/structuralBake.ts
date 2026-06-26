@@ -8,9 +8,7 @@ import {
   filterPreparedStructuralDocumentForBounds,
   prepareStructuralDocument,
   preparedLandformWeightAt,
-  preparedLandformSplineSpaceAt,
   preparedMountainWeightAt,
-  preparedMountainSplineSpaceAt,
   stableAuthoringHash,
   type Bounds2D,
   type PreparedStructuralDocument
@@ -178,8 +176,7 @@ export function bakePreparedDepthZeroTile(
       const targetElevation = getLandformTargetElevation(landform.primitive, waterLevel, config.worldHeight);
       const field = getPreparedField(prepared, landform.primitive.fieldId);
       const fieldContext: NoiseFieldEvaluationContext | null = field ? {
-        cartesian: { x: 0, y: 0 },
-        spline: { x: 0, y: 0 }
+        cartesian: { x: 0, y: 0 }
       } : null;
       for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
         const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
@@ -193,7 +190,6 @@ export function bakePreparedDepthZeroTile(
           if (field && fieldContext) {
             fieldContext.cartesian.x = worldX;
             fieldContext.cartesian.y = worldZ;
-            if (field.usesSpline) preparedLandformSplineSpaceAt(landform, worldX, worldZ, fieldContext.spline);
             const displacement = field.evaluate(fieldContext);
             target += displacement * landform.primitive.noiseScale;
           }
@@ -214,8 +210,7 @@ export function bakePreparedDepthZeroTile(
     if (range && height > 0) {
       const field = getPreparedField(prepared, mountain.primitive.fieldId);
       const fieldContext: NoiseFieldEvaluationContext | null = field ? {
-        cartesian: { x: 0, y: 0 },
-        spline: { x: 0, y: 0 }
+        cartesian: { x: 0, y: 0 }
       } : null;
       for (let sampleY = range.minY; sampleY <= range.maxY; sampleY += 1) {
         const worldZ = (tileY * config.tileSize + sampleY) * config.unitSize - worldSize / 2;
@@ -229,7 +224,6 @@ export function bakePreparedDepthZeroTile(
           if (field && fieldContext) {
             fieldContext.cartesian.x = worldX;
             fieldContext.cartesian.y = worldZ;
-            if (field.usesSpline) preparedMountainSplineSpaceAt(mountain, worldX, worldZ, fieldContext.spline);
             mountainValue = field.evaluate(fieldContext);
           }
           elevations[index] = clamp(elevations[index] + mountainValue * height * weight, 0, config.worldHeight);

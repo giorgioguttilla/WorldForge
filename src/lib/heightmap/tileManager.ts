@@ -57,7 +57,6 @@ export class TileManager {
     }
 
     const config = createWorldConfig(input);
-    const compute = await this.getComputeBackend();
     await this.store.openProject(config.id);
     await this.store.writeConfig(config);
     await this.store.writeAuthoringDocument(createEmptyAuthoringDocument(config.id));
@@ -71,7 +70,7 @@ export class TileManager {
     for (let y = 0; y < config.tilesPerSide; y += 1) {
       for (let x = 0; x < config.tilesPerSide; x += 1) {
         const key = { x, y, d: 0 };
-        const samples = await compute.generateNoiseTile(config.tileSize, x, y, 137);
+        const samples = new Uint16Array(config.tileSize * config.tileSize);
         await this.store.writeTile(key, samples, { cache: false });
         dirty.push(key);
         generated += 1;

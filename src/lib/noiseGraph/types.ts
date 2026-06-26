@@ -5,7 +5,6 @@ export type NoiseGraphNodeTypeV1 =
   | 'output'
   | 'constFloat'
   | 'cartesianPosition'
-  | 'splinePosition'
   | 'simplex2d'
   | 'fbm2d'
   | 'ridged2d'
@@ -15,6 +14,7 @@ export type NoiseGraphNodeTypeV1 =
   | 'divide'
   | 'clamp'
   | 'power'
+  | 'terrace'
   | 'smoothstep';
 
 export interface GraphVec2 {
@@ -68,7 +68,6 @@ export interface NoiseFieldGraphV1 {
 
 export interface NoiseFieldEvaluationContext {
   cartesian: GraphVec2;
-  spline: GraphVec2;
 }
 
 export interface NoiseGraphValidationIssue {

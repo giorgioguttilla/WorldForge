@@ -2,7 +2,7 @@ import type { AnchorV1, AuthoringDocumentV1, LandformAreaV1, MountainSplineV1 } 
 import type { WorldConfig } from '../heightmap/worldConfig';
 import { sampleSplineAnchors } from './spline';
 import { compileNoiseFieldGraph, type CompiledNoiseFieldGraph } from '../noiseGraph';
-import type { GraphVec2, NoiseFieldGraphV1 } from '../noiseGraph';
+import type { NoiseFieldGraphV1 } from '../noiseGraph';
 
 export interface StructuralEvaluation {
   elevation: number;
@@ -174,35 +174,6 @@ export function preparedMountainWeightAt(mountain: PreparedMountain, x: number, 
   const fadeStart = Math.max(0, halfWidth - edgeSmoothness);
   if (distance <= fadeStart) return 1;
   return 1 - smoothstep(fadeStart, halfWidth, distance);
-}
-
-export function preparedLandformSplineSpaceAt(_landform: PreparedLandform, x: number, z: number, out: GraphVec2 = { x: 0, y: 0 }): GraphVec2 {
-  out.x = x;
-  out.y = z;
-  return out;
-}
-
-export function preparedMountainSplineSpaceAt(mountain: PreparedMountain, x: number, z: number, out: GraphVec2 = { x: 0, y: 0 }): GraphVec2 {
-  let best: { distanceSq: number; along: number; lateral: number } | null = null;
-  for (const segment of mountain.segments) {
-    const dx = segment.bx - segment.ax;
-    const dz = segment.bz - segment.az;
-    const lengthSq = dx * dx + dz * dz;
-    if (lengthSq <= Number.EPSILON) continue;
-    const t = clamp(((x - segment.ax) * dx + (z - segment.az) * dz) / lengthSq, 0, 1);
-    const closestX = segment.ax + dx * t;
-    const closestZ = segment.az + dz * t;
-    const px = x - closestX;
-    const pz = z - closestZ;
-    const distanceSq = px * px + pz * pz;
-    const side = Math.sign(dx * (z - segment.az) - dz * (x - segment.ax)) || 1;
-    const lateral = Math.sqrt(distanceSq) * side;
-    const along = segment.startDistance + segment.length * t;
-    if (!best || distanceSq < best.distanceSq) best = { distanceSq, along, lateral };
-  }
-  out.x = best ? best.along : x;
-  out.y = best ? best.lateral : z;
-  return out;
 }
 
 function filterPreparedMountainForBounds(mountain: PreparedMountain, bounds: Bounds2D): PreparedMountain | null {

@@ -3,11 +3,12 @@ import { createDefaultNoiseFieldLibrary, evaluateNoiseFieldGraph, validateNoiseG
 
 describe('noise graph evaluation', () => {
   it('validates and evaluates default presets deterministically', () => {
-    const [rolling] = createDefaultNoiseFieldLibrary();
-    expect(validateNoiseGraph(rolling)).toEqual([]);
+    const [rolling, ...rest] = createDefaultNoiseFieldLibrary();
+    for (const preset of [rolling, ...rest]) {
+      expect(validateNoiseGraph(preset)).toEqual([]);
+    }
     const context = {
-      cartesian: { x: 100, y: 200 },
-      spline: { x: 25, y: -8 }
+      cartesian: { x: 100, y: 200 }
     };
     const first = evaluateNoiseFieldGraph(rolling, context);
     const second = evaluateNoiseFieldGraph(rolling, context);

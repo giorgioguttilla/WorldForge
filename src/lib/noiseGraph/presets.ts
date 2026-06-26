@@ -36,16 +36,87 @@ function mountainsPreset(): NoiseFieldGraphV1 {
 }
 
 function canyonPreset(): NoiseFieldGraphV1 {
-  const spline = node('canyon-spline', 'splinePosition', 60, 140);
-  const ridge = node('canyon-ridge', 'ridged2d', 285, 115, { frequency: 0.003, octaves: 5, gain: 0.46, seed: 341, skewX: 0.35, skewY: 2.4, rangeMin: 0, rangeMax: 1 });
-  const shape = node('canyon-shape', 'smoothstep', 505, 125, { edge0: 0.42, edge1: 0.92 });
-  const scale = node('canyon-scale', 'constFloat', 505, 245, { value: -1 });
-  const carve = node('canyon-carve', 'multiply', 725, 135);
-  const output = node('canyon-output', 'output', 925, 135);
-  return graph('preset-canyon', 'Canyon', 'Stretched contour-following ridges for carved bands.', [spline, ridge, shape, scale, carve, output], [
-    edge(spline, 'xy', ridge, 'xy'),
-    edge(ridge, 'value', shape, 'in'),
-    edge(shape, 'value', carve, 'a'),
+  const position = node('canyon-position', 'cartesianPosition', 60, 140);
+  const mainIncision = node('canyon-main-incision', 'ridged2d', 285, 110, { frequency: 0.0005, octaves: 5, lacunarity: 1.88, gain: 0.46, seed: 341, skewX: 1, skewY: 1, rangeMin: 0, rangeMax: 1 });
+  const mainThreshold = node('canyon-main-threshold', 'smoothstep', 505, 120, { edge0: 0.62, edge1: 0.96 });
+  const mainTerraces = node('canyon-main-terraces', 'terrace', 725, 130, { steps: 11, softness: 0.44 });
+  const mainWeight = node('canyon-main-weight', 'constFloat', 725, 235, { value: 0.88 });
+  const mainCarve = node('canyon-main-carve', 'multiply', 925, 145);
+  const tributaries = node('canyon-tributary-incision', 'ridged2d', 285, 360, { frequency: 0.00115, octaves: 4, lacunarity: 2.08, gain: 0.38, seed: 547, skewX: 1, skewY: 1, rangeMin: 0, rangeMax: 1 });
+  const tributaryThreshold = node('canyon-tributary-threshold', 'smoothstep', 505, 370, { edge0: 0.7, edge1: 0.98 });
+  const tributaryPower = node('canyon-tributary-power', 'power', 725, 380, { exponent: 1.35 });
+  const tributaryWeight = node('canyon-tributary-weight', 'constFloat', 725, 485, { value: 0.22 });
+  const tributaryCarve = node('canyon-tributary-carve', 'multiply', 925, 395);
+  const sediment = node('canyon-sediment-roughness', 'fbm2d', 285, 610, { frequency: 0.0044, octaves: 4, lacunarity: 2.05, gain: 0.42, seed: 811, skewX: 1, skewY: 1, rangeMin: 0, rangeMax: 1 });
+  const sedimentWeight = node('canyon-sediment-weight', 'constFloat', 505, 715, { value: 0.055 });
+  const sedimentDetail = node('canyon-sediment-detail', 'multiply', 725, 625);
+  const weathering = node('canyon-weathering-noise', 'fbm2d', 285, 850, { frequency: 0.018, octaves: 3, lacunarity: 2.25, gain: 0.36, seed: 1217, skewX: 1, skewY: 1, rangeMin: -1, rangeMax: 1 });
+  const weatheringWeight = node('canyon-weathering-weight', 'constFloat', 505, 955, { value: 0.025 });
+  const weatheringDetail = node('canyon-weathering-detail', 'multiply', 725, 865);
+  const sumMainTributary = node('canyon-sum-main-tributary', 'add', 1135, 220);
+  const incisionMask = node('canyon-incision-mask', 'smoothstep', 1335, 230, { edge0: 0.06, edge1: 0.42 });
+  const maskedSediment = node('canyon-masked-sediment', 'multiply', 925, 610);
+  const sumSediment = node('canyon-sum-sediment', 'add', 1535, 345);
+  const sumAll = node('canyon-sum-all', 'add', 1735, 470);
+  const clampNode = node('canyon-clamp', 'clamp', 1935, 480, { min: 0, max: 0.96 });
+  const scale = node('canyon-scale', 'constFloat', 1935, 585, { value: -1 });
+  const carve = node('canyon-carve', 'multiply', 2135, 490);
+  const output = node('canyon-output', 'output', 2335, 500);
+  return graph('preset-canyon', 'Canyon', 'Thresholded canyon incision with clear plateau, softened strata, tributary cuts, and subtle sediment detail.', [
+    position,
+    mainIncision,
+    mainThreshold,
+    mainTerraces,
+    mainWeight,
+    mainCarve,
+    tributaries,
+    tributaryThreshold,
+    tributaryPower,
+    tributaryWeight,
+    tributaryCarve,
+    sediment,
+    sedimentWeight,
+    sedimentDetail,
+    weathering,
+    weatheringWeight,
+    weatheringDetail,
+    sumMainTributary,
+    incisionMask,
+    maskedSediment,
+    sumSediment,
+    sumAll,
+    clampNode,
+    scale,
+    carve,
+    output
+  ], [
+    edge(position, 'xy', mainIncision, 'xy'),
+    edge(position, 'xy', tributaries, 'xy'),
+    edge(position, 'xy', sediment, 'xy'),
+    edge(position, 'xy', weathering, 'xy'),
+    edge(mainIncision, 'value', mainThreshold, 'in'),
+    edge(mainThreshold, 'value', mainTerraces, 'in'),
+    edge(mainTerraces, 'value', mainCarve, 'a'),
+    edge(mainWeight, 'value', mainCarve, 'b'),
+    edge(tributaries, 'value', tributaryThreshold, 'in'),
+    edge(tributaryThreshold, 'value', tributaryPower, 'in'),
+    edge(tributaryPower, 'value', tributaryCarve, 'a'),
+    edge(tributaryWeight, 'value', tributaryCarve, 'b'),
+    edge(sediment, 'value', sedimentDetail, 'a'),
+    edge(sedimentWeight, 'value', sedimentDetail, 'b'),
+    edge(weathering, 'value', weatheringDetail, 'a'),
+    edge(weatheringWeight, 'value', weatheringDetail, 'b'),
+    edge(mainCarve, 'value', sumMainTributary, 'a'),
+    edge(tributaryCarve, 'value', sumMainTributary, 'b'),
+    edge(sumMainTributary, 'value', incisionMask, 'in'),
+    edge(sedimentDetail, 'value', maskedSediment, 'a'),
+    edge(incisionMask, 'value', maskedSediment, 'b'),
+    edge(sumMainTributary, 'value', sumSediment, 'a'),
+    edge(maskedSediment, 'value', sumSediment, 'b'),
+    edge(sumSediment, 'value', sumAll, 'a'),
+    edge(weatheringDetail, 'value', sumAll, 'b'),
+    edge(sumAll, 'value', clampNode, 'in'),
+    edge(clampNode, 'value', carve, 'a'),
     edge(scale, 'value', carve, 'b'),
     edge(carve, 'value', output, 'value')
   ]);
