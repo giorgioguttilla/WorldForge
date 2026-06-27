@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Search, Save, Trash2, X } from '@lucide/svelte';
+  import { Redo2, Save, Search, Trash2, Undo2, X } from '@lucide/svelte';
   import { NOISE_GRAPH_NODE_DEFINITIONS, canConnectPorts, connectPorts, createNoiseGraphNode, deleteGraphSelection, validateNoiseGraph, type NoiseFieldGraphV1, type NoiseGraphNodeTypeV1, type NoiseGraphNodeV1, type NoiseGraphPortRefV1 } from '.';
   import NumericInput from '../ui/NumericInput.svelte';
 
@@ -12,6 +12,7 @@
   const nodeHeader = 32;
   const portStep = 24;
   const portRadius = 6;
+  const maxHistoryEntries = 80;
 
   let canvas: HTMLCanvasElement;
   let wrapper: HTMLDivElement;
@@ -21,10 +22,14 @@
   let selectedNodeId: string | null = null;
   let selectedEdgeId: string | null = null;
   let dragNode: { nodeId: string; dx: number; dy: number } | null = null;
+  let dragStartGraph: NoiseFieldGraphV1 | null = null;
+  let dragMoved = false;
   let dragPort: { ref: NoiseGraphPortRefV1; x: number; y: number; validTarget: NoiseGraphPortRefV1 | null } | null = null;
   let panDrag: { pointerId: number; x: number; y: number } | null = null;
   let pointer = { x: 0, y: 0 };
   let viewport = { x: 0, y: 0, zoom: 1 };
+  let undoStack: NoiseFieldGraphV1[] = [];
+  let redoStack: NoiseFieldGraphV1[] = [];
 
   $: selectedNode = working.nodes.find((node) => node.id === selectedNodeId) ?? null;
   $: issues = validateNoiseGraph(working);
@@ -35,18 +40,6 @@
   onMount(() => {
     modal?.focus();
     draw();
-    const keyHandler = (event: KeyboardEvent) => {
-      if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
-        working = deleteGraphSelection(working, { nodeId: selectedNodeId ?? undefined, edgeId: selectedEdgeId ?? undefined });
-        selectedNodeId = null;
-        selectedEdgeId = null;
-        event.preventDefault();
-        draw();
-      }
-      if (event.code === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', keyHandler);
-    return () => window.removeEventListener('keydown', keyHandler);
   });
 
   $: if (canvas && working) draw();
@@ -164,6 +157,8 @@
       selectedNodeId = node.id;
       selectedEdgeId = null;
       dragNode = { nodeId: node.id, dx: point.x - node.position.x, dy: point.y - node.position.y };
+      dragStartGraph = cloneGraph(working);
+      dragMoved = false;
       canvas.setPointerCapture(event.pointerId);
       draw();
       return;
@@ -187,9 +182,13 @@
     const point = localPoint(event);
     pointer = point;
     if (dragNode) {
+      const nextX = point.x - dragNode.dx;
+      const nextY = point.y - dragNode.dy;
+      const draggedNode = working.nodes.find((node) => node.id === dragNode?.nodeId);
+      if (draggedNode && (draggedNode.position.x !== nextX || draggedNode.position.y !== nextY)) dragMoved = true;
       working = {
         ...working,
-        nodes: working.nodes.map((node) => node.id === dragNode?.nodeId ? { ...node, position: { x: point.x - dragNode.dx, y: point.y - dragNode.dy } } : node)
+        nodes: working.nodes.map((node) => node.id === dragNode?.nodeId ? { ...node, position: { x: nextX, y: nextY } } : node)
       };
       draw();
       return;
@@ -207,11 +206,15 @@
       canvas.releasePointerCapture(event.pointerId);
       return;
     }
+    const completedNodeDrag = dragNode && dragMoved && dragStartGraph;
     if (dragPort?.validTarget) {
       const next = connectPorts(working, dragPort.ref, dragPort.validTarget);
-      if (next) working = next;
+      if (next) commitGraph(next);
     }
     dragNode = null;
+    if (completedNodeDrag && dragStartGraph) pushUndo(dragStartGraph);
+    dragStartGraph = null;
+    dragMoved = false;
     dragPort = null;
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     draw();
@@ -236,7 +239,7 @@
     const rect = wrapper?.getBoundingClientRect();
     const center = rect ? screenToGraph(rect.width / 2, rect.height / 2) : { x: 220, y: 120 };
     const node = createNoiseGraphNode(type, { x: center.x - nodeWidth / 2 + (count % 3) * 24, y: center.y - 40 + (count % 3) * 18 });
-    working = { ...working, nodes: [...working.nodes, node] };
+    commitGraph({ ...working, nodes: [...working.nodes, node] });
     selectedNodeId = node.id;
     selectedEdgeId = null;
     draw();
@@ -251,15 +254,81 @@
 
   function setNodeParam(key: string, value: number | string | boolean) {
     if (!selectedNode) return;
-    working = {
+    commitGraph({
       ...working,
       nodes: working.nodes.map((node) => node.id === selectedNode.id ? { ...node, params: { ...node.params, [key]: value } } : node)
-    };
-    draw();
+    });
   }
 
   function updateGraphName(value: string) {
     working = { ...working, name: value };
+  }
+
+  function cloneGraph(graphToClone: NoiseFieldGraphV1) {
+    return structuredClone(graphToClone);
+  }
+
+  function pushUndo(snapshot: NoiseFieldGraphV1) {
+    undoStack = [...undoStack, cloneGraph(snapshot)].slice(-maxHistoryEntries);
+    redoStack = [];
+  }
+
+  function commitGraph(next: NoiseFieldGraphV1, snapshot: NoiseFieldGraphV1 = working) {
+    pushUndo(snapshot);
+    working = next;
+    reconcileSelection();
+    draw();
+  }
+
+  function undoGraph() {
+    const previous = undoStack.at(-1);
+    if (!previous) return;
+    undoStack = undoStack.slice(0, -1);
+    redoStack = [...redoStack, cloneGraph(working)].slice(-maxHistoryEntries);
+    working = cloneGraph(previous);
+    reconcileSelection();
+    draw();
+  }
+
+  function redoGraph() {
+    const next = redoStack.at(-1);
+    if (!next) return;
+    redoStack = redoStack.slice(0, -1);
+    undoStack = [...undoStack, cloneGraph(working)].slice(-maxHistoryEntries);
+    working = cloneGraph(next);
+    reconcileSelection();
+    draw();
+  }
+
+  function deleteSelection() {
+    const next = deleteGraphSelection(working, { nodeId: selectedNodeId ?? undefined, edgeId: selectedEdgeId ?? undefined });
+    if (next === working) return;
+    commitGraph(next);
+    selectedNodeId = null;
+    selectedEdgeId = null;
+    draw();
+  }
+
+  function deleteNode(nodeId: string) {
+    const next = deleteGraphSelection(working, { nodeId });
+    if (next === working) return;
+    commitGraph(next);
+    selectedNodeId = null;
+    selectedEdgeId = null;
+    draw();
+  }
+
+  function deleteEdge(edgeId: string) {
+    const next = deleteGraphSelection(working, { edgeId });
+    if (next === working) return;
+    commitGraph(next);
+    selectedEdgeId = null;
+    draw();
+  }
+
+  function reconcileSelection() {
+    if (selectedNodeId && !working.nodes.some((node) => node.id === selectedNodeId)) selectedNodeId = null;
+    if (selectedEdgeId && !working.edges.some((edge) => edge.id === selectedEdgeId)) selectedEdgeId = null;
   }
 
   function hitNode(x: number, y: number): NoiseGraphNodeV1 | null {
@@ -366,14 +435,28 @@
     event.stopPropagation();
   }
 
+  function handleModalPointerDown(event: PointerEvent) {
+    if (!isTextInput(event.target)) modal?.focus();
+    event.stopPropagation();
+  }
+
   function handleModalKeydown(event: KeyboardEvent) {
     event.stopPropagation();
-    if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
-      working = deleteGraphSelection(working, { nodeId: selectedNodeId ?? undefined, edgeId: selectedEdgeId ?? undefined });
-      selectedNodeId = null;
-      selectedEdgeId = null;
+    const isUndo = (event.metaKey || event.ctrlKey) && !event.shiftKey && event.code === 'KeyZ';
+    const isRedo = (event.metaKey || event.ctrlKey) && (event.code === 'KeyY' || (event.shiftKey && event.code === 'KeyZ'));
+    if (!isTextInput(event.target) && isUndo) {
       event.preventDefault();
-      draw();
+      undoGraph();
+      return;
+    }
+    if (!isTextInput(event.target) && isRedo) {
+      event.preventDefault();
+      redoGraph();
+      return;
+    }
+    if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
+      event.preventDefault();
+      deleteSelection();
       return;
     }
     if (event.code === 'Escape') {
@@ -391,7 +474,7 @@
   tabindex="-1"
   onkeydown={handleModalKeydown}
   onkeyup={stopModalEvent}
-  onpointerdown={stopModalEvent}
+  onpointerdown={handleModalPointerDown}
   onpointermove={stopModalEvent}
   onpointerup={stopModalEvent}
   onwheel={stopModalEvent}
@@ -433,7 +516,11 @@
     <aside class="noise-inspector">
       <header>
         <input value={working.name} oninput={(event) => updateGraphName(event.currentTarget.value)} />
-        <button type="button" title="Save field" onclick={() => onSave(working)}><Save size={16} /></button>
+        <div class="node-editor-actions">
+          <button type="button" title="Undo" disabled={undoStack.length === 0} onclick={undoGraph}><Undo2 size={16} /></button>
+          <button type="button" title="Redo" disabled={redoStack.length === 0} onclick={redoGraph}><Redo2 size={16} /></button>
+          <button type="button" title="Save field" onclick={() => onSave(working)}><Save size={16} /></button>
+        </div>
       </header>
       <div class="inspector-scroll">
         {#if issues.length > 0}
@@ -447,7 +534,7 @@
           <div class="selected-title">
             <strong>{selectedNode.label || NOISE_GRAPH_NODE_DEFINITIONS[selectedNode.type].label}</strong>
             {#if selectedNode.type !== 'output'}
-              <button type="button" title="Delete selected node" onclick={() => { working = deleteGraphSelection(working, { nodeId: selectedNode?.id }); selectedNodeId = null; draw(); }}><Trash2 size={15} /></button>
+              <button type="button" title="Delete selected node" onclick={() => selectedNode && deleteNode(selectedNode.id)}><Trash2 size={15} /></button>
             {/if}
           </div>
           {#if Object.keys(selectedNode.params).length === 0}
@@ -467,7 +554,7 @@
         {:else if selectedEdgeId}
           <div class="selected-title">
             <strong>Connector</strong>
-            <button type="button" title="Delete selected connector" onclick={() => { working = deleteGraphSelection(working, { edgeId: selectedEdgeId ?? undefined }); selectedEdgeId = null; draw(); }}><Trash2 size={15} /></button>
+            <button type="button" title="Delete selected connector" onclick={() => selectedEdgeId && deleteEdge(selectedEdgeId)}><Trash2 size={15} /></button>
           </div>
         {:else}
           <div class="empty-params">Select a node or connector</div>

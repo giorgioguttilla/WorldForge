@@ -418,6 +418,12 @@ button:disabled {
   border-radius: 7px;
 }
 
+.node-editor-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
 .search-row {
   min-height: 34px;
   display: grid;
