@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { Search, Save, Trash2, X } from '@lucide/svelte';
   import { NOISE_GRAPH_NODE_DEFINITIONS, canConnectPorts, connectPorts, createNoiseGraphNode, deleteGraphSelection, validateNoiseGraph, type NoiseFieldGraphV1, type NoiseGraphNodeTypeV1, type NoiseGraphNodeV1, type NoiseGraphPortRefV1 } from '.';
+  import NumericInput from '../ui/NumericInput.svelte';
 
   export let graph: NoiseFieldGraphV1;
   export let onSave: (graph: NoiseFieldGraphV1) => void = () => {};
@@ -196,9 +197,14 @@
     if (!selectedNode) return;
     const original = selectedNode.params[key];
     const nextValue = typeof original === 'number' ? Number(value) : value;
+    setNodeParam(key, nextValue);
+  }
+
+  function setNodeParam(key: string, value: number | string | boolean) {
+    if (!selectedNode) return;
     working = {
       ...working,
-      nodes: working.nodes.map((node) => node.id === selectedNode.id ? { ...node, params: { ...node.params, [key]: nextValue } } : node)
+      nodes: working.nodes.map((node) => node.id === selectedNode.id ? { ...node, params: { ...node.params, [key]: value } } : node)
     };
     draw();
   }
@@ -353,7 +359,11 @@
           {#each Object.entries(selectedNode.params) as [key, value]}
             <label>
               <span>{key}</span>
-              <input type={typeof value === 'number' ? 'number' : 'text'} step="0.001" value={value} oninput={(event) => updateNodeParam(key, event.currentTarget.value)} />
+              {#if typeof value === 'number'}
+                <NumericInput step="0.001" value={value} onCommit={(next) => setNodeParam(key, next)} />
+              {:else}
+                <input type="text" value={value} oninput={(event) => updateNodeParam(key, event.currentTarget.value)} />
+              {/if}
             </label>
           {/each}
         {/if}

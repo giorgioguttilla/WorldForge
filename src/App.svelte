@@ -11,6 +11,7 @@
   import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
   import NoiseGraphEditor from './lib/noiseGraph/NoiseGraphEditor.svelte';
   import { createNoiseGraph, type NoiseFieldGraphV1 } from './lib/noiseGraph';
+  import NumericInput from './lib/ui/NumericInput.svelte';
 
   type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
 
@@ -1060,13 +1061,15 @@
           oninput={() => applyWaterSettings()}
         />
       </label>
-      <input
-        type="number"
+      <NumericInput
         min="0"
         max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
         step="1"
-        bind:value={waterLevel}
-        oninput={() => applyWaterSettings()}
+        value={waterLevel}
+        onCommit={(value) => {
+          waterLevel = value;
+          applyWaterSettings();
+        }}
       />
     </section>
   {/if}
@@ -1142,20 +1145,20 @@
           <div class="field-grid compact">
             <label>
               <span>Elevation</span>
-              <input type="number" step="1" value={selectedPrimitive.elevation} oninput={(event) => updateSelectedPrimitive({ elevation: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+              <NumericInput step="1" value={selectedPrimitive.elevation} onCommit={(value) => updateSelectedPrimitive({ elevation: value } as Partial<PrimitiveV1>)} />
             </label>
             <label>
               <span>Priority</span>
-              <input type="number" step="1" value={selectedPrimitive.priority} oninput={(event) => updateSelectedPrimitive({ priority: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+              <NumericInput step="1" value={selectedPrimitive.priority} onCommit={(value) => updateSelectedPrimitive({ priority: value } as Partial<PrimitiveV1>)} />
             </label>
           </div>
           <label>
             <span>Noise scale</span>
-            <input type="number" step="1" value={selectedPrimitive.noiseScale} oninput={(event) => updateSelectedPrimitive({ noiseScale: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            <NumericInput step="1" value={selectedPrimitive.noiseScale} onCommit={(value) => updateSelectedPrimitive({ noiseScale: value } as Partial<PrimitiveV1>)} />
           </label>
           <label>
             <span>Edge smoothness</span>
-            <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
           </label>
           <label>
             <span>Curve smoothness</span>
@@ -1165,16 +1168,16 @@
           <div class="field-grid compact">
             <label>
               <span>Height</span>
-              <input type="number" min="0" step="1" value={selectedPrimitive.height} oninput={(event) => updateSelectedPrimitive({ height: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+              <NumericInput min={0} step="1" value={selectedPrimitive.height} onCommit={(value) => updateSelectedPrimitive({ height: value } as Partial<PrimitiveV1>)} />
             </label>
             <label>
               <span>Width</span>
-              <input type="number" min="0" step="1" value={selectedPrimitive.width} oninput={(event) => updateSelectedPrimitive({ width: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+              <NumericInput min={0} step="1" value={selectedPrimitive.width} onCommit={(value) => updateSelectedPrimitive({ width: value } as Partial<PrimitiveV1>)} />
             </label>
           </div>
           <label>
             <span>Edge smoothness</span>
-            <input type="number" min="0" step="1" value={selectedPrimitive.edgeSmoothness} oninput={(event) => updateSelectedPrimitive({ edgeSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
           </label>
           <label>
             <span>Curve smoothness</span>
@@ -1225,18 +1228,18 @@
         <div class="field-grid">
           <label>
             <span>Tile size</span>
-            <input type="number" min="2" step="2" bind:value={worldInput.tileSize} />
+            <NumericInput min={2} step="2" value={worldInput.tileSize} onCommit={(value) => { worldInput = { ...worldInput, tileSize: value }; }} />
           </label>
           <label>
             <span>Tiles per side</span>
-            <input type="number" min="1" step="1" bind:value={worldInput.tilesPerSide} />
+            <NumericInput min={1} step="1" value={worldInput.tilesPerSide} onCommit={(value) => { worldInput = { ...worldInput, tilesPerSide: value }; }} />
           </label>
         </div>
 
         <div class="field-grid unit-grid">
           <label>
             <span>Unit size</span>
-            <input type="number" min="0.0001" step="0.25" bind:value={worldInput.unitSize} />
+            <NumericInput min={0.0001} step="0.25" value={worldInput.unitSize} onCommit={(value) => { worldInput = { ...worldInput, unitSize: value }; }} />
           </label>
           <label>
             <span>Unit</span>
@@ -1250,7 +1253,7 @@
 
         <label>
           <span>Overall world height</span>
-          <input type="number" min="1" step="1" bind:value={worldInput.worldHeight} />
+          <NumericInput min={1} step="1" value={worldInput.worldHeight} onCommit={(value) => { worldInput = { ...worldInput, worldHeight: value }; }} />
         </label>
 
         {#if replacingExistingWorld && manager.config}
