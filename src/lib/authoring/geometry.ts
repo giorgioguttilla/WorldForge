@@ -303,7 +303,8 @@ export function stableAuthoringHash(config: Pick<WorldConfig, 'id' | 'tileSize' 
   const payload = JSON.stringify({
     config,
     waterLevel,
-    primitives: document.primitives
+    primitives: document.primitives,
+    erosion: document.erosion
   });
   let hash = 2166136261;
   for (let i = 0; i < payload.length; i += 1) {

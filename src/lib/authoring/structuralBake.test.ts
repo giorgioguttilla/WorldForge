@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
 import { tileKeyToId, type TileKey } from '../heightmap/tileKey';
-import type { AuthoringDocumentV1 } from './authoringDocument';
+import { createEmptyAuthoringDocument, type AuthoringDocumentV1 } from './authoringDocument';
 import { bakeStructuralAuthoring } from './structuralBake';
 
 const config: WorldConfig = {
@@ -23,6 +23,7 @@ describe('structural bake', () => {
     const tiles = new Map<string, Uint16Array>();
     const writes: TileKey[] = [];
     const document: AuthoringDocumentV1 = {
+      ...createEmptyAuthoringDocument('world'),
       version: 1,
       worldId: 'world',
       fieldLibrary: [],
@@ -76,6 +77,7 @@ describe('structural bake', () => {
   it('applies selected noise fields during depth-0 bake', async () => {
     const tiles = new Map<string, Uint16Array>();
     const document: AuthoringDocumentV1 = {
+      ...createEmptyAuthoringDocument('world'),
       version: 1,
       worldId: 'world',
       fieldLibrary: [{

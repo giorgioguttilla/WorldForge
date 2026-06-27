@@ -95,6 +95,29 @@ export class HeightmapTileStore {
     this.writeCount += 1;
   }
 
+  async writeWaterMaskTile(key: TileKey, samples: Uint16Array): Promise<void> {
+    const root = this.requireRoot();
+    const pathParts = waterMaskTilePath(key).split('/');
+    const fileName = pathParts.pop();
+    if (!fileName) throw new Error('Invalid water mask tile path.');
+    const dir = await this.ensureDirectory(root, pathParts);
+    const handle = await dir.getFileHandle(fileName, { create: true });
+    const writable = await handle.createWritable({ keepExistingData: false });
+    await writable.write(R16HeightmapCodec.encode(samples));
+    await writable.close();
+  }
+
+  async readWaterMaskTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
+    const root = this.requireRoot();
+    try {
+      const file = await (await this.getFile(root, waterMaskTilePath(key))).getFile();
+      return R16HeightmapCodec.decode(await file.arrayBuffer(), tileSize);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotFoundError') return null;
+      throw error;
+    }
+  }
+
   async readTile(key: TileKey, tileSize: number, options: TileAccessOptions = {}): Promise<Uint16Array> {
     const id = tilePath(key);
     const shouldCache = options.cache !== false;
@@ -158,4 +181,8 @@ export class HeightmapTileStore {
     }
     return cursor.getFileHandle(fileName);
   }
+}
+
+export function waterMaskTilePath(key: TileKey, extension = 'r16'): string {
+  return `masks/water/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }

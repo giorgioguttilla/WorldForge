@@ -311,6 +311,46 @@ button:disabled {
   height: 16px;
 }
 
+.erosion-settings {
+  display: grid;
+  gap: 9px;
+  border: 1px solid rgba(196, 215, 221, 0.13);
+  border-radius: 7px;
+  padding: 9px;
+  background: rgba(3, 7, 10, 0.26);
+}
+
+.subpanel-title {
+  color: #b9c7cc;
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.erosion-footnote {
+  color: #8da0a6;
+  font-size: 12px;
+}
+
+.erosion-diagnostics {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  color: #b9c7cc;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.erosion-warning {
+  border: 1px solid rgba(205, 147, 85, 0.38);
+  border-radius: 7px;
+  background: rgba(121, 78, 39, 0.28);
+  color: #d8c4a3;
+  font-size: 12px;
+  line-height: 1.3;
+  padding: 7px;
+}
+
 .field-picker {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -604,6 +644,12 @@ button:disabled {
   overflow: hidden;
   border-radius: 999px;
   background: rgba(206, 220, 224, 0.13);
+}
+
+.progress-eta {
+  margin-top: 4px;
+  color: #9fb1b8;
+  font-size: 12px;
 }
 
 .progress-track span {

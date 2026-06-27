@@ -1,7 +1,7 @@
 import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
-import type { AuthoringDocumentV1, BakeMetadataV1 } from './authoringDocument';
+import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1 } from './authoringDocument';
 import {
   clamp,
   elevationToR16,
@@ -15,9 +15,10 @@ import {
 } from './geometry';
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
+import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
 
 export interface BakeProgress {
-  phase: 'baking' | 'building-lod';
+  phase: 'baking' | 'eroding' | 'building-lod';
   current: number;
   total: number;
   label: string;
@@ -26,6 +27,8 @@ export interface BakeProgress {
 export interface BakeTileIO {
   readTile(key: TileKey): Promise<Uint16Array>;
   writeTile(key: TileKey, samples: Uint16Array): Promise<void>;
+  readWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
+  writeWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface BakePassResult {
@@ -50,6 +53,11 @@ export interface StructuralBakeOptions {
 
 interface DepthZeroPassResult extends BakePassResult {
   dirtyTiles: TileKey[];
+}
+
+interface ErosionPassResult extends BakePassResult {
+  dirtyTiles: TileKey[];
+  summary?: ErosionBakeSummaryV1;
 }
 
 interface LodPassResult extends BakePassResult {
@@ -107,12 +115,20 @@ export async function bakeStructuralAuthoring(
   };
   const depthZero = await depthZeroPass.run();
 
+  const erosionPass: BakePass<ErosionPassResult> = {
+    id: 'erosion-v1',
+    run: () => runErosionPass(config, document, io, onProgress)
+  };
+  const erosion = await erosionPass.run();
+  const lodSourceTiles = erosion.dirtyTiles.length > 0 ? erosion.dirtyTiles : depthZero.dirtyTiles;
+
   const lodPass: BakePass<LodPassResult> = {
     id: 'lod-rebuild',
-    run: () => runLodRebuildPass(config, depthZero.dirtyTiles, io, onProgress)
+    run: () => runLodRebuildPass(config, lodSourceTiles, io, onProgress)
   };
   const lod = await lodPass.run();
 
+  const erosionSummary = erosion.summary;
   return {
     metadata: {
       id: crypto.randomUUID(),
@@ -121,9 +137,10 @@ export async function bakeStructuralAuthoring(
       status: 'clean',
       inputHash: stableAuthoringHash(config, document, waterLevel),
       primitiveCount: document.primitives.filter((primitive) => primitive.enabled).length,
-      tileCount
+      tileCount,
+      ...(erosionSummary ? { erosion: erosionSummary } : {})
     },
-    dirtyTiles: depthZero.dirtyTiles,
+    dirtyTiles: lodSourceTiles,
     lodTileCount: lod.lodTileCount
   };
 }
@@ -380,6 +397,36 @@ async function runDepthZeroStructuralPass(
   );
 
   return { id: 'depth-zero-structural', dirtyTiles };
+}
+
+async function runErosionPass(
+  config: WorldConfig,
+  document: AuthoringDocumentV1,
+  io: BakeTileIO,
+  onProgress?: (progress: BakeProgress) => void
+): Promise<ErosionPassResult> {
+  if (!document.erosion?.enabled) {
+    return {
+      id: 'erosion-v1',
+      dirtyTiles: [],
+      summary: {
+        enabled: false,
+        preset: document.erosion?.preset ?? 'medium',
+        hydraulicIterations: 0,
+        thermalIterations: 0,
+        chunkSize: document.erosion?.chunkSize ?? config.tileSize,
+        overlap: document.erosion?.overlap ?? 0,
+        waterMask: 'accumulated-water-influence',
+        warnings: []
+      }
+    };
+  }
+  const result = await runWebGpuErosionBake(config, document.erosion, io, (progress: ErosionProgress) => onProgress?.(progress));
+  return {
+    id: 'erosion-v1',
+    dirtyTiles: result.dirtyTiles,
+    summary: result.summary
+  };
 }
 
 async function runLodRebuildPass(

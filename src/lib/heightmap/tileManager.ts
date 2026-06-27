@@ -1,6 +1,6 @@
 import { LodBuilder } from './lodBuilder';
 import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './gpuHeightmapCompute';
-import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
+import { HeightmapTileStore, waterMaskTilePath, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
 import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
@@ -19,7 +19,7 @@ export interface EditorMetrics extends TileMetricsSnapshot {
 }
 
 export interface BulkProgress {
-  phase: 'generating' | 'building-lod' | BakeProgress['phase'];
+  phase: 'generating' | BakeProgress['phase'];
   current: number;
   total: number;
   label: string;
@@ -184,7 +184,9 @@ export class TileManager {
         waterLevel,
         {
           readTile: (key) => this.store.readTile(key, config.tileSize, { cache: false }),
-          writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false })
+          writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false }),
+          readWaterMaskTile: (key) => this.store.readWaterMaskTile(key, config.tileSize),
+          writeWaterMaskTile: (key, samples) => this.store.writeWaterMaskTile(key, samples)
         },
         onProgress,
         options
@@ -306,6 +308,13 @@ export class TileManager {
           const samples = await this.store.readTile(key, config.tileSize, { cache: false });
           const blob = await encodeGrayscale16Png(config.tileSize, config.tileSize, samples);
           await this.writeBlobFile(directory, tilePath(key, 'png'), blob);
+          if (d === 0) {
+            const waterMask = await this.store.readWaterMaskTile(key, config.tileSize);
+            if (waterMask) {
+              const maskBlob = await encodeGrayscale16Png(config.tileSize, config.tileSize, waterMask);
+              await this.writeBlobFile(directory, waterMaskTilePath(key, 'png'), maskBlob);
+            }
+          }
         }
       }
     }

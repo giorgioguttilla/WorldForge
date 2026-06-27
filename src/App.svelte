@@ -6,7 +6,8 @@
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
   import type { VisualizationMode } from './lib/render/terrainRenderer';
-  import { createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
+  import { applyErosionPreset, createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type ErosionPresetV1, type ErosionSettingsV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
+  import { estimateErosionBakeMemoryMb } from './lib/authoring/erosionBakeWebGpu';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
   import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
   import NoiseGraphEditor from './lib/noiseGraph/NoiseGraphEditor.svelte';
@@ -43,6 +44,8 @@
   let metrics: EditorMetrics = { ...manager.metrics };
   let configErrors: string[] = [];
   let bulkProgress: BulkProgress | null = null;
+  let bulkEtaText = '';
+  let progressRateState: { phase: BulkProgress['phase']; time: number; current: number; msPerUnit: number | null } | null = null;
   let waterSaveTimer: number | null = null;
   let authoringSaveTimer: number | null = null;
   let authoringDocument: AuthoringDocumentV1 | null = null;
@@ -76,6 +79,8 @@
   $: selectedPrimitive = authoringDocument?.primitives.find((primitive) => primitive.id === selectedPrimitiveId) ?? null;
   $: selectedField = selectedPrimitive?.fieldId ? authoringDocument?.fieldLibrary.find((field) => field.id === selectedPrimitive.fieldId) ?? null : null;
   $: selectedAnchor = selectedPrimitive?.anchors.find((anchor) => anchor.id === selectedAnchorId) ?? null;
+  $: erosionSettings = authoringDocument?.erosion ?? null;
+  $: erosionMemoryMb = erosionSettings ? estimateErosionBakeMemoryMb(erosionSettings) : 0;
   $: canFinishMountain = activeTool === 'mountainSpline' && draftAnchors.length >= 2;
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
   $: modalInputLocked = Boolean(editingField);
@@ -172,21 +177,22 @@
     if (replacingExistingWorld && !confirmedReplace) return;
     creating = true;
     bulkProgress = { phase: 'generating', current: 0, total: 1, label: 'Preparing world generation' };
+    bulkEtaText = '';
+    progressRateState = null;
     status = 'Generating raw R16 tiles and LODs...';
     try {
       const replaceProjectId = replacingExistingWorld ? manager.config?.id : undefined;
       viewport?.terrain.clear();
       await manager.createWorld(worldInput, {
         replaceProjectId,
-        onProgress: (progress) => {
-          bulkProgress = progress;
-          status = progress.label;
-        }
+        onProgress: updateBulkProgress
       });
       showDialog = false;
       replacingExistingWorld = false;
       confirmedReplace = false;
       bulkProgress = null;
+      bulkEtaText = '';
+      progressRateState = null;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
       metrics = { ...manager.metrics };
       loadWaterSettings();
@@ -617,6 +623,21 @@
     commitAuthoring(replacePrimitive(nextPrimitive));
   }
 
+  function updateErosionSettings(patch: Partial<ErosionSettingsV1>) {
+    if (!authoringDocument) return;
+    const nextErosion = {
+      ...authoringDocument.erosion,
+      ...patch,
+      preset: patch.preset ?? (patch.enabled === undefined ? 'custom' : authoringDocument.erosion.preset)
+    };
+    commitAuthoring({ ...authoringDocument, erosion: nextErosion });
+  }
+
+  function setErosionPreset(preset: ErosionPresetV1) {
+    if (!authoringDocument) return;
+    commitAuthoring({ ...authoringDocument, erosion: applyErosionPreset(preset, authoringDocument.erosion) });
+  }
+
   function setSelectedField(fieldId: string) {
     if (!selectedPrimitive) return;
     updateSelectedPrimitive({ fieldId: fieldId || undefined } as Partial<PrimitiveV1>);
@@ -723,12 +744,11 @@
     await flushAuthoringSave();
     bakeState = 'baking';
     bulkProgress = { phase: 'baking', current: 0, total: 1, label: 'Preparing structural bake' };
+    bulkEtaText = '';
+    progressRateState = null;
     status = 'Baking structural terrain...';
     try {
-      authoringDocument = await manager.bakeAuthoringDocument(authoringDocument, waterLevel, (progress) => {
-        bulkProgress = progress;
-        status = progress.label;
-      }, {
+      authoringDocument = await manager.bakeAuthoringDocument(authoringDocument, waterLevel, updateBulkProgress, {
         debugTelemetry: bakeDebugTelemetry,
         preferWebGpu: preferWebGpuBake
       });
@@ -742,7 +762,51 @@
       status = error instanceof Error ? error.message : 'Bake failed.';
     } finally {
       bulkProgress = null;
+      bulkEtaText = '';
+      progressRateState = null;
     }
+  }
+
+  function updateBulkProgress(progress: BulkProgress) {
+    const now = performance.now();
+    if (!progressRateState || progressRateState.phase !== progress.phase || progress.current < progressRateState.current) {
+      progressRateState = { phase: progress.phase, time: now, current: progress.current, msPerUnit: null };
+    } else {
+      const units = progress.current - progressRateState.current;
+      const elapsed = now - progressRateState.time;
+      if (units > 0 && elapsed > 0) {
+        const currentRate = elapsed / units;
+        progressRateState.msPerUnit = progressRateState.msPerUnit === null
+          ? currentRate
+          : progressRateState.msPerUnit * 0.7 + currentRate * 0.3;
+        progressRateState.time = now;
+        progressRateState.current = progress.current;
+      }
+    }
+    const remaining = Math.max(0, progress.total - progress.current);
+    const etaMs = progressRateState?.msPerUnit === null || !progressRateState?.msPerUnit ? 0 : remaining * progressRateState.msPerUnit;
+    bulkEtaText = etaMs > 0 && progress.current < progress.total ? formatDuration(etaMs) : '';
+    bulkProgress = progress;
+    status = bulkEtaText ? `${progress.label} · ETA ${bulkEtaText}` : progress.label;
+  }
+
+  function formatDuration(ms: number) {
+    const seconds = Math.max(1, Math.round(ms / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    if (minutes < 60) return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const minuteRest = minutes % 60;
+    return minuteRest > 0 ? `${hours}h ${minuteRest}m` : `${hours}h`;
+  }
+
+  function formatDiagnostic(value: number | null | undefined) {
+    if (!Number.isFinite(value)) return '-';
+    const number = Number(value);
+    if (Math.abs(number) < 0.01) return number.toFixed(4);
+    if (Math.abs(number) < 1) return number.toFixed(3);
+    return number.toFixed(2);
   }
 
   function findAnchorHit(x: number, z: number): { primitiveId: string; anchorId: string } | null {
@@ -1091,6 +1155,84 @@
         </div>
       </div>
 
+      {#if erosionSettings}
+        <div class="erosion-settings">
+          <div class="subpanel-title">Erosion</div>
+          <label class="toggle-row">
+            <input type="checkbox" checked={erosionSettings.enabled} onchange={(event) => updateErosionSettings({ enabled: event.currentTarget.checked })} />
+            <span>Enable erosion stage</span>
+          </label>
+          <div class="field-grid compact">
+            <label>
+              <span>Preset</span>
+              <select value={erosionSettings.preset} onchange={(event) => setErosionPreset(event.currentTarget.value as ErosionPresetV1)}>
+                <option value="light">light</option>
+                <option value="medium">medium</option>
+                <option value="heavy">heavy</option>
+                <option value="custom">custom</option>
+              </select>
+            </label>
+            <label>
+              <span>Chunk</span>
+              <NumericInput min={64} step="64" value={erosionSettings.chunkSize} onCommit={(value) => updateErosionSettings({ chunkSize: value })} />
+            </label>
+          </div>
+          <div class="field-grid compact">
+            <label>
+              <span>Hydraulic iters</span>
+              <NumericInput min={0} step="1" value={erosionSettings.hydraulicIterations} onCommit={(value) => updateErosionSettings({ hydraulicIterations: value })} />
+            </label>
+            <label>
+              <span>Overlap</span>
+              <NumericInput min={2} step="1" value={erosionSettings.overlap} onCommit={(value) => updateErosionSettings({ overlap: value })} />
+            </label>
+          </div>
+          <label>
+            <span>Rainfall / climate</span>
+            <input type="range" min="0" max="2" step="0.01" value={erosionSettings.rainfall} oninput={(event) => updateErosionSettings({ rainfall: Number(event.currentTarget.value) })} />
+          </label>
+          <div class="field-grid compact">
+            <label>
+              <span>Erosion</span>
+              <NumericInput min={0} step="0.01" value={erosionSettings.erosionStrength} onCommit={(value) => updateErosionSettings({ erosionStrength: value })} />
+            </label>
+            <label>
+              <span>Hardness</span>
+              <NumericInput min={0} max={1} step="0.01" value={erosionSettings.hardness} onCommit={(value) => updateErosionSettings({ hardness: value })} />
+            </label>
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" checked={erosionSettings.thermalEnabled} onchange={(event) => updateErosionSettings({ thermalEnabled: event.currentTarget.checked })} />
+            <span>Thermal erosion</span>
+          </label>
+          <div class="field-grid compact">
+            <label>
+              <span>Thermal iters</span>
+              <NumericInput min={0} step="1" value={erosionSettings.thermalIterations} onCommit={(value) => updateErosionSettings({ thermalIterations: value })} />
+            </label>
+            <label>
+              <span>Talus angle</span>
+              <NumericInput min={1} max={89} step="1" value={erosionSettings.talusAngleDegrees} onCommit={(value) => updateErosionSettings({ talusAngleDegrees: value })} />
+            </label>
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" checked={erosionSettings.outputWaterMask} onchange={(event) => updateErosionSettings({ outputWaterMask: event.currentTarget.checked })} />
+            <span>Output water mask</span>
+          </label>
+          <div class="erosion-footnote">~{erosionMemoryMb.toFixed(0)} MB GPU working set per chunk</div>
+          {#if authoringDocument.lastBake?.erosion?.enabled}
+            <div class="erosion-diagnostics">
+              <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
+              <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
+              <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+            </div>
+            {#if authoringDocument.lastBake.erosion.warnings.length > 0}
+              <div class="erosion-warning">{authoringDocument.lastBake.erosion.warnings[0]}</div>
+            {/if}
+          {/if}
+        </div>
+      {/if}
+
       {#if activeTool === 'landformArea' && draftAnchors.length > 0}
         <div class="draft-row">
           <span>{draftAnchors.length} anchors</span>
@@ -1208,6 +1350,9 @@
   {#if bulkProgress || restoring}
     <div class="progress-panel" aria-label="Bulk operation progress">
       <div>{bulkProgress?.label ?? 'Restoring world'}</div>
+      {#if bulkEtaText}
+        <div class="progress-eta">ETA {bulkEtaText}</div>
+      {/if}
       <div class="progress-track"><span style={`width: ${restoring ? 38 : bulkProgressPercent}%`}></span></div>
     </div>
   {/if}

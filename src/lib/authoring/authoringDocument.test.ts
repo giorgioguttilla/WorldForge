@@ -24,6 +24,27 @@ describe('authoring document', () => {
     expect(normalizeAuthoringDocument({ primitives: [{ type: 'unknown' }] }, 'world-a')).toEqual(createEmptyAuthoringDocument('world-a'));
   });
 
+  it('normalizes erosion settings with medium defaults', () => {
+    const document = normalizeAuthoringDocument({
+      erosion: {
+        enabled: true,
+        preset: 'heavy',
+        hydraulicIterations: '12',
+        hardness: 4,
+        overlap: 1
+      }
+    }, 'world-a');
+
+    expect(document.erosion).toMatchObject({
+      enabled: true,
+      preset: 'heavy',
+      hydraulicIterations: 12,
+      hardness: 1,
+      overlap: 2,
+      outputWaterMask: true
+    });
+  });
+
   it('normalizes saved primitive fields conservatively', () => {
     const document = normalizeAuthoringDocument({
       worldId: 'old',
