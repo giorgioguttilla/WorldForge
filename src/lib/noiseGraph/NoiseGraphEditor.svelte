@@ -15,13 +15,16 @@
 
   let canvas: HTMLCanvasElement;
   let wrapper: HTMLDivElement;
+  let modal: HTMLDivElement;
   let working: NoiseFieldGraphV1 = structuredClone(graph);
   let query = '';
   let selectedNodeId: string | null = null;
   let selectedEdgeId: string | null = null;
   let dragNode: { nodeId: string; dx: number; dy: number } | null = null;
   let dragPort: { ref: NoiseGraphPortRefV1; x: number; y: number; validTarget: NoiseGraphPortRefV1 | null } | null = null;
+  let panDrag: { pointerId: number; x: number; y: number } | null = null;
   let pointer = { x: 0, y: 0 };
+  let viewport = { x: 0, y: 0, zoom: 1 };
 
   $: selectedNode = working.nodes.find((node) => node.id === selectedNodeId) ?? null;
   $: issues = validateNoiseGraph(working);
@@ -30,6 +33,7 @@
     .filter((definition) => `${definition.label} ${definition.category} ${definition.type}`.toLowerCase().includes(query.toLowerCase()));
 
   onMount(() => {
+    modal?.focus();
     draw();
     const keyHandler = (event: KeyboardEvent) => {
       if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
@@ -59,6 +63,9 @@
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     context.clearRect(0, 0, rect.width, rect.height);
     drawGrid(context, rect.width, rect.height);
+    context.save();
+    context.translate(viewport.x, viewport.y);
+    context.scale(viewport.zoom, viewport.zoom);
     for (const edge of working.edges) {
       const from = portPosition(edge.from);
       const to = portPosition(edge.to);
@@ -70,18 +77,22 @@
       if (start) drawSpline(context, start.x, start.y, pointer.x, pointer.y, dragPort.validTarget ? '#8bd59c' : '#d4b26f', 2);
     }
     for (const node of working.nodes) drawNode(context, node);
+    context.restore();
   }
 
   function drawGrid(context: CanvasRenderingContext2D, width: number, height: number) {
     context.strokeStyle = 'rgba(196, 215, 221, 0.08)';
     context.lineWidth = 1;
-    for (let x = 0; x < width; x += 32) {
+    const spacing = 32 * viewport.zoom;
+    const offsetX = modulo(viewport.x, spacing);
+    const offsetY = modulo(viewport.y, spacing);
+    for (let x = offsetX; x < width; x += spacing) {
       context.beginPath();
       context.moveTo(x, 0);
       context.lineTo(x, height);
       context.stroke();
     }
-    for (let y = 0; y < height; y += 32) {
+    for (let y = offsetY; y < height; y += spacing) {
       context.beginPath();
       context.moveTo(0, y);
       context.lineTo(width, y);
@@ -124,6 +135,13 @@
   }
 
   function handlePointerDown(event: PointerEvent) {
+    if (event.button === 2) {
+      event.preventDefault();
+      panDrag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+      canvas.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (event.button !== 0) return;
     const point = localPoint(event);
     const port = hitPort(point.x, point.y);
     if (port) {
@@ -156,6 +174,16 @@
   }
 
   function handlePointerMove(event: PointerEvent) {
+    if (panDrag) {
+      viewport = {
+        ...viewport,
+        x: viewport.x + event.clientX - panDrag.x,
+        y: viewport.y + event.clientY - panDrag.y
+      };
+      panDrag = { ...panDrag, x: event.clientX, y: event.clientY };
+      draw();
+      return;
+    }
     const point = localPoint(event);
     pointer = point;
     if (dragNode) {
@@ -174,19 +202,40 @@
   }
 
   function handlePointerUp(event: PointerEvent) {
+    if (panDrag?.pointerId === event.pointerId) {
+      panDrag = null;
+      canvas.releasePointerCapture(event.pointerId);
+      return;
+    }
     if (dragPort?.validTarget) {
       const next = connectPorts(working, dragPort.ref, dragPort.validTarget);
       if (next) working = next;
     }
     dragNode = null;
     dragPort = null;
-    canvas.releasePointerCapture(event.pointerId);
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    draw();
+  }
+
+  function handleWheel(event: WheelEvent) {
+    event.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const screen = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const before = screenToGraph(screen.x, screen.y);
+    const zoom = Math.max(0.35, Math.min(2.75, viewport.zoom * Math.exp(-event.deltaY * 0.001)));
+    viewport = {
+      x: screen.x - before.x * zoom,
+      y: screen.y - before.y * zoom,
+      zoom
+    };
     draw();
   }
 
   function addNode(type: NoiseGraphNodeTypeV1) {
     const count = working.nodes.length;
-    const node = createNoiseGraphNode(type, { x: 180 + (count % 3) * 38, y: 90 + count * 24 });
+    const rect = wrapper?.getBoundingClientRect();
+    const center = rect ? screenToGraph(rect.width / 2, rect.height / 2) : { x: 220, y: 120 };
+    const node = createNoiseGraphNode(type, { x: center.x - nodeWidth / 2 + (count % 3) * 24, y: center.y - 40 + (count % 3) * 18 });
     working = { ...working, nodes: [...working.nodes, node] };
     selectedNodeId = node.id;
     selectedEdgeId = null;
@@ -265,7 +314,18 @@
 
   function localPoint(event: PointerEvent) {
     const rect = canvas.getBoundingClientRect();
-    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    return screenToGraph(event.clientX - rect.left, event.clientY - rect.top);
+  }
+
+  function screenToGraph(x: number, y: number) {
+    return {
+      x: (x - viewport.x) / viewport.zoom,
+      y: (y - viewport.y) / viewport.zoom
+    };
+  }
+
+  function modulo(value: number, divisor: number) {
+    return ((value % divisor) + divisor) % divisor;
   }
 
   function isTextInput(target: EventTarget | null) {
@@ -279,7 +339,7 @@
     context.moveTo(x1, y1);
     context.bezierCurveTo(x1 + tension, y1, x2 - tension, y2, x2, y2);
     context.strokeStyle = color;
-    context.lineWidth = width;
+    context.lineWidth = width / viewport.zoom;
     context.stroke();
   }
 
@@ -301,9 +361,42 @@
     const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSq));
     return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
   }
+
+  function stopModalEvent(event: Event) {
+    event.stopPropagation();
+  }
+
+  function handleModalKeydown(event: KeyboardEvent) {
+    event.stopPropagation();
+    if ((event.code === 'Delete' || event.code === 'Backspace') && !isTextInput(event.target)) {
+      working = deleteGraphSelection(working, { nodeId: selectedNodeId ?? undefined, edgeId: selectedEdgeId ?? undefined });
+      selectedNodeId = null;
+      selectedEdgeId = null;
+      event.preventDefault();
+      draw();
+      return;
+    }
+    if (event.code === 'Escape') {
+      event.preventDefault();
+      onCancel();
+    }
+  }
 </script>
 
-<div class="noise-modal">
+<div
+  bind:this={modal}
+  class="noise-modal"
+  role="dialog"
+  aria-modal="true"
+  tabindex="-1"
+  onkeydown={handleModalKeydown}
+  onkeyup={stopModalEvent}
+  onpointerdown={stopModalEvent}
+  onpointermove={stopModalEvent}
+  onpointerup={stopModalEvent}
+  onwheel={stopModalEvent}
+  onclick={stopModalEvent}
+>
   <div class="noise-editor">
     <aside class="noise-palette">
       <header>
@@ -331,6 +424,9 @@
         onpointerdown={handlePointerDown}
         onpointermove={handlePointerMove}
         onpointerup={handlePointerUp}
+        onpointercancel={handlePointerUp}
+        oncontextmenu={(event) => event.preventDefault()}
+        onwheel={handleWheel}
       ></canvas>
     </main>
 
@@ -339,42 +435,44 @@
         <input value={working.name} oninput={(event) => updateGraphName(event.currentTarget.value)} />
         <button type="button" title="Save field" onclick={() => onSave(working)}><Save size={16} /></button>
       </header>
-      {#if issues.length > 0}
-        <div class="graph-issues">
-          {#each issues as issue}
-            <div>{issue.message}</div>
-          {/each}
-        </div>
-      {/if}
-      {#if selectedNode}
-        <div class="selected-title">
-          <strong>{selectedNode.label || NOISE_GRAPH_NODE_DEFINITIONS[selectedNode.type].label}</strong>
-          {#if selectedNode.type !== 'output'}
-            <button type="button" title="Delete selected node" onclick={() => { working = deleteGraphSelection(working, { nodeId: selectedNode?.id }); selectedNodeId = null; draw(); }}><Trash2 size={15} /></button>
-          {/if}
-        </div>
-        {#if Object.keys(selectedNode.params).length === 0}
-          <div class="empty-params">No editable parameters</div>
-        {:else}
-          {#each Object.entries(selectedNode.params) as [key, value]}
-            <label>
-              <span>{key}</span>
-              {#if typeof value === 'number'}
-                <NumericInput step="0.001" value={value} onCommit={(next) => setNodeParam(key, next)} />
-              {:else}
-                <input type="text" value={value} oninput={(event) => updateNodeParam(key, event.currentTarget.value)} />
-              {/if}
-            </label>
-          {/each}
+      <div class="inspector-scroll">
+        {#if issues.length > 0}
+          <div class="graph-issues">
+            {#each issues as issue}
+              <div>{issue.message}</div>
+            {/each}
+          </div>
         {/if}
-      {:else if selectedEdgeId}
-        <div class="selected-title">
-          <strong>Connector</strong>
-          <button type="button" title="Delete selected connector" onclick={() => { working = deleteGraphSelection(working, { edgeId: selectedEdgeId ?? undefined }); selectedEdgeId = null; draw(); }}><Trash2 size={15} /></button>
-        </div>
-      {:else}
-        <div class="empty-params">Select a node or connector</div>
-      {/if}
+        {#if selectedNode}
+          <div class="selected-title">
+            <strong>{selectedNode.label || NOISE_GRAPH_NODE_DEFINITIONS[selectedNode.type].label}</strong>
+            {#if selectedNode.type !== 'output'}
+              <button type="button" title="Delete selected node" onclick={() => { working = deleteGraphSelection(working, { nodeId: selectedNode?.id }); selectedNodeId = null; draw(); }}><Trash2 size={15} /></button>
+            {/if}
+          </div>
+          {#if Object.keys(selectedNode.params).length === 0}
+            <div class="empty-params">No editable parameters</div>
+          {:else}
+            {#each Object.entries(selectedNode.params) as [key, value]}
+              <label>
+                <span>{key}</span>
+                {#if typeof value === 'number'}
+                  <NumericInput step="0.001" value={value} onCommit={(next) => setNodeParam(key, next)} />
+                {:else}
+                  <input type="text" value={value} oninput={(event) => updateNodeParam(key, event.currentTarget.value)} />
+                {/if}
+              </label>
+            {/each}
+          {/if}
+        {:else if selectedEdgeId}
+          <div class="selected-title">
+            <strong>Connector</strong>
+            <button type="button" title="Delete selected connector" onclick={() => { working = deleteGraphSelection(working, { edgeId: selectedEdgeId ?? undefined }); selectedEdgeId = null; draw(); }}><Trash2 size={15} /></button>
+          </div>
+        {:else}
+          <div class="empty-params">Select a node or connector</div>
+        {/if}
+      </div>
     </aside>
   </div>
 </div>

@@ -54,6 +54,7 @@ export class EditorViewport {
   private waterSettings: WaterSettings = { visible: false, level: 0 };
   private authoringHandlers: AuthoringPointerHandlers | null = null;
   private authoringPointerId: number | null = null;
+  private inputLocked = false;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -158,6 +159,15 @@ export class EditorViewport {
     this.authoringHandlers = handlers;
   }
 
+  setInputLocked(locked: boolean): void {
+    this.inputLocked = locked;
+    this.controller.setInputLocked(locked);
+    if (locked) {
+      this.authoringPointerId = null;
+      this.onHoverCoordinates?.(null);
+    }
+  }
+
   setAuthoringDocument(document: AuthoringDocumentV1 | null): void {
     this.authoringOverlay.setDocument(document);
   }
@@ -200,6 +210,7 @@ export class EditorViewport {
   };
 
   private readonly onPointerMove = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (!this.onHoverCoordinates || !this.manager.config) return;
     const rect = this.canvas.getBoundingClientRect();
     const pointer = new THREE.Vector2(
@@ -226,6 +237,7 @@ export class EditorViewport {
   };
 
   private readonly onAuthoringPointerDown = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (event.button !== 0 || !this.authoringHandlers) return;
     const point = this.projectPointerToAuthoringPlane(event);
     if (!point) return;
@@ -237,6 +249,7 @@ export class EditorViewport {
   };
 
   private readonly onAuthoringPointerMove = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (!this.authoringHandlers || this.authoringPointerId !== event.pointerId) return;
     const point = this.projectPointerToAuthoringPlane(event);
     if (!point) return;
@@ -247,6 +260,7 @@ export class EditorViewport {
   };
 
   private readonly onAuthoringPointerUp = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (!this.authoringHandlers || this.authoringPointerId !== event.pointerId) return;
     const point = this.projectPointerToAuthoringPlane(event);
     if (point && this.authoringHandlers.pointerUp(point)) {

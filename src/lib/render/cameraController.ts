@@ -28,6 +28,7 @@ export class CameraController {
   private characterVelocityY = 0;
   private characterGroundPending = false;
   private dragPointerId: number | null = null;
+  private inputLocked = false;
 
   constructor(
     private readonly dom: HTMLElement,
@@ -56,6 +57,15 @@ export class CameraController {
     }
   }
 
+  setInputLocked(locked: boolean): void {
+    this.inputLocked = locked;
+    if (locked) {
+      this.keys.clear();
+      this.dragging = false;
+      this.dragPointerId = null;
+    }
+  }
+
   resize(width: number, height: number): void {
     this.perspective.aspect = width / Math.max(1, height);
     this.perspective.updateProjectionMatrix();
@@ -70,6 +80,7 @@ export class CameraController {
   }
 
   update(deltaSeconds: number): void {
+    if (this.inputLocked) return;
     const shiftMultiplier = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 4 : 1;
     const speed = (this.mode === 'ortho' ? 1600 : 900) * shiftMultiplier;
     const amount = speed * deltaSeconds;
@@ -119,6 +130,7 @@ export class CameraController {
   }
 
   private readonly onKeyDown = (event: KeyboardEvent): void => {
+    if (this.inputLocked) return;
     if (event.code === 'Space' && this.mode === 'character') {
       event.preventDefault();
     }
@@ -126,6 +138,7 @@ export class CameraController {
   };
 
   private readonly onKeyUp = (event: KeyboardEvent): void => {
+    if (this.inputLocked) return;
     this.keys.delete(event.code);
   };
 
@@ -134,6 +147,7 @@ export class CameraController {
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (event.button !== 2) return;
     event.preventDefault();
     this.dragging = true;
@@ -144,6 +158,7 @@ export class CameraController {
   };
 
   private readonly onPointerMove = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (!this.dragging) return;
     const dx = event.clientX - this.lastX;
     const dy = event.clientY - this.lastY;
@@ -166,12 +181,14 @@ export class CameraController {
   };
 
   private readonly onPointerUp = (event: PointerEvent): void => {
+    if (this.inputLocked) return;
     if (this.dragPointerId !== null && event.pointerId !== this.dragPointerId) return;
     this.dragging = false;
     this.dragPointerId = null;
   };
 
   private readonly onWheel = (event: WheelEvent): void => {
+    if (this.inputLocked) return;
     if (this.mode !== 'ortho') return;
     event.preventDefault();
     this.ortho.zoom = Math.max(0.05, Math.min(8, this.ortho.zoom * (event.deltaY > 0 ? 0.9 : 1.1)));

@@ -78,6 +78,8 @@
   $: selectedAnchor = selectedPrimitive?.anchors.find((anchor) => anchor.id === selectedAnchorId) ?? null;
   $: canFinishMountain = activeTool === 'mountainSpline' && draftAnchors.length >= 2;
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
+  $: modalInputLocked = Boolean(editingField);
+  $: viewport?.setInputLocked(modalInputLocked);
 
   onMount(async () => {
     preferWebGpuBake = readBooleanSetting(WEBGPU_BAKE_SETTING_KEY, true);
@@ -103,6 +105,7 @@
     }, 500);
 
     const keyHandler = (event: KeyboardEvent) => {
+      if (modalInputLocked) return;
       if (event.code === 'Escape' && showDialog && manager.config) {
         cancelWorldDialog();
         return;

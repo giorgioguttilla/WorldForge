@@ -383,16 +383,18 @@ button:disabled {
 .noise-palette,
 .noise-inspector {
   min-width: 0;
+  min-height: 0;
   display: grid;
   grid-template-rows: auto auto 1fr;
   gap: 10px;
   padding: 12px;
   background: rgba(13, 20, 26, 0.92);
   border-right: 1px solid rgba(196, 215, 221, 0.12);
+  overflow: hidden;
 }
 
 .noise-inspector {
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto 1fr;
   border-right: 0;
   border-left: 1px solid rgba(196, 215, 221, 0.12);
 }
@@ -448,10 +450,12 @@ button:disabled {
 
 .module-list {
   min-height: 0;
+  max-height: 100%;
   overflow: auto;
   display: grid;
   align-content: start;
   gap: 6px;
+  padding-right: 2px;
 }
 
 .module-list button {
@@ -482,6 +486,8 @@ button:disabled {
   width: 100%;
   height: 100%;
   cursor: crosshair;
+  touch-action: none;
+  user-select: none;
 }
 
 .noise-inspector label {
@@ -492,15 +498,13 @@ button:disabled {
   font-weight: 650;
 }
 
-.noise-inspector {
-  align-content: start;
-}
-
-.noise-inspector > :last-child {
+.inspector-scroll {
+  min-height: 0;
   display: grid;
   gap: 10px;
   align-content: start;
   overflow: auto;
+  padding-right: 2px;
 }
 
 .graph-issues {
