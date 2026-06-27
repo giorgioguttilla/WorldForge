@@ -78,25 +78,34 @@ export async function tryCreateWebGpuDepthZeroBake(
   const simplexSeedSlots = collectSimplexSeedSlots(supportedFields);
   const packed = packPreparedDocument(prepared, waterLevel, config.worldHeight, supportedFields, simplexSeedSlots);
   const shader = createBakeShader(config, supportedFields, simplexSeedSlots);
-  const module = device.createShaderModule({ label: 'WorldForge structural bake', code: shader });
-  const pipeline = device.createComputePipeline({
-    label: 'WorldForge structural bake pipeline',
-    layout: 'auto',
-    compute: { module, entryPoint: 'main' }
-  });
-  const buffers = createDocumentBuffers(device, packed);
+  let buffers: GpuDocumentBuffers | null = null;
+  try {
+    const module = device.createShaderModule({ label: 'WorldForge structural bake', code: shader });
+    const pipeline = device.createComputePipeline({
+      label: 'WorldForge structural bake pipeline',
+      layout: 'auto',
+      compute: { module, entryPoint: 'main' }
+    });
+    buffers = createDocumentBuffers(device, packed);
 
-  return {
-    async bakeTile(tileX, tileY) {
-      return bakeTileWithDevice(device, pipeline, buffers, config, tileX, tileY);
-    },
-    destroy() {
-      for (const buffer of Object.values(buffers)) {
-        if (typeof buffer === 'object') buffer.destroy();
+    return {
+      async bakeTile(tileX, tileY) {
+        if (!buffers) throw new Error('WebGPU bake buffers were released.');
+        return bakeTileWithDevice(device, pipeline, buffers, config, tileX, tileY);
+      },
+      destroy() {
+        if (buffers) {
+          destroyDocumentBuffers(buffers);
+          buffers = null;
+        }
+        device.destroy();
       }
-      device.destroy();
-    }
-  };
+    };
+  } catch (error) {
+    if (buffers) destroyDocumentBuffers(buffers);
+    device.destroy();
+    throw error;
+  }
 }
 
 async function bakeTileWithDevice(
@@ -124,39 +133,44 @@ async function bakeTileWithDevice(
     output: device.createBuffer({ size: outputBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
     readback: device.createBuffer({ size: outputBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
   };
-  const bindGroup = device.createBindGroup({
-    label: 'WorldForge structural bake bind group',
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: buffers.uniform } },
-      { binding: 1, resource: { buffer: documentBuffers.landforms } },
-      { binding: 2, resource: { buffer: documentBuffers.mountains } },
-      { binding: 3, resource: { buffer: documentBuffers.points } },
-      { binding: 4, resource: { buffer: documentBuffers.segments } },
-      { binding: 5, resource: { buffer: documentBuffers.segmentBounds } },
-      { binding: 6, resource: { buffer: documentBuffers.simplexGradients } },
-      { binding: 7, resource: { buffer: buffers.output } }
-    ]
-  });
-  const encoder = device.createCommandEncoder();
-  const pass = encoder.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(config.tileSize / WORKGROUP_SIZE), Math.ceil(config.tileSize / WORKGROUP_SIZE));
-  pass.end();
-  encoder.copyBufferToBuffer(buffers.output, 0, buffers.readback, 0, outputBytes);
-  device.queue.submit([encoder.finish()]);
-  await buffers.readback.mapAsync(GPUMapMode.READ);
-  const mapped = new Uint32Array(buffers.readback.getMappedRange());
-  const result = new Uint16Array(sampleCount);
-  for (let i = 0; i < sampleCount; i += 1) {
-    result[i] = mapped[i];
+  let readbackMapped = false;
+  try {
+    const bindGroup = device.createBindGroup({
+      label: 'WorldForge structural bake bind group',
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: buffers.uniform } },
+        { binding: 1, resource: { buffer: documentBuffers.landforms } },
+        { binding: 2, resource: { buffer: documentBuffers.mountains } },
+        { binding: 3, resource: { buffer: documentBuffers.points } },
+        { binding: 4, resource: { buffer: documentBuffers.segments } },
+        { binding: 5, resource: { buffer: documentBuffers.segmentBounds } },
+        { binding: 6, resource: { buffer: documentBuffers.simplexGradients } },
+        { binding: 7, resource: { buffer: buffers.output } }
+      ]
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(config.tileSize / WORKGROUP_SIZE), Math.ceil(config.tileSize / WORKGROUP_SIZE));
+    pass.end();
+    encoder.copyBufferToBuffer(buffers.output, 0, buffers.readback, 0, outputBytes);
+    device.queue.submit([encoder.finish()]);
+    await buffers.readback.mapAsync(GPUMapMode.READ);
+    readbackMapped = true;
+    const mapped = new Uint32Array(buffers.readback.getMappedRange());
+    const result = new Uint16Array(sampleCount);
+    for (let i = 0; i < sampleCount; i += 1) {
+      result[i] = mapped[i];
+    }
+    return result;
+  } finally {
+    if (readbackMapped) buffers.readback.unmap();
+    for (const buffer of Object.values(buffers)) {
+      buffer.destroy();
+    }
   }
-  buffers.readback.unmap();
-  for (const buffer of Object.values(buffers)) {
-    buffer.destroy();
-  }
-  return result;
 }
 
 function createDocumentBuffers(device: GPUDevice, packed: PackedGpuDocument): GpuDocumentBuffers {
@@ -170,6 +184,15 @@ function createDocumentBuffers(device: GPUDevice, packed: PackedGpuDocument): Gp
     segmentBounds: createStorageBuffer(device, packed.segmentBounds),
     simplexGradients: createStorageBuffer(device, packed.simplexGradients)
   };
+}
+
+function destroyDocumentBuffers(buffers: GpuDocumentBuffers): void {
+  buffers.landforms.destroy();
+  buffers.mountains.destroy();
+  buffers.points.destroy();
+  buffers.segments.destroy();
+  buffers.segmentBounds.destroy();
+  buffers.simplexGradients.destroy();
 }
 
 function packPreparedDocument(

@@ -47,6 +47,11 @@ export class TileManager {
     this.store = store;
   }
 
+  dispose(): void {
+    this.computeBackend?.dispose?.();
+    this.computeBackend = null;
+  }
+
   async initializeComputeBackend(): Promise<string> {
     return (await this.getComputeBackend()).label;
   }

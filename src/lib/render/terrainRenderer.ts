@@ -151,12 +151,13 @@ export class TerrainQuadtreeRenderer {
   }
 
   dispose(): void {
+    this.generation += 1;
+    this.cancelPendingBuilds();
     for (const node of this.pool) {
       node.mesh.geometry.dispose();
     }
     for (const state of this.workers) {
       state.worker.terminate();
-      state.requests.clear();
       state.tileCache.clear();
       state.pending = 0;
     }

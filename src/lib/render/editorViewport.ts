@@ -49,6 +49,7 @@ export class EditorViewport {
   private lastFrameTime = performance.now();
   private frame = 0;
   private disposed = false;
+  private animationFrame: number | null = null;
   private lastControlScaleCameraKey = '';
   private waterSettings: WaterSettings = { visible: false, level: 0 };
   private authoringHandlers: AuthoringPointerHandlers | null = null;
@@ -130,7 +131,12 @@ export class EditorViewport {
   }
 
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
+    if (this.animationFrame !== null) {
+      cancelAnimationFrame(this.animationFrame);
+      this.animationFrame = null;
+    }
     this.stats.dom.remove();
     this.controller.dispose();
     this.terrain.dispose();
@@ -180,7 +186,7 @@ export class EditorViewport {
 
   private animate = (): void => {
     if (this.disposed) return;
-    requestAnimationFrame(this.animate);
+    this.animationFrame = requestAnimationFrame(this.animate);
     this.stats.begin();
     const now = performance.now();
     const delta = Math.min(0.1, (now - this.lastFrameTime) / 1000);

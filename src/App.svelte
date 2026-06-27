@@ -151,6 +151,7 @@
       if (authoringSyncFrame !== null) window.cancelAnimationFrame(authoringSyncFrame);
       resizeObserver.disconnect();
       viewport?.dispose();
+      manager.dispose();
     };
   });
 
@@ -159,6 +160,7 @@
     if (authoringSaveTimer !== null) window.clearTimeout(authoringSaveTimer);
     if (authoringSyncFrame !== null) window.cancelAnimationFrame(authoringSyncFrame);
     viewport?.dispose();
+    manager.dispose();
   });
 
   async function createWorld() {

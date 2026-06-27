@@ -3,6 +3,7 @@ import { generateNoiseTile } from './noise';
 export interface HeightmapComputeBackend {
   readonly label: string;
   generateNoiseTile(tileSize: number, tileX: number, tileY: number, seed: number): Promise<Uint16Array>;
+  dispose?(): void;
 }
 
 export class CpuHeightmapCompute implements HeightmapComputeBackend {
@@ -75,6 +76,11 @@ export class WebGpuHeightmapCompute implements HeightmapComputeBackend {
     uniforms.destroy();
 
     return hasUsableHeightRange(samples) ? samples : this.cpuFallback.generateNoiseTile(tileSize, tileX, tileY, seed);
+  }
+
+  dispose(): void {
+    this.pipeline = null;
+    this.device.destroy();
   }
 
   private getPipeline(): GPUComputePipeline {
