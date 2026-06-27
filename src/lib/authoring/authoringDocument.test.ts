@@ -10,8 +10,11 @@ describe('authoring document', () => {
       primitives: []
     });
     expect(document.fieldLibrary.map((field) => field.id)).toEqual([
+      'preset-plains',
       'preset-rolling-hills',
+      'preset-dunes',
       'preset-mountains',
+      'preset-himalayas',
       'preset-canyon'
     ]);
   });

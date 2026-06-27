@@ -2,15 +2,51 @@ import type { NoiseFieldGraphV1, NoiseGraphNodeTypeV1 } from './types';
 
 export function createDefaultNoiseFieldLibrary(): NoiseFieldGraphV1[] {
   return [
+    plainsPreset(),
     rollingHillsPreset(),
-    mountainsPreset(),
+    dunesPreset(),
+    mediumMountainsPreset(),
+    himalayasPreset(),
     canyonPreset()
   ];
 }
 
+function plainsPreset(): NoiseFieldGraphV1 {
+  const position = node('plains-position', 'cartesianPosition', 60, 140);
+  const broad = node('plains-broad', 'fbm2d', 295, 80, { frequency: 0.00008, octaves: 3, lacunarity: 2, gain: 0.45, seed: 31, skewX: 1, skewY: 1, rangeMin: -1, rangeMax: 1 });
+  const broadWeight = node('plains-broad-weight', 'constFloat', 295, 205, { value: 0.55 });
+  const broadScaled = node('plains-broad-scaled', 'multiply', 515, 105);
+  const texture = node('plains-texture', 'fbm2d', 295, 355, { frequency: 0.00065, octaves: 3, lacunarity: 2.1, gain: 0.35, seed: 37, skewX: 1, skewY: 1, rangeMin: -1, rangeMax: 1 });
+  const textureWeight = node('plains-texture-weight', 'constFloat', 295, 480, { value: 0.1 });
+  const textureScaled = node('plains-texture-scaled', 'multiply', 515, 380);
+  const sum = node('plains-sum', 'add', 735, 225);
+  const output = node('plains-output', 'output', 940, 225);
+  return graph('preset-plains', 'Plains', 'Very low relief with broad 10k-foot swells and faint thousand-foot surface texture.', [
+    position,
+    broad,
+    broadWeight,
+    broadScaled,
+    texture,
+    textureWeight,
+    textureScaled,
+    sum,
+    output
+  ], [
+    edge(position, 'xy', broad, 'xy'),
+    edge(position, 'xy', texture, 'xy'),
+    edge(broad, 'value', broadScaled, 'a'),
+    edge(broadWeight, 'value', broadScaled, 'b'),
+    edge(texture, 'value', textureScaled, 'a'),
+    edge(textureWeight, 'value', textureScaled, 'b'),
+    edge(broadScaled, 'value', sum, 'a'),
+    edge(textureScaled, 'value', sum, 'b'),
+    edge(sum, 'value', output, 'value')
+  ]);
+}
+
 function rollingHillsPreset(): NoiseFieldGraphV1 {
   const position = node('rolling-position', 'cartesianPosition', 60, 140);
-  const fbm = node('rolling-fbm', 'fbm2d', 300, 105, { frequency: 0.0009, octaves: 5, gain: 0.52, seed: 71, rangeMin: -1, rangeMax: 1 });
+  const fbm = node('rolling-fbm', 'fbm2d', 300, 105, { frequency: 0.00038, octaves: 5, lacunarity: 2, gain: 0.5, seed: 71, rangeMin: -1, rangeMax: 1 });
   const output = node('rolling-output', 'output', 540, 130);
   return graph('preset-rolling-hills', 'Rolling Hills', 'Low rounded terrain undulations.', [position, fbm, output], [
     edge(position, 'xy', fbm, 'xy'),
@@ -18,20 +54,93 @@ function rollingHillsPreset(): NoiseFieldGraphV1 {
   ]);
 }
 
-function mountainsPreset(): NoiseFieldGraphV1 {
+function dunesPreset(): NoiseFieldGraphV1 {
+  const position = node('dunes-position', 'cartesianPosition', 60, 140);
+  const duneBands = node('dunes-bands', 'ridged2d', 295, 95, { frequency: 0.0033, octaves: 4, lacunarity: 1.75, gain: 0.42, seed: 143, skewX: 2.6, skewY: 0.55, rangeMin: -1, rangeMax: 1 });
+  const bandWeight = node('dunes-band-weight', 'constFloat', 295, 220, { value: 0.72 });
+  const bandsScaled = node('dunes-bands-scaled', 'multiply', 515, 120);
+  const drift = node('dunes-drift', 'fbm2d', 295, 370, { frequency: 0.00035, octaves: 4, lacunarity: 2, gain: 0.48, seed: 149, skewX: 1.8, skewY: 0.8, rangeMin: -1, rangeMax: 1 });
+  const driftWeight = node('dunes-drift-weight', 'constFloat', 295, 495, { value: 0.28 });
+  const driftScaled = node('dunes-drift-scaled', 'multiply', 515, 395);
+  const sum = node('dunes-sum', 'add', 735, 245);
+  const output = node('dunes-output', 'output', 940, 245);
+  return graph('preset-dunes', 'Dunes', 'Wind-stretched dune bands with 150-800 foot wavelengths and gentle drift variation.', [
+    position,
+    duneBands,
+    bandWeight,
+    bandsScaled,
+    drift,
+    driftWeight,
+    driftScaled,
+    sum,
+    output
+  ], [
+    edge(position, 'xy', duneBands, 'xy'),
+    edge(position, 'xy', drift, 'xy'),
+    edge(duneBands, 'value', bandsScaled, 'a'),
+    edge(bandWeight, 'value', bandsScaled, 'b'),
+    edge(drift, 'value', driftScaled, 'a'),
+    edge(driftWeight, 'value', driftScaled, 'b'),
+    edge(bandsScaled, 'value', sum, 'a'),
+    edge(driftScaled, 'value', sum, 'b'),
+    edge(sum, 'value', output, 'value')
+  ]);
+}
+
+function mediumMountainsPreset(): NoiseFieldGraphV1 {
   const position = node('mountains-position', 'cartesianPosition', 60, 140);
-  const ridge = node('mountains-ridge', 'ridged2d', 295, 70, { frequency: 0.0022, octaves: 6, gain: 0.55, seed: 219, rangeMin: 0, rangeMax: 1 });
-  const mask = node('mountains-mask', 'fbm2d', 295, 245, { frequency: 0.00075, octaves: 4, gain: 0.5, seed: 220, rangeMin: 0.25, rangeMax: 1 });
+  const ridge = node('mountains-ridge', 'ridged2d', 295, 70, { frequency: 0.00065, octaves: 5, lacunarity: 1.9, gain: 0.42, seed: 219, rangeMin: 0, rangeMax: 1 });
+  const mask = node('mountains-mask', 'fbm2d', 295, 245, { frequency: 0.00018, octaves: 4, lacunarity: 2, gain: 0.48, seed: 220, rangeMin: 0.38, rangeMax: 1 });
   const multiply = node('mountains-multiply', 'multiply', 530, 135);
-  const power = node('mountains-power', 'power', 720, 135, { exponent: 1.35 });
+  const power = node('mountains-power', 'power', 720, 135, { exponent: 1.08 });
   const output = node('mountains-output', 'output', 910, 135);
-  return graph('preset-mountains', 'Mountains', 'Ridged peaks with broad elevation breakup.', [position, ridge, mask, multiply, power, output], [
+  return graph('preset-mountains', 'Medium Mountains', 'Broad mountain ranges with multi-thousand-foot massing and roughly 1,500-foot ridge structure.', [position, ridge, mask, multiply, power, output], [
     edge(position, 'xy', ridge, 'xy'),
     edge(position, 'xy', mask, 'xy'),
     edge(ridge, 'value', multiply, 'a'),
     edge(mask, 'value', multiply, 'b'),
     edge(multiply, 'value', power, 'in'),
     edge(power, 'value', output, 'value')
+  ]);
+}
+
+function himalayasPreset(): NoiseFieldGraphV1 {
+  const position = node('himalayas-position', 'cartesianPosition', 60, 140);
+  const massif = node('himalayas-massif', 'fbm2d', 295, 55, { frequency: 0.00014, octaves: 4, lacunarity: 1.95, gain: 0.5, seed: 401, skewX: 1.35, skewY: 0.9, rangeMin: 0.32, rangeMax: 1 });
+  const ridges = node('himalayas-ridges', 'ridged2d', 295, 235, { frequency: 0.0009, octaves: 6, lacunarity: 1.9, gain: 0.4, seed: 409, skewX: 1.15, skewY: 0.85, rangeMin: 0, rangeMax: 1 });
+  const multiply = node('himalayas-multiply', 'multiply', 535, 150);
+  const power = node('himalayas-power', 'power', 735, 150, { exponent: 1.22 });
+  const detail = node('himalayas-detail', 'fbm2d', 535, 390, { frequency: 0.0018, octaves: 3, lacunarity: 2.1, gain: 0.34, seed: 419, skewX: 1, skewY: 1, rangeMin: -1, rangeMax: 1 });
+  const detailWeight = node('himalayas-detail-weight', 'constFloat', 735, 500, { value: 0.055 });
+  const detailScaled = node('himalayas-detail-scaled', 'multiply', 935, 405);
+  const sum = node('himalayas-sum', 'add', 1135, 245);
+  const clampNode = node('himalayas-clamp', 'clamp', 1335, 245, { min: 0, max: 1 });
+  const output = node('himalayas-output', 'output', 1535, 245);
+  return graph('preset-himalayas', 'Himalayas', 'Tall ridged ranges with mile-scale massifs, thousand-foot ridge structure, and restrained sharp detail.', [
+    position,
+    massif,
+    ridges,
+    multiply,
+    power,
+    detail,
+    detailWeight,
+    detailScaled,
+    sum,
+    clampNode,
+    output
+  ], [
+    edge(position, 'xy', massif, 'xy'),
+    edge(position, 'xy', ridges, 'xy'),
+    edge(position, 'xy', detail, 'xy'),
+    edge(massif, 'value', multiply, 'a'),
+    edge(ridges, 'value', multiply, 'b'),
+    edge(multiply, 'value', power, 'in'),
+    edge(detail, 'value', detailScaled, 'a'),
+    edge(detailWeight, 'value', detailScaled, 'b'),
+    edge(power, 'value', sum, 'a'),
+    edge(detailScaled, 'value', sum, 'b'),
+    edge(sum, 'value', clampNode, 'in'),
+    edge(clampNode, 'value', output, 'value')
   ]);
 }
 
