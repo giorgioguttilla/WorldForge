@@ -190,7 +190,8 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
         talus: Math.tan((settings.talusAngleDegrees * Math.PI) / 180) * config.unitSize,
         waterMaskScale: settings.waterMaskScale
       };
-      const buffers = createSimulationBuffers(device, input, sampleCount, outputCount);
+      const inputWithMacro = await applyMacroErosion(device, pipeline, config, settings, input, width, height);
+      const buffers = createSimulationBuffers(device, inputWithMacro, width * height, outputCount);
       let heightReadbackMapped = false;
       let maskReadbackMapped = false;
       try {
@@ -229,9 +230,126 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
   };
 }
 
+async function applyMacroErosion(
+  device: GPUDevice,
+  pipeline: GPUComputePipeline,
+  config: WorldConfig,
+  settings: ErosionSettingsV1,
+  input: Float32Array,
+  width: number,
+  height: number
+): Promise<Float32Array> {
+  const factor = chooseMacroFactor(width, height);
+  if (factor <= 1 || settings.hydraulicIterations < 8) return input;
+
+  const coarseWidth = Math.max(2, Math.ceil(width / factor));
+  const coarseHeight = Math.max(2, Math.ceil(height / factor));
+  const coarseInput = downsampleHeightField(input, width, height, coarseWidth, coarseHeight);
+  const coarseIterations = Math.max(6, Math.round(settings.hydraulicIterations * 0.45));
+  const coarseSettings: ErosionSettingsV1 = {
+    ...settings,
+    hydraulicIterations: coarseIterations,
+    thermalIterations: settings.thermalEnabled ? Math.max(0, Math.round(settings.thermalIterations * 0.35)) : 0
+  };
+  const coarseUniforms: ErosionUniforms = {
+    width: coarseWidth,
+    height: coarseHeight,
+    pixelWorldSize: config.unitSize * factor,
+    worldHeight: config.worldHeight,
+    rainfall: settings.rainfall * 1.25,
+    evaporation: Math.max(0, settings.evaporation * 0.75),
+    erosionStrength: settings.erosionStrength,
+    depositionStrength: settings.depositionStrength,
+    sedimentCapacity: settings.sedimentCapacity,
+    hardness: settings.hardness,
+    thermalStrength: settings.thermalStrength,
+    talus: Math.tan((settings.talusAngleDegrees * Math.PI) / 180) * config.unitSize * factor,
+    waterMaskScale: settings.waterMaskScale
+  };
+  const coarseBuffers = createSimulationBuffers(device, coarseInput, coarseWidth * coarseHeight, coarseWidth * coarseHeight);
+  let mapped = false;
+  try {
+    await runSimulationPasses(device, pipeline, coarseBuffers, coarseWidth, coarseHeight, coarseSettings, 0, 0, coarseWidth, coarseHeight, coarseUniforms);
+    await dispatchExportPass(device, pipeline, coarseBuffers, coarseUniforms, 3, finalParity(coarseSettings), coarseWidth, coarseHeight, 0, 0, coarseWidth, coarseHeight);
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(coarseBuffers.outputValues, 0, coarseBuffers.valueReadback, 0, coarseWidth * coarseHeight * Float32Array.BYTES_PER_ELEMENT);
+    device.queue.submit([encoder.finish()]);
+    await coarseBuffers.valueReadback.mapAsync(GPUMapMode.READ);
+    mapped = true;
+    const coarseEroded = new Float32Array(new Float32Array(coarseBuffers.valueReadback.getMappedRange()).slice());
+    return applyCoarseDelta(input, width, height, coarseInput, coarseEroded, coarseWidth, coarseHeight, config.worldHeight);
+  } finally {
+    if (mapped) coarseBuffers.valueReadback.unmap();
+    for (const buffer of Object.values(coarseBuffers)) buffer.destroy();
+  }
+}
+
+function chooseMacroFactor(width: number, height: number): number {
+  const minSide = Math.min(width, height);
+  if (minSide >= 384) return 4;
+  if (minSide >= 160) return 2;
+  return 1;
+}
+
+function downsampleHeightField(input: Float32Array, width: number, height: number, outWidth: number, outHeight: number): Float32Array {
+  const output = new Float32Array(outWidth * outHeight);
+  for (let y = 0; y < outHeight; y += 1) {
+    const minY = Math.floor((y / outHeight) * height);
+    const maxY = Math.max(minY + 1, Math.floor(((y + 1) / outHeight) * height));
+    for (let x = 0; x < outWidth; x += 1) {
+      const minX = Math.floor((x / outWidth) * width);
+      const maxX = Math.max(minX + 1, Math.floor(((x + 1) / outWidth) * width));
+      let total = 0;
+      let count = 0;
+      for (let sy = minY; sy < Math.min(height, maxY); sy += 1) {
+        for (let sx = minX; sx < Math.min(width, maxX); sx += 1) {
+          total += input[sy * width + sx];
+          count += 1;
+        }
+      }
+      output[y * outWidth + x] = count > 0 ? total / count : 0;
+    }
+  }
+  return output;
+}
+
+function applyCoarseDelta(
+  input: Float32Array,
+  width: number,
+  height: number,
+  coarseInput: Float32Array,
+  coarseEroded: Float32Array,
+  coarseWidth: number,
+  coarseHeight: number,
+  worldHeight: number
+): Float32Array {
+  const output = new Float32Array(input.length);
+  for (let y = 0; y < height; y += 1) {
+    const v = coarseHeight === 1 ? 0 : (y / Math.max(1, height - 1)) * (coarseHeight - 1);
+    const y0 = Math.floor(v);
+    const y1 = Math.min(coarseHeight - 1, y0 + 1);
+    const ty = v - y0;
+    for (let x = 0; x < width; x += 1) {
+      const u = coarseWidth === 1 ? 0 : (x / Math.max(1, width - 1)) * (coarseWidth - 1);
+      const x0 = Math.floor(u);
+      const x1 = Math.min(coarseWidth - 1, x0 + 1);
+      const tx = u - x0;
+      const delta00 = coarseEroded[y0 * coarseWidth + x0] - coarseInput[y0 * coarseWidth + x0];
+      const delta10 = coarseEroded[y0 * coarseWidth + x1] - coarseInput[y0 * coarseWidth + x1];
+      const delta01 = coarseEroded[y1 * coarseWidth + x0] - coarseInput[y1 * coarseWidth + x0];
+      const delta11 = coarseEroded[y1 * coarseWidth + x1] - coarseInput[y1 * coarseWidth + x1];
+      const top = delta00 + (delta10 - delta00) * tx;
+      const bottom = delta01 + (delta11 - delta01) * tx;
+      const delta = top + (bottom - top) * ty;
+      output[y * width + x] = Math.max(0, Math.min(worldHeight, input[y * width + x] + delta * 0.85));
+    }
+  }
+  return output;
+}
+
 function createSimulationBuffers(device: GPUDevice, input: Float32Array, sampleCount: number, outputCount: number) {
   const zeroHydro = new Float32Array(sampleCount * 2);
-  const zeroFlux = new Float32Array(sampleCount * 4);
+  const zeroFlux = new Float32Array(sampleCount * 8);
   const zeroScalar = new Float32Array(sampleCount);
   const outBytes = outputCount * Float32Array.BYTES_PER_ELEMENT;
   return {
@@ -654,9 +772,14 @@ fn sedimentAt(i: u32) -> f32 {
   return hydroRead(i).y;
 }
 
-fn fluxAt(x: i32, y: i32) -> vec4<f32> {
+fn fluxCardAt(x: i32, y: i32) -> vec4<f32> {
   if (!inside(x, y)) { return vec4<f32>(0.0); }
-  return flux[idx(x, y)];
+  return flux[idx(x, y) * 2u];
+}
+
+fn fluxDiagAt(x: i32, y: i32) -> vec4<f32> {
+  if (!inside(x, y)) { return vec4<f32>(0.0); }
+  return flux[idx(x, y) * 2u + 1u];
 }
 
 fn neighborSurfaceAt(x: i32, y: i32, fallback: f32) -> f32 {
@@ -668,11 +791,19 @@ fn neighborSurfaceAt(x: i32, y: i32, fallback: f32) -> f32 {
 fn outAmount(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
   if (!inside(fromX, fromY) || !inside(toX, toY)) { return 0.0; }
   let source = idx(fromX, fromY);
-  let f = flux[source];
-  if (toX < fromX) { return f.x; }
-  if (toX > fromX) { return f.y; }
-  if (toY < fromY) { return f.z; }
-  return f.w;
+  let dx = toX - fromX;
+  let dy = toY - fromY;
+  let card = flux[source * 2u];
+  let diag = flux[source * 2u + 1u];
+  if (dx == -1 && dy == 0) { return card.x; }
+  if (dx == 1 && dy == 0) { return card.y; }
+  if (dx == 0 && dy == -1) { return card.z; }
+  if (dx == 0 && dy == 1) { return card.w; }
+  if (dx == -1 && dy == -1) { return diag.x; }
+  if (dx == 1 && dy == -1) { return diag.y; }
+  if (dx == -1 && dy == 1) { return diag.z; }
+  if (dx == 1 && dy == 1) { return diag.w; }
+  return 0.0;
 }
 
 fn sedimentOutAmount(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
@@ -725,12 +856,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d1 = max(0.0, surface - neighborSurfaceAt(x + 1, y, surface));
     let d2 = max(0.0, surface - neighborSurfaceAt(x, y - 1, surface));
     let d3 = max(0.0, surface - neighborSurfaceAt(x, y + 1, surface));
+    let diagonalScale = 0.70710678;
+    let d4 = max(0.0, surface - neighborSurfaceAt(x - 1, y - 1, surface)) * diagonalScale;
+    let d5 = max(0.0, surface - neighborSurfaceAt(x + 1, y - 1, surface)) * diagonalScale;
+    let d6 = max(0.0, surface - neighborSurfaceAt(x - 1, y + 1, surface)) * diagonalScale;
+    let d7 = max(0.0, surface - neighborSurfaceAt(x + 1, y + 1, surface)) * diagonalScale;
     var outFlux = vec4<f32>(d0, d1, d2, d3) * 0.62;
-    let totalFlux = outFlux.x + outFlux.y + outFlux.z + outFlux.w;
+    var outFluxDiag = vec4<f32>(d4, d5, d6, d7) * 0.62;
+    let totalFlux = outFlux.x + outFlux.y + outFlux.z + outFlux.w + outFluxDiag.x + outFluxDiag.y + outFluxDiag.z + outFluxDiag.w;
     if (totalFlux > currentWater && totalFlux > 0.000001) {
-      outFlux *= currentWater / totalFlux;
+      let scale = currentWater / totalFlux;
+      outFlux *= scale;
+      outFluxDiag *= scale;
     }
-    flux[i] = max(outFlux, vec4<f32>(0.0));
+    flux[i * 2u] = max(outFlux, vec4<f32>(0.0));
+    flux[i * 2u + 1u] = max(outFluxDiag, vec4<f32>(0.0));
     return;
   }
 
@@ -746,20 +886,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let currentHydro = hydroRead(i);
   let currentWater = currentHydro.x + rain;
   let currentSediment = currentHydro.y;
-  let f = flux[i];
+  let f = flux[i * 2u];
+  let fd = flux[i * 2u + 1u];
   let out0 = f.x;
   let out1 = f.y;
   let out2 = f.z;
   let out3 = f.w;
-  let leftFlux = fluxAt(x - 1, y);
-  let rightFlux = fluxAt(x + 1, y);
-  let upFlux = fluxAt(x, y - 1);
-  let downFlux = fluxAt(x, y + 1);
-  let incomingWater = leftFlux.y + rightFlux.x + upFlux.w + downFlux.z;
-  let outgoingWater = out0 + out1 + out2 + out3;
+  let out4 = fd.x;
+  let out5 = fd.y;
+  let out6 = fd.z;
+  let out7 = fd.w;
+  let leftFlux = fluxCardAt(x - 1, y);
+  let rightFlux = fluxCardAt(x + 1, y);
+  let upFlux = fluxCardAt(x, y - 1);
+  let downFlux = fluxCardAt(x, y + 1);
+  let upLeftFlux = fluxDiagAt(x - 1, y - 1);
+  let upRightFlux = fluxDiagAt(x + 1, y - 1);
+  let downLeftFlux = fluxDiagAt(x - 1, y + 1);
+  let downRightFlux = fluxDiagAt(x + 1, y + 1);
+  let incomingWater = leftFlux.y + rightFlux.x + upFlux.w + downFlux.z + upLeftFlux.w + upRightFlux.z + downLeftFlux.y + downRightFlux.x;
+  let outgoingWater = out0 + out1 + out2 + out3 + out4 + out5 + out6 + out7;
   var nextWater = max(0.0, currentWater + incomingWater - outgoingWater);
 
-  let incomingSediment = sedimentOutAmount(x - 1, y, x, y) + sedimentOutAmount(x + 1, y, x, y) + sedimentOutAmount(x, y - 1, x, y) + sedimentOutAmount(x, y + 1, x, y);
+  let incomingSediment =
+    sedimentOutAmount(x - 1, y, x, y) +
+    sedimentOutAmount(x + 1, y, x, y) +
+    sedimentOutAmount(x, y - 1, x, y) +
+    sedimentOutAmount(x, y + 1, x, y) +
+    sedimentOutAmount(x - 1, y - 1, x, y) +
+    sedimentOutAmount(x + 1, y - 1, x, y) +
+    sedimentOutAmount(x - 1, y + 1, x, y) +
+    sedimentOutAmount(x + 1, y + 1, x, y);
   let outgoingSediment = currentSediment * min(1.0, outgoingWater / max(0.000001, currentWater));
   var nextSediment = max(0.0, currentSediment + incomingSediment - outgoingSediment);
 
@@ -768,15 +925,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let downhill1 = max(0.0, centerHeight - hRead(idx(min(widthI() - 1, x + 1), y)));
   let downhill2 = max(0.0, centerHeight - hRead(idx(x, max(0, y - 1))));
   let downhill3 = max(0.0, centerHeight - hRead(idx(x, min(heightI() - 1, y + 1))));
-  let weightedDownhill = out0 * downhill0 + out1 * downhill1 + out2 * downhill2 + out3 * downhill3;
+  let downhill4 = max(0.0, centerHeight - hRead(idx(max(0, x - 1), max(0, y - 1)))) * 0.70710678;
+  let downhill5 = max(0.0, centerHeight - hRead(idx(min(widthI() - 1, x + 1), max(0, y - 1)))) * 0.70710678;
+  let downhill6 = max(0.0, centerHeight - hRead(idx(max(0, x - 1), min(heightI() - 1, y + 1)))) * 0.70710678;
+  let downhill7 = max(0.0, centerHeight - hRead(idx(min(widthI() - 1, x + 1), min(heightI() - 1, y + 1)))) * 0.70710678;
+  let weightedDownhill = out0 * downhill0 + out1 * downhill1 + out2 * downhill2 + out3 * downhill3 + out4 * downhill4 + out5 * downhill5 + out6 * downhill6 + out7 * downhill7;
   let transportSlope = weightedDownhill / max(0.000001, outgoingWater);
-  let accumulatedDischarge = flowAccum[i] * 0.035;
+  let accumulatedDischarge = min(flowAccum[i] * 0.004, outgoingWater * 3.0);
   let transportEnergy = (outgoingWater + accumulatedDischarge) * max(0.0, transportSlope);
   let capacity = transportEnergy * max(nextWater, outgoingWater) * p(8) * (1.0 + transportSlope / max(0.001, p(2)));
   var nextHeight = hRead(i);
   if (outgoingWater > 0.00001 && transportSlope > 0.00001 && nextSediment < capacity) {
+    let downstreamBed = (
+      out0 * hRead(idx(max(0, x - 1), y)) +
+      out1 * hRead(idx(min(widthI() - 1, x + 1), y)) +
+      out2 * hRead(idx(x, max(0, y - 1))) +
+      out3 * hRead(idx(x, min(heightI() - 1, y + 1))) +
+      out4 * hRead(idx(max(0, x - 1), max(0, y - 1))) +
+      out5 * hRead(idx(min(widthI() - 1, x + 1), max(0, y - 1))) +
+      out6 * hRead(idx(max(0, x - 1), min(heightI() - 1, y + 1))) +
+      out7 * hRead(idx(min(widthI() - 1, x + 1), min(heightI() - 1, y + 1)))
+    ) / max(0.000001, outgoingWater);
+    let bedLimit = max(0.0, centerHeight - downstreamBed + p(2) * 0.08);
+    let perStepLimit = p(2) * (0.05 + 0.18 * p(6) * (1.0 - p(9)));
     let incision = transportSlope * outgoingWater * p(6) * (1.0 - p(9)) * 0.012;
-    let erode = min(nextHeight, (capacity - nextSediment) * p(6) * (1.0 - p(9)) * 0.18 + incision);
+    let erode = min(min(nextHeight, bedLimit), min(perStepLimit, (capacity - nextSediment) * p(6) * (1.0 - p(9)) * 0.18 + incision));
     nextHeight -= erode;
     nextSediment += erode;
   } else {
