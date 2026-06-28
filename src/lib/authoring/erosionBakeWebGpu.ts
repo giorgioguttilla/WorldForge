@@ -157,7 +157,7 @@ export async function runWebGpuErosionBake(
 export function estimateErosionBakeMemoryMb(settingsInput: ErosionSettingsV1): number {
   const settings = normalizeErosionSettings(settingsInput);
   const side = settings.chunkSize + settings.overlap * 2;
-  const floatBuffers = 6;
+  const floatBuffers = 11;
   const readbackBuffers = 1;
   const tileCacheBudget = 96;
   return ((side * side * Float32Array.BYTES_PER_ELEMENT * (floatBuffers + readbackBuffers)) / 1024 / 1024) + tileCacheBudget;
@@ -195,7 +195,7 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
       let maskReadbackMapped = false;
       try {
         await runSimulationPasses(device, pipeline, buffers, width, height, settings, writeOffsetX, writeOffsetY, writeWidth, writeHeight, uniforms);
-        await dispatchExportPass(device, pipeline, buffers, uniforms, 2, finalParity(settings), writeWidth, writeHeight, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
+        await dispatchExportPass(device, pipeline, buffers, uniforms, 3, finalParity(settings), writeWidth, writeHeight, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
         const encoder = device.createCommandEncoder();
         encoder.copyBufferToBuffer(buffers.outputValues, 0, buffers.valueReadback, 0, outputCount * Float32Array.BYTES_PER_ELEMENT);
         device.queue.submit([encoder.finish()]);
@@ -206,7 +206,7 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
         buffers.valueReadback.unmap();
         heightReadbackMapped = false;
 
-        await dispatchExportPass(device, pipeline, buffers, uniforms, 3, finalParity(settings), writeWidth, writeHeight, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
+        await dispatchExportPass(device, pipeline, buffers, uniforms, 4, finalParity(settings), writeWidth, writeHeight, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
         const maskEncoder = device.createCommandEncoder();
         maskEncoder.copyBufferToBuffer(buffers.outputValues, 0, buffers.valueReadback, 0, outputCount * Float32Array.BYTES_PER_ELEMENT);
         device.queue.submit([maskEncoder.finish()]);
@@ -230,16 +230,17 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
 }
 
 function createSimulationBuffers(device: GPUDevice, input: Float32Array, sampleCount: number, outputCount: number) {
-  const zeroFloats = new Float32Array(sampleCount);
+  const zeroHydro = new Float32Array(sampleCount * 2);
+  const zeroFlux = new Float32Array(sampleCount * 4);
+  const zeroScalar = new Float32Array(sampleCount);
   const outBytes = outputCount * Float32Array.BYTES_PER_ELEMENT;
   return {
     heightA: createBuffer(device, input, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     heightB: createBuffer(device, input, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
-    waterA: createBuffer(device, zeroFloats, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
-    waterB: createBuffer(device, zeroFloats, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
-    sedimentA: createBuffer(device, zeroFloats, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
-    sedimentB: createBuffer(device, zeroFloats, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
-    flowAccum: createBuffer(device, zeroFloats, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    hydroA: createBuffer(device, zeroHydro, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    hydroB: createBuffer(device, zeroHydro, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    flux: createBuffer(device, zeroFlux, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    flowAccum: createBuffer(device, zeroScalar, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
     outputValues: device.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
     valueReadback: device.createBuffer({ size: outBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
   };
@@ -262,11 +263,12 @@ async function runSimulationPasses(
   const passBuffers: GPUBuffer[] = [];
   for (let iteration = 0; iteration < settings.hydraulicIterations; iteration += 1) {
     encodePass(device, encoder, pipeline, buffers, passBuffers, uniforms, 0, iteration % 2, width, height, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
+    encodePass(device, encoder, pipeline, buffers, passBuffers, uniforms, 1, iteration % 2, width, height, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
   }
   const hydraulicParity = settings.hydraulicIterations % 2;
   if (settings.thermalEnabled) {
     for (let iteration = 0; iteration < settings.thermalIterations; iteration += 1) {
-      encodePass(device, encoder, pipeline, buffers, passBuffers, uniforms, 1, (hydraulicParity + iteration) % 2, width, height, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
+      encodePass(device, encoder, pipeline, buffers, passBuffers, uniforms, 2, (hydraulicParity + iteration) % 2, width, height, writeOffsetX, writeOffsetY, writeWidth, writeHeight);
     }
   }
   device.queue.submit([encoder.finish()]);
@@ -299,12 +301,11 @@ function encodePass(
       { binding: 0, resource: { buffer: params } },
       { binding: 1, resource: { buffer: buffers.heightA } },
       { binding: 2, resource: { buffer: buffers.heightB } },
-      { binding: 3, resource: { buffer: buffers.waterA } },
-      { binding: 4, resource: { buffer: buffers.waterB } },
-      { binding: 5, resource: { buffer: buffers.sedimentA } },
-      { binding: 6, resource: { buffer: buffers.sedimentB } },
-      { binding: 7, resource: { buffer: buffers.flowAccum } },
-      { binding: 8, resource: { buffer: buffers.outputValues } }
+      { binding: 3, resource: { buffer: buffers.hydroA } },
+      { binding: 4, resource: { buffer: buffers.hydroB } },
+      { binding: 5, resource: { buffer: buffers.flux } },
+      { binding: 6, resource: { buffer: buffers.flowAccum } },
+      { binding: 7, resource: { buffer: buffers.outputValues } }
     ]
   });
   const pass = encoder.beginComputePass();
@@ -587,12 +588,11 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read_write> heightA: array<f32>;
 @group(0) @binding(2) var<storage, read_write> heightB: array<f32>;
-@group(0) @binding(3) var<storage, read_write> waterA: array<f32>;
-@group(0) @binding(4) var<storage, read_write> waterB: array<f32>;
-@group(0) @binding(5) var<storage, read_write> sedimentA: array<f32>;
-@group(0) @binding(6) var<storage, read_write> sedimentB: array<f32>;
-@group(0) @binding(7) var<storage, read_write> flowAccum: array<f32>;
-@group(0) @binding(8) var<storage, read_write> outputValues: array<f32>;
+@group(0) @binding(3) var<storage, read_write> hydroA: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read_write> hydroB: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> flux: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> flowAccum: array<f32>;
+@group(0) @binding(7) var<storage, read_write> outputValues: array<f32>;
 
 fn p(i: u32) -> f32 {
   switch (i) {
@@ -625,7 +625,7 @@ fn inside(x: i32, y: i32) -> bool { return x >= 0 && y >= 0 && x < widthI() && y
 fn surfaceAt(x: i32, y: i32, fallback: f32) -> f32 {
   if (!inside(x, y)) { return fallback; }
   let i = idx(x, y);
-  return hRead(i) + wRead(i);
+  return hRead(i) + waterAt(i);
 }
 
 fn hRead(i: u32) -> f32 {
@@ -633,48 +633,53 @@ fn hRead(i: u32) -> f32 {
   return heightB[i];
 }
 
-fn wRead(i: u32) -> f32 {
-  if (i32(p(14)) == 0) { return waterA[i]; }
-  return waterB[i];
-}
-
-fn sRead(i: u32) -> f32 {
-  if (i32(p(14)) == 0) { return sedimentA[i]; }
-  return sedimentB[i];
+fn hydroRead(i: u32) -> vec2<f32> {
+  if (i32(p(14)) == 0) { return hydroA[i]; }
+  return hydroB[i];
 }
 
 fn hWrite(i: u32, v: f32) {
   if (i32(p(14)) == 0) { heightB[i] = v; } else { heightA[i] = v; }
 }
 
-fn wWrite(i: u32, v: f32) {
-  if (i32(p(14)) == 0) { waterB[i] = v; } else { waterA[i] = v; }
+fn hydroWrite(i: u32, v: vec2<f32>) {
+  if (i32(p(14)) == 0) { hydroB[i] = v; } else { hydroA[i] = v; }
 }
 
-fn sWrite(i: u32, v: f32) {
-  if (i32(p(14)) == 0) { sedimentB[i] = v; } else { sedimentA[i] = v; }
+fn waterAt(i: u32) -> f32 {
+  return hydroRead(i).x;
+}
+
+fn sedimentAt(i: u32) -> f32 {
+  return hydroRead(i).y;
+}
+
+fn fluxAt(x: i32, y: i32) -> vec4<f32> {
+  if (!inside(x, y)) { return vec4<f32>(0.0); }
+  return flux[idx(x, y)];
+}
+
+fn neighborSurfaceAt(x: i32, y: i32, fallback: f32) -> f32 {
+  if (!inside(x, y)) { return fallback; }
+  let i = idx(x, y);
+  return hRead(i) + waterAt(i);
 }
 
 fn outAmount(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
   if (!inside(fromX, fromY) || !inside(toX, toY)) { return 0.0; }
   let source = idx(fromX, fromY);
-  let to = idx(toX, toY);
-  let surface = hRead(source) + wRead(source);
-  let d0 = max(0.0, surface - surfaceAt(fromX - 1, fromY, surface));
-  let d1 = max(0.0, surface - surfaceAt(fromX + 1, fromY, surface));
-  let d2 = max(0.0, surface - surfaceAt(fromX, fromY - 1, surface));
-  let d3 = max(0.0, surface - surfaceAt(fromX, fromY + 1, surface));
-  let total = d0 + d1 + d2 + d3;
-  if (total <= 0.000001) { return 0.0; }
-  let descent = max(0.0, surface - (hRead(to) + wRead(to)));
-  let movable = min(wRead(source), total * 0.48);
-  return movable * descent / total;
+  let f = flux[source];
+  if (toX < fromX) { return f.x; }
+  if (toX > fromX) { return f.y; }
+  if (toY < fromY) { return f.z; }
+  return f.w;
 }
 
 fn sedimentOutAmount(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
   if (!inside(fromX, fromY) || !inside(toX, toY)) { return 0.0; }
-  let water = max(0.000001, wRead(idx(fromX, fromY)));
-  let sediment = sRead(idx(fromX, fromY));
+  let source = idx(fromX, fromY);
+  let water = max(0.000001, waterAt(source));
+  let sediment = sedimentAt(source);
   return sediment * min(1.0, outAmount(fromX, fromY, toX, toY) / water);
 }
 
@@ -684,7 +689,7 @@ fn thermalGive(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
   let to = idx(toX, toY);
   let slope = hRead(source) - hRead(to);
   if (slope <= p(11)) { return 0.0; }
-  return (slope - p(11)) * p(10) * 0.125;
+  return (slope - p(11)) * p(10) * 0.16;
 }
 
 @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
@@ -693,13 +698,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let y = i32(gid.y);
   let passType = i32(p(13));
 
-  if (passType == 2 || passType == 3) {
+  if (passType == 3 || passType == 4) {
     if (x >= i32(p(17)) || y >= i32(p(18))) { return; }
     let srcX = x + i32(p(15));
     let srcY = y + i32(p(16));
     let source = idx(srcX, srcY);
     let out = u32(y * i32(p(17)) + x);
-    if (passType == 2) {
+    if (passType == 3) {
       outputValues[out] = clamp(hRead(source), 0.0, p(3));
       return;
     }
@@ -712,28 +717,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (!inside(x, y)) { return; }
   let i = idx(x, y);
 
-  if (passType == 1) {
+  if (passType == 0) {
+    let rain = p(4) * p(2) * 0.05;
+    let currentWater = waterAt(i) + rain;
+    let surface = hRead(i) + currentWater;
+    let d0 = max(0.0, surface - neighborSurfaceAt(x - 1, y, surface));
+    let d1 = max(0.0, surface - neighborSurfaceAt(x + 1, y, surface));
+    let d2 = max(0.0, surface - neighborSurfaceAt(x, y - 1, surface));
+    let d3 = max(0.0, surface - neighborSurfaceAt(x, y + 1, surface));
+    var outFlux = vec4<f32>(d0, d1, d2, d3) * 0.62;
+    let totalFlux = outFlux.x + outFlux.y + outFlux.z + outFlux.w;
+    if (totalFlux > currentWater && totalFlux > 0.000001) {
+      outFlux *= currentWater / totalFlux;
+    }
+    flux[i] = max(outFlux, vec4<f32>(0.0));
+    return;
+  }
+
+  if (passType == 2) {
     let outgoing = thermalGive(x, y, x - 1, y) + thermalGive(x, y, x + 1, y) + thermalGive(x, y, x, y - 1) + thermalGive(x, y, x, y + 1);
     let incoming = thermalGive(x - 1, y, x, y) + thermalGive(x + 1, y, x, y) + thermalGive(x, y - 1, x, y) + thermalGive(x, y + 1, x, y);
     hWrite(i, clamp(hRead(i) + incoming - outgoing, 0.0, p(3)));
-    wWrite(i, wRead(i));
-    sWrite(i, sRead(i));
+    hydroWrite(i, hydroRead(i));
     return;
   }
 
   let rain = p(4) * p(2) * 0.05;
-  let currentWater = wRead(i) + rain;
-  let out0 = outAmount(x, y, x - 1, y);
-  let out1 = outAmount(x, y, x + 1, y);
-  let out2 = outAmount(x, y, x, y - 1);
-  let out3 = outAmount(x, y, x, y + 1);
-  let incomingWater = outAmount(x - 1, y, x, y) + outAmount(x + 1, y, x, y) + outAmount(x, y - 1, x, y) + outAmount(x, y + 1, x, y);
+  let currentHydro = hydroRead(i);
+  let currentWater = currentHydro.x + rain;
+  let currentSediment = currentHydro.y;
+  let f = flux[i];
+  let out0 = f.x;
+  let out1 = f.y;
+  let out2 = f.z;
+  let out3 = f.w;
+  let leftFlux = fluxAt(x - 1, y);
+  let rightFlux = fluxAt(x + 1, y);
+  let upFlux = fluxAt(x, y - 1);
+  let downFlux = fluxAt(x, y + 1);
+  let incomingWater = leftFlux.y + rightFlux.x + upFlux.w + downFlux.z;
   let outgoingWater = out0 + out1 + out2 + out3;
   var nextWater = max(0.0, currentWater + incomingWater - outgoingWater);
 
   let incomingSediment = sedimentOutAmount(x - 1, y, x, y) + sedimentOutAmount(x + 1, y, x, y) + sedimentOutAmount(x, y - 1, x, y) + sedimentOutAmount(x, y + 1, x, y);
-  let outgoingSediment = sedimentOutAmount(x, y, x - 1, y) + sedimentOutAmount(x, y, x + 1, y) + sedimentOutAmount(x, y, x, y - 1) + sedimentOutAmount(x, y, x, y + 1);
-  var nextSediment = max(0.0, sRead(i) + incomingSediment - outgoingSediment);
+  let outgoingSediment = currentSediment * min(1.0, outgoingWater / max(0.000001, currentWater));
+  var nextSediment = max(0.0, currentSediment + incomingSediment - outgoingSediment);
 
   let centerHeight = hRead(i);
   let downhill0 = max(0.0, centerHeight - hRead(idx(max(0, x - 1), y)));
@@ -742,8 +770,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let downhill3 = max(0.0, centerHeight - hRead(idx(x, min(heightI() - 1, y + 1))));
   let weightedDownhill = out0 * downhill0 + out1 * downhill1 + out2 * downhill2 + out3 * downhill3;
   let transportSlope = weightedDownhill / max(0.000001, outgoingWater);
-  let transportEnergy = outgoingWater * max(0.0, transportSlope);
-  let capacity = transportEnergy * nextWater * p(8) * (1.0 + transportSlope / max(0.001, p(2)));
+  let accumulatedDischarge = flowAccum[i] * 0.035;
+  let transportEnergy = (outgoingWater + accumulatedDischarge) * max(0.0, transportSlope);
+  let capacity = transportEnergy * max(nextWater, outgoingWater) * p(8) * (1.0 + transportSlope / max(0.001, p(2)));
   var nextHeight = hRead(i);
   if (outgoingWater > 0.00001 && transportSlope > 0.00001 && nextSediment < capacity) {
     let incision = transportSlope * outgoingWater * p(6) * (1.0 - p(9)) * 0.012;
@@ -759,8 +788,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   nextWater = max(0.0, nextWater * (1.0 - p(5) * 0.08));
   hWrite(i, clamp(nextHeight, 0.0, p(3)));
-  wWrite(i, nextWater);
-  sWrite(i, max(0.0, nextSediment));
+  hydroWrite(i, vec2<f32>(nextWater, max(0.0, nextSediment)));
   flowAccum[i] = flowAccum[i] + nextWater + outgoingWater + incomingWater;
 }
 `;
