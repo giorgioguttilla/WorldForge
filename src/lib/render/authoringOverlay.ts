@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { AnchorV1, AuthoringDocumentV1, PrimitiveV1, RiverAssetV1 } from '../authoring/authoringDocument';
+import type { AnchorV1, AuthoringDocumentV1, LakeAssetV1, PrimitiveV1, RiverAssetV1 } from '../authoring/authoringDocument';
 import { DEFAULT_SPLINE_SMOOTHNESS, sampleSplineAnchors, type SplinePoint2D } from '../authoring/spline';
 
 export interface AuthoringSelection {
@@ -71,6 +71,9 @@ export class AuthoringOverlay {
     this.group.position.y = this.waterLevel + 2;
     for (const river of this.document?.rivers ?? []) {
       this.addRiver(river);
+    }
+    for (const lake of this.document?.lakes ?? []) {
+      this.addLake(lake);
     }
     for (const primitive of this.document?.primitives ?? []) {
       if (!primitive.enabled) continue;
@@ -167,6 +170,55 @@ export class AuthoringOverlay {
 
   private riverPointY(elevation: number): number {
     return elevation - (this.waterLevel + 2) + 3;
+  }
+
+  private addLake(lake: LakeAssetV1): void {
+    if (lake.points.length < 3) return;
+    const shape = new THREE.Shape(lake.points.map((point) => new THREE.Vector2(point.x, point.z)));
+    const geometry = new THREE.ShapeGeometry(shape);
+    geometry.rotateX(Math.PI / 2);
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x5ecfff,
+      transparent: true,
+      opacity: 0.26,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.y = this.riverPointY(lake.waterElevation) - 0.18;
+    mesh.renderOrder = 17;
+    this.track(mesh);
+
+    const outline = lake.points.map((point) => new THREE.Vector3(point.x, this.riverPointY(lake.waterElevation) - 0.12, point.z));
+    outline.push(outline[0].clone());
+    const outlineGeometry = new THREE.BufferGeometry().setFromPoints(outline);
+    const outlineMaterial = new THREE.LineBasicMaterial({
+      color: 0xb6ecff,
+      transparent: true,
+      opacity: 0.72,
+      depthTest: false,
+      depthWrite: false
+    });
+    const line = new THREE.Line(outlineGeometry, outlineMaterial);
+    line.renderOrder = 18;
+    this.track(line);
+
+    if (lake.outlet) {
+      const outletGeometry = new THREE.CircleGeometry(20, 14);
+      outletGeometry.rotateX(-Math.PI / 2);
+      const outletMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.45,
+        depthTest: false,
+        depthWrite: false
+      });
+      const outlet = new THREE.Mesh(outletGeometry, outletMaterial);
+      outlet.position.set(lake.outlet.x, this.riverPointY(lake.waterElevation), lake.outlet.z);
+      outlet.renderOrder = 19;
+      this.track(outlet);
+    }
   }
 
   private addFill(anchors: AnchorV1[], color: number, smoothness: number): void {

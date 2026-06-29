@@ -57,10 +57,27 @@ export interface RiverAssetV1 {
   id: string;
   name: string;
   generatedAt: string;
-  source: 'erosion-water-mask-v1';
+  source: 'erosion-water-mask-v1' | 'heightmap-flow-v2';
   maxDischarge: number;
   meanSlope: number;
   points: RiverPointV1[];
+}
+
+export interface LakePointV1 {
+  x: number;
+  z: number;
+}
+
+export interface LakeAssetV1 {
+  id: string;
+  name: string;
+  generatedAt: string;
+  source: 'erosion-depression-v1' | 'heightmap-depression-v2';
+  waterElevation: number;
+  area: number;
+  maxDepth: number;
+  points: LakePointV1[];
+  outlet?: LakePointV1;
 }
 
 export interface BakeMetadataV1 {
@@ -115,11 +132,14 @@ export interface AuthoringDocumentV1 {
   fieldLibrary: NoiseFieldGraphV1[];
   primitives: PrimitiveV1[];
   rivers: RiverAssetV1[];
+  lakes: LakeAssetV1[];
   erosion: ErosionSettingsV1;
   lastBake?: BakeMetadataV1;
 }
 
 const LAND_MODES = new Set<LandformModeV1>(['land', 'water', 'plateau']);
+const RIVER_SOURCES = new Set<RiverAssetV1['source']>(['erosion-water-mask-v1', 'heightmap-flow-v2']);
+const LAKE_SOURCES = new Set<LakeAssetV1['source']>(['erosion-depression-v1', 'heightmap-depression-v2']);
 
 export const EROSION_PRESETS: Record<ErosionPresetV1, ErosionSettingsV1> = {
   light: {
@@ -207,6 +227,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
     fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: [],
     rivers: [],
+    lakes: [],
     erosion: { ...EROSION_PRESETS.medium, enabled: false }
   };
 }
@@ -225,6 +246,7 @@ export function normalizeAuthoringDocument(value: unknown, worldId: string): Aut
     fieldLibrary: mergeDefaultFields(normalizedFields),
     primitives,
     rivers: Array.isArray(value.rivers) ? value.rivers.map(normalizeRiver).filter((river): river is RiverAssetV1 => Boolean(river)) : [],
+    lakes: Array.isArray(value.lakes) ? value.lakes.map(normalizeLake).filter((lake): lake is LakeAssetV1 => Boolean(lake)) : [],
     erosion: normalizeErosionSettings(value.erosion)
   };
   const lastBake = normalizeBakeMetadata(value.lastBake);
@@ -362,7 +384,7 @@ function normalizeRiver(value: unknown): RiverAssetV1 | null {
     id: typeof value.id === 'string' && value.id ? value.id : crypto.randomUUID(),
     name: typeof value.name === 'string' && value.name.trim() ? value.name : 'River',
     generatedAt: typeof value.generatedAt === 'string' ? value.generatedAt : new Date().toISOString(),
-    source: 'erosion-water-mask-v1',
+    source: RIVER_SOURCES.has(value.source as RiverAssetV1['source']) ? value.source as RiverAssetV1['source'] : 'heightmap-flow-v2',
     maxDischarge: Math.max(0, finiteNumber(value.maxDischarge, 0)),
     meanSlope: Math.max(0, finiteNumber(value.meanSlope, 0)),
     points
@@ -381,6 +403,34 @@ function normalizeRiverPoint(value: unknown): RiverPointV1 | null {
     discharge: Math.max(0, finiteNumber(value.discharge, 0)),
     width: Math.max(0, finiteNumber(value.width, 0))
   };
+}
+
+function normalizeLake(value: unknown): LakeAssetV1 | null {
+  if (!isRecord(value)) return null;
+  const points = Array.isArray(value.points)
+    ? value.points.map(normalizeLakePoint).filter((point): point is LakePointV1 => Boolean(point))
+    : [];
+  if (points.length < 3) return null;
+  const outlet = normalizeLakePoint(value.outlet);
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : crypto.randomUUID(),
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : 'Lake',
+    generatedAt: typeof value.generatedAt === 'string' ? value.generatedAt : new Date().toISOString(),
+    source: LAKE_SOURCES.has(value.source as LakeAssetV1['source']) ? value.source as LakeAssetV1['source'] : 'heightmap-depression-v2',
+    waterElevation: finiteNumber(value.waterElevation, 0),
+    area: Math.max(0, finiteNumber(value.area, 0)),
+    maxDepth: Math.max(0, finiteNumber(value.maxDepth, 0)),
+    points,
+    ...(outlet ? { outlet } : {})
+  };
+}
+
+function normalizeLakePoint(value: unknown): LakePointV1 | null {
+  if (!isRecord(value)) return null;
+  const x = finiteNumber(value.x, Number.NaN);
+  const z = finiteNumber(value.z, Number.NaN);
+  if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+  return { x, z };
 }
 
 function normalizeBakeMetadata(value: unknown): BakeMetadataV1 | undefined {

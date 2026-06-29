@@ -1,7 +1,7 @@
 import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
-import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1, RiverAssetV1 } from './authoringDocument';
+import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1, LakeAssetV1, RiverAssetV1 } from './authoringDocument';
 import {
   clamp,
   elevationToR16,
@@ -16,7 +16,7 @@ import {
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
-import { extractRiverAssets } from './riverExtraction';
+import { extractHydrologyAssets } from './riverExtraction';
 
 export interface BakeProgress {
   phase: 'baking' | 'eroding' | 'extracting-rivers' | 'building-lod';
@@ -46,6 +46,7 @@ export interface StructuralBakeResult {
   dirtyTiles: TileKey[];
   lodTileCount: number;
   rivers: RiverAssetV1[];
+  lakes: LakeAssetV1[];
 }
 
 export interface StructuralBakeOptions {
@@ -68,6 +69,7 @@ interface LodPassResult extends BakePassResult {
 
 interface RiverExtractionPassResult extends BakePassResult {
   rivers: RiverAssetV1[];
+  lakes: LakeAssetV1[];
 }
 
 interface BakeWorkerResponse {
@@ -154,7 +156,8 @@ export async function bakeStructuralAuthoring(
     },
     dirtyTiles: lodSourceTiles,
     lodTileCount: lod.lodTileCount,
-    rivers: riverExtraction.rivers
+    rivers: riverExtraction.rivers,
+    lakes: riverExtraction.lakes
   };
 }
 
@@ -444,17 +447,14 @@ async function runErosionPass(
 
 async function runRiverExtractionPass(
   config: WorldConfig,
-  document: AuthoringDocumentV1,
+  _document: AuthoringDocumentV1,
   io: BakeTileIO,
   onProgress?: (progress: BakeProgress) => void
 ): Promise<RiverExtractionPassResult> {
-  if (!document.erosion?.enabled || !document.erosion.outputWaterMask || !io.readWaterMaskTile) {
-    return { id: 'river-extraction-v1', rivers: [] };
-  }
-  onProgress?.({ phase: 'extracting-rivers', current: 0, total: 1, label: 'Extracting river assets from erosion flow' });
-  const rivers = await extractRiverAssets(config, io);
-  onProgress?.({ phase: 'extracting-rivers', current: 1, total: 1, label: `Extracted ${rivers.length} river assets` });
-  return { id: 'river-extraction-v1', rivers };
+  onProgress?.({ phase: 'extracting-rivers', current: 0, total: 1, label: 'Extracting hydrology assets from heightmap flow' });
+  const hydrology = await extractHydrologyAssets(config, io);
+  onProgress?.({ phase: 'extracting-rivers', current: 1, total: 1, label: `Extracted ${hydrology.rivers.length} rivers and ${hydrology.lakes.length} lakes` });
+  return { id: 'river-extraction-v1', ...hydrology };
 }
 
 async function runLodRebuildPass(

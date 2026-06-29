@@ -1,6 +1,6 @@
 import type { TileKey } from '../heightmap/tileKey';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
-import type { RiverAssetV1, RiverPointV1 } from './authoringDocument';
+import type { LakeAssetV1, LakePointV1, RiverAssetV1, RiverPointV1 } from './authoringDocument';
 
 export interface RiverExtractionIO {
   readTile(key: TileKey): Promise<Uint16Array>;
@@ -13,52 +13,84 @@ interface CoarseCell {
   samples: number;
 }
 
+interface CoarseGrid {
+  side: number;
+  stride: number;
+  cells: CoarseCell[];
+  maxWater: number;
+}
+
+interface FlowNetwork {
+  receiver: Int32Array;
+  accumulation: Float32Array;
+  upstreamRiverCounts: Uint16Array;
+  riverMask: Uint8Array;
+  maxAccumulation: number;
+}
+
 interface TraceCell {
   x: number;
   y: number;
 }
 
+export interface HydrologyAssetsV1 {
+  rivers: RiverAssetV1[];
+  lakes: LakeAssetV1[];
+}
+
 const TARGET_COARSE_SIDE = 512;
-const MAX_RIVERS = 72;
-const MAX_TRACE_STEPS = 420;
-const MIN_TRACE_POINTS = 10;
-const SOURCE_BIN_COUNT = 8;
+const MAX_RIVERS = 120;
+const MAX_LAKES = 48;
+const MAX_TRACE_STEPS = 800;
+const MIN_TRACE_POINTS = 8;
 
 export async function extractRiverAssets(
   config: WorldConfig,
   io: RiverExtractionIO,
   generatedAt = new Date().toISOString()
 ): Promise<RiverAssetV1[]> {
-  if (!io.readWaterMaskTile) return [];
+  return (await extractHydrologyAssets(config, io, generatedAt)).rivers;
+}
+
+export async function extractHydrologyAssets(
+  config: WorldConfig,
+  io: RiverExtractionIO,
+  generatedAt = new Date().toISOString()
+): Promise<HydrologyAssetsV1> {
   const coarse = await buildCoarseDrainageGrid(config, io);
-  const candidates = selectRiverSources(coarse);
+  if (!coarse.cells.some((cell) => cell.samples > 0)) return { rivers: [], lakes: [] };
+
+  const network = buildFlowNetwork(coarse);
+  const lakes = extractLakeAssets(config, coarse, network, generatedAt);
+  const sources = selectNetworkSources(coarse, network);
   const claimed = new Uint8Array(coarse.side * coarse.side);
   const rivers: RiverAssetV1[] = [];
 
-  for (const candidate of candidates) {
+  for (const source of sources) {
     if (rivers.length >= MAX_RIVERS) break;
-    if (isClaimedNear(claimed, coarse.side, candidate.x, candidate.y, 3)) continue;
-    const trace = traceDownhill(coarse, candidate.x, candidate.y);
+    const sourceIndex = source.y * coarse.side + source.x;
+    if (claimed[sourceIndex]) continue;
+    const trace = traceRiverNetwork(coarse, network, source.x, source.y, claimed);
     if (trace.length < MIN_TRACE_POINTS) continue;
-    markClaimed(claimed, coarse.side, trace, 2);
+    markTraceClaimed(claimed, coarse.side, trace);
     const simplified = simplifyTrace(trace, coarse);
     if (simplified.length < 2) continue;
-    const points = simplified.map((cell) => riverPointFromCell(config, coarse, cell));
+    const points = simplified.map((cell) => riverPointFromCell(config, coarse, network, cell));
     rivers.push({
       id: crypto.randomUUID(),
       name: `River ${rivers.length + 1}`,
       generatedAt,
-      source: 'erosion-water-mask-v1',
+      source: 'heightmap-flow-v2',
       maxDischarge: Math.max(...points.map((point) => point.discharge)),
       meanSlope: meanTraceSlope(simplified, coarse),
       points
     });
   }
 
-  return rivers;
+  return { rivers, lakes };
 }
 
-async function buildCoarseDrainageGrid(config: WorldConfig, io: RiverExtractionIO): Promise<{ side: number; stride: number; cells: CoarseCell[]; maxWater: number }> {
+async function buildCoarseDrainageGrid(config: WorldConfig, io: RiverExtractionIO): Promise<CoarseGrid> {
   const fullSide = config.tileSize * config.tilesPerSide;
   const side = Math.max(16, Math.min(TARGET_COARSE_SIDE, fullSide));
   const stride = Math.max(1, Math.ceil(fullSide / side));
@@ -69,7 +101,6 @@ async function buildCoarseDrainageGrid(config: WorldConfig, io: RiverExtractionI
     for (let tileX = 0; tileX < config.tilesPerSide; tileX += 1) {
       const key = { x: tileX, y: tileY, d: 0 };
       const mask = await io.readWaterMaskTile?.(key);
-      if (!mask) continue;
       const heights = await io.readTile(key);
       const offsetX = tileX * config.tileSize;
       const offsetY = tileY * config.tileSize;
@@ -84,7 +115,7 @@ async function buildCoarseDrainageGrid(config: WorldConfig, io: RiverExtractionI
           const sampleIndex = y * config.tileSize + x;
           const coarseIndex = coarseY * side + coarseX;
           const cell = cells[coarseIndex];
-          const water = mask[sampleIndex];
+          const water = mask?.[sampleIndex] ?? 0;
           cell.height += r16ToElevation(heights[sampleIndex], config.worldHeight);
           cell.water = Math.max(cell.water, water);
           cell.samples += 1;
@@ -101,74 +132,49 @@ async function buildCoarseDrainageGrid(config: WorldConfig, io: RiverExtractionI
   return { side, stride, cells, maxWater };
 }
 
-function selectRiverSources(coarse: { side: number; cells: CoarseCell[]; maxWater: number }): TraceCell[] {
-  if (coarse.maxWater <= 0) return [];
-  const waterValues = coarse.cells.map((cell) => cell.water).filter((value) => value > 0).sort((a, b) => a - b);
-  if (waterValues.length === 0) return [];
-  const threshold = Math.max(coarse.maxWater * 0.08, 768);
-  const candidates: Array<TraceCell & { water: number }> = [];
+function buildFlowNetwork(coarse: CoarseGrid): FlowNetwork {
+  const count = coarse.side * coarse.side;
+  const receiver = new Int32Array(count).fill(-1);
+  const accumulation = new Float32Array(count);
+  const order: number[] = [];
 
-  for (let y = 1; y < coarse.side - 1; y += 1) {
-    for (let x = 1; x < coarse.side - 1; x += 1) {
-      const water = cellAt(coarse, x, y).water;
-      if (cellAt(coarse, x, y).samples === 0) continue;
-      if (water < threshold) continue;
-      if (!isLocalWaterPeak(coarse, x, y, water)) continue;
-      candidates.push({ x, y, water });
-    }
+  for (let index = 0; index < count; index += 1) {
+    const cell = coarse.cells[index];
+    if (cell.samples === 0) continue;
+    const x = index % coarse.side;
+    const y = Math.floor(index / coarse.side);
+    receiver[index] = nextDownhillIndex(coarse, x, y);
+    accumulation[index] = 1 + Math.sqrt(cell.water / 65535) * 1.5;
+    order.push(index);
   }
 
-  return spatiallyBalanceSources(candidates, coarse.side).slice(0, MAX_RIVERS * 8);
+  order.sort((a, b) => coarse.cells[b].height - coarse.cells[a].height);
+  for (const index of order) {
+    const next = receiver[index];
+    if (next >= 0) accumulation[next] += accumulation[index];
+  }
+
+  let maxAccumulation = 0;
+  for (let index = 0; index < count; index += 1) {
+    if (coarse.cells[index].samples === 0) continue;
+    maxAccumulation = Math.max(maxAccumulation, accumulation[index]);
+  }
+
+  const riverMask = buildRiverMask(coarse, accumulation, maxAccumulation);
+  const upstreamRiverCounts = new Uint16Array(count);
+  for (let index = 0; index < count; index += 1) {
+    if (!riverMask[index]) continue;
+    const next = receiver[index];
+    if (next >= 0 && riverMask[next]) upstreamRiverCounts[next] += 1;
+  }
+
+  return { receiver, accumulation, upstreamRiverCounts, riverMask, maxAccumulation };
 }
 
-function spatiallyBalanceSources(candidates: Array<TraceCell & { water: number }>, side: number): TraceCell[] {
-  const bins = Array.from({ length: SOURCE_BIN_COUNT * SOURCE_BIN_COUNT }, () => [] as Array<TraceCell & { water: number }>);
-  for (const candidate of candidates) {
-    const binX = Math.min(SOURCE_BIN_COUNT - 1, Math.floor((candidate.x / side) * SOURCE_BIN_COUNT));
-    const binY = Math.min(SOURCE_BIN_COUNT - 1, Math.floor((candidate.y / side) * SOURCE_BIN_COUNT));
-    bins[binY * SOURCE_BIN_COUNT + binX].push(candidate);
-  }
-  for (const bin of bins) bin.sort((a, b) => b.water - a.water);
-
-  const balanced: Array<TraceCell & { water: number }> = [];
-  const maxDepth = Math.max(0, ...bins.map((bin) => bin.length));
-  for (let depth = 0; depth < maxDepth; depth += 1) {
-    for (const bin of bins) {
-      const candidate = bin[depth];
-      if (candidate) balanced.push(candidate);
-    }
-  }
-
-  return balanced.map(({ x, y }) => ({ x, y }));
-}
-
-function traceDownhill(coarse: { side: number; cells: CoarseCell[] }, startX: number, startY: number): TraceCell[] {
-  const trace: TraceCell[] = [];
-  const visited = new Set<string>();
-  let x = startX;
-  let y = startY;
-
-  for (let step = 0; step < MAX_TRACE_STEPS; step += 1) {
-    const key = `${x}:${y}`;
-    if (visited.has(key)) break;
-    visited.add(key);
-    trace.push({ x, y });
-    const next = nextDownhillCell(coarse, x, y);
-    if (!next) break;
-    x = next.x;
-    y = next.y;
-    if (x <= 0 || y <= 0 || x >= coarse.side - 1 || y >= coarse.side - 1) {
-      trace.push({ x, y });
-      break;
-    }
-  }
-
-  return trace;
-}
-
-function nextDownhillCell(coarse: { side: number; cells: CoarseCell[] }, x: number, y: number): TraceCell | null {
+function nextDownhillIndex(coarse: CoarseGrid, x: number, y: number): number {
   const center = cellAt(coarse, x, y);
-  let best: (TraceCell & { score: number }) | null = null;
+  let bestIndex = -1;
+  let bestScore = 0;
   for (let dy = -1; dy <= 1; dy += 1) {
     for (let dx = -1; dx <= 1; dx += 1) {
       if (dx === 0 && dy === 0) continue;
@@ -179,15 +185,230 @@ function nextDownhillCell(coarse: { side: number; cells: CoarseCell[] }, x: numb
       if (neighbor.samples === 0) continue;
       const drop = center.height - neighbor.height;
       if (drop <= 0) continue;
-      const diagonal = dx !== 0 && dy !== 0 ? 0.70710678 : 1;
-      const score = drop * diagonal + (neighbor.water / 65535) * 0.02;
-      if (!best || score > best.score) best = { x: nx, y: ny, score };
+      const distanceScale = dx !== 0 && dy !== 0 ? 0.70710678 : 1;
+      const score = drop * distanceScale + (neighbor.water / 65535) * 0.02;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = ny * coarse.side + nx;
+      }
     }
   }
-  return best ? { x: best.x, y: best.y } : null;
+  return bestIndex;
 }
 
-function simplifyTrace(trace: TraceCell[], coarse: { side: number; cells: CoarseCell[] }): TraceCell[] {
+function buildRiverMask(coarse: CoarseGrid, accumulation: Float32Array, maxAccumulation: number): Uint8Array {
+  const riverMask = new Uint8Array(coarse.side * coarse.side);
+  if (maxAccumulation <= 0) return riverMask;
+  const scores: number[] = [];
+  for (let index = 0; index < coarse.cells.length; index += 1) {
+    const cell = coarse.cells[index];
+    if (cell.samples === 0) continue;
+    scores.push(riverScore(coarse, accumulation, index));
+  }
+  scores.sort((a, b) => a - b);
+  const percentile = scores[Math.floor(scores.length * 0.9)] ?? 0;
+  const threshold = Math.max(12, percentile, maxAccumulation * 0.012);
+
+  for (let index = 0; index < coarse.cells.length; index += 1) {
+    const cell = coarse.cells[index];
+    if (cell.samples === 0) continue;
+    if (riverScore(coarse, accumulation, index) >= threshold) riverMask[index] = 1;
+  }
+  return riverMask;
+}
+
+function riverScore(coarse: CoarseGrid, accumulation: Float32Array, index: number): number {
+  const wetness = coarse.maxWater > 0 ? Math.sqrt(coarse.cells[index].water / coarse.maxWater) : 0;
+  return accumulation[index] * (0.9 + wetness * 0.25);
+}
+
+function selectNetworkSources(coarse: CoarseGrid, network: FlowNetwork): TraceCell[] {
+  const sources: Array<TraceCell & { score: number }> = [];
+  for (let index = 0; index < network.riverMask.length; index += 1) {
+    if (!network.riverMask[index]) continue;
+    if (network.upstreamRiverCounts[index] > 0) continue;
+    const x = index % coarse.side;
+    const y = Math.floor(index / coarse.side);
+    sources.push({ x, y, score: network.accumulation[index] });
+  }
+  return sources
+    .sort((a, b) => b.score - a.score)
+    .map(({ x, y }) => ({ x, y }));
+}
+
+function traceRiverNetwork(coarse: CoarseGrid, network: FlowNetwork, startX: number, startY: number, claimed: Uint8Array): TraceCell[] {
+  const trace: TraceCell[] = [];
+  const visited = new Set<number>();
+  let index = startY * coarse.side + startX;
+
+  for (let step = 0; step < MAX_TRACE_STEPS; step += 1) {
+    if (index < 0 || visited.has(index)) break;
+    visited.add(index);
+    trace.push({ x: index % coarse.side, y: Math.floor(index / coarse.side) });
+    const next = network.receiver[index];
+    if (next < 0) break;
+    if (claimed[next] && network.upstreamRiverCounts[next] > 1) break;
+    if (!network.riverMask[next] && trace.length >= MIN_TRACE_POINTS) break;
+    index = next;
+  }
+
+  return trace;
+}
+
+function extractLakeAssets(config: WorldConfig, coarse: CoarseGrid, network: FlowNetwork, generatedAt: string): LakeAssetV1[] {
+  const sinkForCell = computeSinkMap(coarse, network);
+  const sinkAccumulation = new Map<number, number>();
+  for (let index = 0; index < sinkForCell.length; index += 1) {
+    const sink = sinkForCell[index];
+    if (sink < 0) continue;
+    sinkAccumulation.set(sink, (sinkAccumulation.get(sink) ?? 0) + network.accumulation[index]);
+  }
+
+  const candidates = [...sinkAccumulation.entries()]
+    .filter(([sink, accumulation]) => {
+      if (isEdgeIndex(coarse.side, sink)) return false;
+      return accumulation >= Math.max(18, network.maxAccumulation * 0.025);
+    })
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_LAKES * 4);
+
+  const lakes: LakeAssetV1[] = [];
+  for (const [sink, accumulation] of candidates) {
+    if (lakes.length >= MAX_LAKES) break;
+    const basin = collectBasinCells(sinkForCell, sink);
+    if (basin.length < 4) continue;
+    const lake = createLakeFromBasin(config, coarse, basin, sink, accumulation, network.maxAccumulation, generatedAt, lakes.length + 1);
+    if (lake) lakes.push(lake);
+  }
+  return lakes;
+}
+
+function computeSinkMap(coarse: CoarseGrid, network: FlowNetwork): Int32Array {
+  const sinkForCell = new Int32Array(coarse.side * coarse.side).fill(-2);
+  const resolve = (start: number): number => {
+    const stack: number[] = [];
+    let index = start;
+    while (index >= 0) {
+      const known = sinkForCell[index];
+      if (known >= -1 && known !== -2) {
+        for (const item of stack) sinkForCell[item] = known;
+        return known;
+      }
+      stack.push(index);
+      const next = network.receiver[index];
+      if (next < 0) {
+        for (const item of stack) sinkForCell[item] = index;
+        return index;
+      }
+      index = next;
+    }
+    for (const item of stack) sinkForCell[item] = -1;
+    return -1;
+  };
+
+  for (let index = 0; index < sinkForCell.length; index += 1) {
+    if (coarse.cells[index].samples === 0) {
+      sinkForCell[index] = -1;
+      continue;
+    }
+    resolve(index);
+  }
+  return sinkForCell;
+}
+
+function collectBasinCells(sinkForCell: Int32Array, sink: number): number[] {
+  const basin: number[] = [];
+  for (let index = 0; index < sinkForCell.length; index += 1) {
+    if (sinkForCell[index] === sink) basin.push(index);
+  }
+  return basin;
+}
+
+function createLakeFromBasin(
+  config: WorldConfig,
+  coarse: CoarseGrid,
+  basin: number[],
+  sink: number,
+  accumulation: number,
+  maxAccumulation: number,
+  generatedAt: string,
+  index: number
+): LakeAssetV1 | null {
+  const basinSet = new Set(basin);
+  const rim = findBasinRim(coarse, basinSet);
+  if (!rim) return null;
+  const sinkHeight = coarse.cells[sink].height;
+  const relief = rim.height - sinkHeight;
+  if (relief <= config.unitSize * coarse.stride * 0.04) return null;
+
+  const fillFraction = 0.48 + Math.min(0.38, (accumulation / Math.max(1, maxAccumulation)) * 0.38);
+  const waterElevation = sinkHeight + relief * fillFraction;
+  const flooded = basin.filter((cellIndex) => coarse.cells[cellIndex].height <= waterElevation);
+  if (flooded.length < 3) return null;
+
+  const polygon = outlineCellsAsRadialPolygon(config, coarse, flooded);
+  if (polygon.length < 3) return null;
+  const cellArea = (config.unitSize * coarse.stride) ** 2;
+  return {
+    id: crypto.randomUUID(),
+    name: `Lake ${index}`,
+    generatedAt,
+    source: 'heightmap-depression-v2',
+    waterElevation,
+    area: flooded.length * cellArea,
+    maxDepth: Math.max(0, waterElevation - sinkHeight),
+    points: polygon,
+    outlet: coarseIndexToWorldPoint(config, coarse, rim.outlet)
+  };
+}
+
+function findBasinRim(coarse: CoarseGrid, basin: Set<number>): { height: number; outlet: number } | null {
+  let best: { height: number; outlet: number } | null = null;
+  for (const index of basin) {
+    const x = index % coarse.side;
+    const y = Math.floor(index / coarse.side);
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= coarse.side || ny >= coarse.side) continue;
+        const neighborIndex = ny * coarse.side + nx;
+        if (basin.has(neighborIndex)) continue;
+        const neighbor = coarse.cells[neighborIndex];
+        if (neighbor.samples === 0) continue;
+        if (!best || neighbor.height < best.height) best = { height: neighbor.height, outlet: neighborIndex };
+      }
+    }
+  }
+  return best;
+}
+
+function outlineCellsAsRadialPolygon(config: WorldConfig, coarse: CoarseGrid, cells: number[]): LakePointV1[] {
+  let cx = 0;
+  let cz = 0;
+  const points = cells.map((index) => coarseIndexToWorldPoint(config, coarse, index));
+  for (const point of points) {
+    cx += point.x;
+    cz += point.z;
+  }
+  cx /= points.length;
+  cz /= points.length;
+
+  const binCount = Math.min(64, Math.max(16, Math.ceil(Math.sqrt(points.length) * 4)));
+  const bins: Array<(LakePointV1 & { distance: number }) | null> = Array.from({ length: binCount }, () => null);
+  for (const point of points) {
+    const angle = Math.atan2(point.z - cz, point.x - cx);
+    const bin = Math.min(binCount - 1, Math.floor(((angle + Math.PI) / (Math.PI * 2)) * binCount));
+    const distance = Math.hypot(point.x - cx, point.z - cz);
+    if (!bins[bin] || distance > bins[bin].distance) bins[bin] = { ...point, distance };
+  }
+  return bins
+    .filter((point): point is LakePointV1 & { distance: number } => Boolean(point))
+    .map(({ x, z }) => ({ x, z }));
+}
+
+function simplifyTrace(trace: TraceCell[], coarse: CoarseGrid): TraceCell[] {
   const simplified: TraceCell[] = [];
   let previousDirection = '';
   for (let i = 0; i < trace.length; i += 1) {
@@ -206,22 +427,24 @@ function simplifyTrace(trace: TraceCell[], coarse: { side: number; cells: Coarse
   }).filter((point) => cellAt(coarse, point.x, point.y).samples > 0);
 }
 
-function riverPointFromCell(config: WorldConfig, coarse: { side: number; stride: number; cells: CoarseCell[] }, cell: TraceCell): RiverPointV1 {
+function riverPointFromCell(config: WorldConfig, coarse: CoarseGrid, network: FlowNetwork, cell: TraceCell): RiverPointV1 {
   const fullSide = config.tileSize * config.tilesPerSide;
   const worldSize = fullSide * config.unitSize;
   const sampleX = Math.min(fullSide - 1, (cell.x + 0.5) * coarse.stride);
   const sampleY = Math.min(fullSide - 1, (cell.y + 0.5) * coarse.stride);
-  const water = cellAt(coarse, cell.x, cell.y).water;
+  const index = cell.y * coarse.side + cell.x;
+  const accumulation01 = network.maxAccumulation > 0 ? network.accumulation[index] / network.maxAccumulation : 0;
+  const discharge = Math.max(cellAt(coarse, cell.x, cell.y).water, Math.min(65535, Math.round(accumulation01 * 65535)));
   return {
     x: sampleX * config.unitSize - worldSize / 2,
     z: sampleY * config.unitSize - worldSize / 2,
     elevation: cellAt(coarse, cell.x, cell.y).height,
-    discharge: water,
-    width: config.unitSize * coarse.stride * (0.75 + Math.sqrt(water / 65535) * 3.25)
+    discharge,
+    width: config.unitSize * coarse.stride * (0.9 + Math.sqrt(discharge / 65535) * 4.2)
   };
 }
 
-function meanTraceSlope(trace: TraceCell[], coarse: { side: number; cells: CoarseCell[] }): number {
+function meanTraceSlope(trace: TraceCell[], coarse: CoarseGrid): number {
   if (trace.length < 2) return 0;
   let total = 0;
   let count = 0;
@@ -234,41 +457,29 @@ function meanTraceSlope(trace: TraceCell[], coarse: { side: number; cells: Coars
   return count > 0 ? total / count : 0;
 }
 
-function isLocalWaterPeak(coarse: { side: number; cells: CoarseCell[] }, x: number, y: number, water: number): boolean {
-  for (let dy = -1; dy <= 1; dy += 1) {
-    for (let dx = -1; dx <= 1; dx += 1) {
-      if (dx === 0 && dy === 0) continue;
-      if (cellAt(coarse, x + dx, y + dy).water > water) return false;
-    }
-  }
-  return true;
+function coarseIndexToWorldPoint(config: WorldConfig, coarse: CoarseGrid, index: number): LakePointV1 {
+  const fullSide = config.tileSize * config.tilesPerSide;
+  const worldSize = fullSide * config.unitSize;
+  const x = index % coarse.side;
+  const y = Math.floor(index / coarse.side);
+  const sampleX = Math.min(fullSide - 1, (x + 0.5) * coarse.stride);
+  const sampleY = Math.min(fullSide - 1, (y + 0.5) * coarse.stride);
+  return {
+    x: sampleX * config.unitSize - worldSize / 2,
+    z: sampleY * config.unitSize - worldSize / 2
+  };
 }
 
-function isClaimedNear(claimed: Uint8Array, side: number, x: number, y: number, radius: number): boolean {
-  for (let dy = -radius; dy <= radius; dy += 1) {
-    for (let dx = -radius; dx <= radius; dx += 1) {
-      const nx = x + dx;
-      const ny = y + dy;
-      if (nx < 0 || ny < 0 || nx >= side || ny >= side) continue;
-      if (claimed[ny * side + nx]) return true;
-    }
-  }
-  return false;
+function isEdgeIndex(side: number, index: number): boolean {
+  const x = index % side;
+  const y = Math.floor(index / side);
+  return x <= 0 || y <= 0 || x >= side - 1 || y >= side - 1;
 }
 
-function markClaimed(claimed: Uint8Array, side: number, trace: TraceCell[], radius: number): void {
-  for (const cell of trace) {
-    for (let dy = -radius; dy <= radius; dy += 1) {
-      for (let dx = -radius; dx <= radius; dx += 1) {
-        const x = cell.x + dx;
-        const y = cell.y + dy;
-        if (x < 0 || y < 0 || x >= side || y >= side) continue;
-        claimed[y * side + x] = 1;
-      }
-    }
-  }
+function markTraceClaimed(claimed: Uint8Array, side: number, trace: TraceCell[]): void {
+  for (const cell of trace) claimed[cell.y * side + cell.x] = 1;
 }
 
-function cellAt(coarse: { side: number; cells: CoarseCell[] }, x: number, y: number): CoarseCell {
+function cellAt(coarse: CoarseGrid, x: number, y: number): CoarseCell {
   return coarse.cells[y * coarse.side + x];
 }
