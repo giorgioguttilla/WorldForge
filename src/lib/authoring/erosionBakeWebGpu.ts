@@ -954,7 +954,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     nextSediment += erode;
   } else {
     let lowEnergyDeposit = nextSediment * select(0.0, 0.12, outgoingWater <= 0.00001 || transportSlope <= 0.00001);
-    let deposit = max(0.0, nextSediment - capacity) * p(7) * 0.22 + lowEnergyDeposit;
+    let rawDeposit = max(0.0, nextSediment - capacity) * p(7) * 0.22 + lowEnergyDeposit;
+    let depositLimit = p(2) * (0.04 + p(7) * 0.12);
+    let deposit = min(rawDeposit, depositLimit);
     nextHeight += deposit;
     nextSediment = max(0.0, nextSediment - deposit);
   }
