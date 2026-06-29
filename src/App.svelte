@@ -1353,11 +1353,12 @@
             </label>
             <div class="erosion-footnote">~{erosionMemoryMb.toFixed(0)} MB GPU working set per chunk</div>
             {#if authoringDocument.lastBake?.erosion?.enabled}
-              <div class="erosion-diagnostics">
-                <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
-                <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
-                <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
-              </div>
+            <div class="erosion-diagnostics">
+              <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
+              <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
+              <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+              <div>Rivers {authoringDocument.rivers.length}</div>
+            </div>
               {#if authoringDocument.lastBake.erosion.warnings.length > 0}
                 <div class="erosion-warning">{authoringDocument.lastBake.erosion.warnings[0]}</div>
               {/if}

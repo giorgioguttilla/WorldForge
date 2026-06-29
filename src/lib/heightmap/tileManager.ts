@@ -193,7 +193,7 @@ export class TileManager {
       );
       this.metrics.lodRebuildMs = performance.now() - start;
       this.metrics.lastGeneratedTiles = result.dirtyTiles.length;
-      const baked = { ...normalized, lastBake: result.metadata };
+      const baked = { ...normalized, rivers: result.rivers, lastBake: result.metadata };
       await this.store.writeAuthoringDocument(baked);
       this.store.clearCache();
       this.refreshStoreMetrics();

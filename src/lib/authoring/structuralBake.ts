@@ -1,7 +1,7 @@
 import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
-import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1 } from './authoringDocument';
+import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1, RiverAssetV1 } from './authoringDocument';
 import {
   clamp,
   elevationToR16,
@@ -16,9 +16,10 @@ import {
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
+import { extractRiverAssets } from './riverExtraction';
 
 export interface BakeProgress {
-  phase: 'baking' | 'eroding' | 'building-lod';
+  phase: 'baking' | 'eroding' | 'extracting-rivers' | 'building-lod';
   current: number;
   total: number;
   label: string;
@@ -44,6 +45,7 @@ export interface StructuralBakeResult {
   metadata: BakeMetadataV1;
   dirtyTiles: TileKey[];
   lodTileCount: number;
+  rivers: RiverAssetV1[];
 }
 
 export interface StructuralBakeOptions {
@@ -62,6 +64,10 @@ interface ErosionPassResult extends BakePassResult {
 
 interface LodPassResult extends BakePassResult {
   lodTileCount: number;
+}
+
+interface RiverExtractionPassResult extends BakePassResult {
+  rivers: RiverAssetV1[];
 }
 
 interface BakeWorkerResponse {
@@ -122,6 +128,12 @@ export async function bakeStructuralAuthoring(
   const erosion = await erosionPass.run();
   const lodSourceTiles = erosion.dirtyTiles.length > 0 ? erosion.dirtyTiles : depthZero.dirtyTiles;
 
+  const riverPass: BakePass<RiverExtractionPassResult> = {
+    id: 'river-extraction-v1',
+    run: () => runRiverExtractionPass(config, document, io, onProgress)
+  };
+  const riverExtraction = await riverPass.run();
+
   const lodPass: BakePass<LodPassResult> = {
     id: 'lod-rebuild',
     run: () => runLodRebuildPass(config, lodSourceTiles, io, onProgress)
@@ -141,7 +153,8 @@ export async function bakeStructuralAuthoring(
       ...(erosionSummary ? { erosion: erosionSummary } : {})
     },
     dirtyTiles: lodSourceTiles,
-    lodTileCount: lod.lodTileCount
+    lodTileCount: lod.lodTileCount,
+    rivers: riverExtraction.rivers
   };
 }
 
@@ -427,6 +440,21 @@ async function runErosionPass(
     dirtyTiles: result.dirtyTiles,
     summary: result.summary
   };
+}
+
+async function runRiverExtractionPass(
+  config: WorldConfig,
+  document: AuthoringDocumentV1,
+  io: BakeTileIO,
+  onProgress?: (progress: BakeProgress) => void
+): Promise<RiverExtractionPassResult> {
+  if (!document.erosion?.enabled || !document.erosion.outputWaterMask || !io.readWaterMaskTile) {
+    return { id: 'river-extraction-v1', rivers: [] };
+  }
+  onProgress?.({ phase: 'extracting-rivers', current: 0, total: 1, label: 'Extracting river assets from erosion flow' });
+  const rivers = await extractRiverAssets(config, io);
+  onProgress?.({ phase: 'extracting-rivers', current: 1, total: 1, label: `Extracted ${rivers.length} river assets` });
+  return { id: 'river-extraction-v1', rivers };
 }
 
 async function runLodRebuildPass(

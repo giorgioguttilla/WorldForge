@@ -45,6 +45,24 @@ export interface MountainSplineV1 extends PrimitiveBaseV1 {
 
 export type PrimitiveV1 = LandformAreaV1 | MountainSplineV1;
 
+export interface RiverPointV1 {
+  x: number;
+  z: number;
+  elevation: number;
+  discharge: number;
+  width: number;
+}
+
+export interface RiverAssetV1 {
+  id: string;
+  name: string;
+  generatedAt: string;
+  source: 'erosion-water-mask-v1';
+  maxDischarge: number;
+  meanSlope: number;
+  points: RiverPointV1[];
+}
+
 export interface BakeMetadataV1 {
   id: string;
   startedAt: string;
@@ -96,6 +114,7 @@ export interface AuthoringDocumentV1 {
   worldId: string;
   fieldLibrary: NoiseFieldGraphV1[];
   primitives: PrimitiveV1[];
+  rivers: RiverAssetV1[];
   erosion: ErosionSettingsV1;
   lastBake?: BakeMetadataV1;
 }
@@ -187,6 +206,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
     worldId,
     fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: [],
+    rivers: [],
     erosion: { ...EROSION_PRESETS.medium, enabled: false }
   };
 }
@@ -204,6 +224,7 @@ export function normalizeAuthoringDocument(value: unknown, worldId: string): Aut
     worldId,
     fieldLibrary: mergeDefaultFields(normalizedFields),
     primitives,
+    rivers: Array.isArray(value.rivers) ? value.rivers.map(normalizeRiver).filter((river): river is RiverAssetV1 => Boolean(river)) : [],
     erosion: normalizeErosionSettings(value.erosion)
   };
   const lastBake = normalizeBakeMetadata(value.lastBake);
@@ -328,6 +349,37 @@ function normalizeAnchor(value: unknown): AnchorV1 | null {
     id: typeof value.id === 'string' && value.id ? value.id : crypto.randomUUID(),
     x,
     z
+  };
+}
+
+function normalizeRiver(value: unknown): RiverAssetV1 | null {
+  if (!isRecord(value)) return null;
+  const points = Array.isArray(value.points)
+    ? value.points.map(normalizeRiverPoint).filter((point): point is RiverPointV1 => Boolean(point))
+    : [];
+  if (points.length < 2) return null;
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : crypto.randomUUID(),
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : 'River',
+    generatedAt: typeof value.generatedAt === 'string' ? value.generatedAt : new Date().toISOString(),
+    source: 'erosion-water-mask-v1',
+    maxDischarge: Math.max(0, finiteNumber(value.maxDischarge, 0)),
+    meanSlope: Math.max(0, finiteNumber(value.meanSlope, 0)),
+    points
+  };
+}
+
+function normalizeRiverPoint(value: unknown): RiverPointV1 | null {
+  if (!isRecord(value)) return null;
+  const x = finiteNumber(value.x, Number.NaN);
+  const z = finiteNumber(value.z, Number.NaN);
+  if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+  return {
+    x,
+    z,
+    elevation: finiteNumber(value.elevation, 0),
+    discharge: Math.max(0, finiteNumber(value.discharge, 0)),
+    width: Math.max(0, finiteNumber(value.width, 0))
   };
 }
 

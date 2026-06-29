@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { AnchorV1, AuthoringDocumentV1, PrimitiveV1 } from '../authoring/authoringDocument';
+import type { AnchorV1, AuthoringDocumentV1, PrimitiveV1, RiverAssetV1 } from '../authoring/authoringDocument';
 import { DEFAULT_SPLINE_SMOOTHNESS, sampleSplineAnchors, type SplinePoint2D } from '../authoring/spline';
 
 export interface AuthoringSelection {
@@ -69,6 +69,9 @@ export class AuthoringOverlay {
     this.clear();
     this.group.visible = this.visible;
     this.group.position.y = this.waterLevel + 2;
+    for (const river of this.document?.rivers ?? []) {
+      this.addRiver(river);
+    }
     for (const primitive of this.document?.primitives ?? []) {
       if (!primitive.enabled) continue;
       this.addPrimitive(primitive, primitive.id === this.selection.primitiveId);
@@ -110,6 +113,60 @@ export class AuthoringOverlay {
     this.addPolyline(primitive.anchors, false, selected ? 0xffffff : 0xd59a6f, selected, false, primitive.splineSmoothness);
     this.addAnchors(primitive.anchors, selected ? 0xffffff : 0xd59a6f, selected);
     if (selected) this.addTransformControls(primitive.anchors);
+  }
+
+  private addRiver(river: RiverAssetV1): void {
+    if (river.points.length < 2) return;
+    const controlPoints = river.points.map((point) => new THREE.Vector3(point.x, this.riverPointY(point.elevation), point.z));
+    const curve = new THREE.CatmullRomCurve3(controlPoints, false, 'centripetal', 0.35);
+    const points = curve.getPoints(Math.max(12, river.points.length * 4));
+    const visibleWidth = Math.max(36, Math.min(180, averageRiverWidth(river) * 1.8));
+    const corridorGeometry = buildRiverRibbonGeometry(points, visibleWidth / 2);
+    if (corridorGeometry) {
+      const corridorMaterial = new THREE.MeshBasicMaterial({
+        color: 0x47b8ff,
+        transparent: true,
+        opacity: 0.2,
+        side: THREE.DoubleSide,
+        depthTest: false,
+        depthWrite: false
+      });
+      const corridorMesh = new THREE.Mesh(corridorGeometry, corridorMaterial);
+      corridorMesh.renderOrder = 18;
+      this.track(corridorMesh);
+    }
+
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const material = new THREE.LineBasicMaterial({
+      color: 0xb6ecff,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false
+    });
+    const line = new THREE.Line(geometry, material);
+    line.renderOrder = 19;
+    this.track(line);
+
+    const mouth = river.points[river.points.length - 1];
+    const radius = Math.max(18, Math.min(72, mouth.width * 0.8));
+    const markerGeometry = new THREE.CircleGeometry(radius, 16);
+    markerGeometry.rotateX(-Math.PI / 2);
+    const markerMaterial = new THREE.MeshBasicMaterial({
+      color: 0x47b8ff,
+      transparent: true,
+      opacity: 0.34,
+      depthTest: false,
+      depthWrite: false
+    });
+    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+    marker.position.set(mouth.x, this.riverPointY(mouth.elevation) - 0.08, mouth.z);
+    marker.renderOrder = 18;
+    this.track(marker);
+  }
+
+  private riverPointY(elevation: number): number {
+    return elevation - (this.waterLevel + 2) + 3;
   }
 
   private addFill(anchors: AnchorV1[], color: number, smoothness: number): void {
@@ -329,6 +386,50 @@ export class AuthoringOverlay {
     this.group.add(object);
     this.disposable.push(object);
   }
+}
+
+function averageRiverWidth(river: RiverAssetV1): number {
+  if (river.points.length === 0) return 0;
+  return river.points.reduce((sum, point) => sum + point.width, 0) / river.points.length;
+}
+
+function buildRiverRibbonGeometry(points: THREE.Vector3[], radius: number): THREE.BufferGeometry | null {
+  if (points.length < 2 || radius <= 0) return null;
+  const vertices: number[] = [];
+  const indices: number[] = [];
+
+  for (let i = 0; i < points.length; i += 1) {
+    const previous = points[Math.max(0, i - 1)];
+    const current = points[i];
+    const next = points[Math.min(points.length - 1, i + 1)];
+    const dx = next.x - previous.x;
+    const dz = next.z - previous.z;
+    const length = Math.hypot(dx, dz);
+    if (length <= 0) {
+      vertices.push(current.x, current.y, current.z, current.x, current.y, current.z);
+      continue;
+    }
+    const nx = -dz / length;
+    const nz = dx / length;
+    vertices.push(
+      current.x + nx * radius, current.y - 0.1, current.z + nz * radius,
+      current.x - nx * radius, current.y - 0.1, current.z - nz * radius
+    );
+  }
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = i * 2;
+    const b = a + 1;
+    const c = a + 2;
+    const d = a + 3;
+    indices.push(a, c, b, b, c, d);
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
 }
 
 function getTransformControls(anchors: AnchorV1[]): { pivot: SplinePoint2D; radius: number; ringWidth: number; arrowLength: number } | null {
