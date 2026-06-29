@@ -118,6 +118,10 @@ export class EditorViewport {
     this.terrain.setVisualizationMode(mode);
   }
 
+  setLodAggression(aggression: number): void {
+    this.terrain.setLodSettings({ aggression });
+  }
+
   setWater(settings: WaterSettings): void {
     this.waterSettings = settings;
     this.updateWaterPlane();

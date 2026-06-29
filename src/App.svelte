@@ -17,6 +17,7 @@
   type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
 
   const WEBGPU_BAKE_SETTING_KEY = 'worldforge:preferWebGpuBake';
+  const LOD_AGGRESSION_SETTING_KEY = 'worldforge:lodAggression';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -39,6 +40,7 @@
   let showWater = false;
   let bakeDebugTelemetry = false;
   let preferWebGpuBake = true;
+  let lodAggression = 1;
   let waterLevel = 0;
   let hoverCoordinates: HoverCoordinates | null = null;
   let metrics: EditorMetrics = { ...manager.metrics };
@@ -88,10 +90,12 @@
 
   onMount(async () => {
     preferWebGpuBake = readBooleanSetting(WEBGPU_BAKE_SETTING_KEY, true);
+    lodAggression = readNumberSetting(LOD_AGGRESSION_SETTING_KEY, 1);
     viewport = new EditorViewport(canvas, container, manager, (coordinates) => {
       hoverCoordinates = coordinates;
     });
     await viewport.init();
+    viewport.setLodAggression(lodAggression);
     viewport.setAuthoringInputHandlers({
       pointerDown: handleAuthoringPointerDown,
       pointerMove: handleAuthoringPointerMove,
@@ -277,6 +281,12 @@
   function setVisualizationMode(mode: VisualizationMode) {
     visualizationMode = mode;
     viewport?.setVisualizationMode(mode);
+  }
+
+  function setLodAggression(value: number) {
+    lodAggression = Math.max(0, Math.min(4, value));
+    localStorage.setItem(LOD_AGGRESSION_SETTING_KEY, lodAggression.toString());
+    viewport?.setLodAggression(lodAggression);
   }
 
   function loadWaterSettings() {
@@ -732,6 +742,13 @@
     return fallback;
   }
 
+  function readNumberSetting(key: string, fallback: number): number {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const stored = Number(raw);
+    return Number.isFinite(stored) ? stored : fallback;
+  }
+
   function restoreSelection(selection: { primitiveId: string | null; anchorId: string | null }, document: AuthoringDocumentV1) {
     const primitive = document.primitives.find((item) => item.id === selection.primitiveId);
     selectedPrimitiveId = primitive?.id ?? null;
@@ -1117,6 +1134,17 @@
         <input type="checkbox" bind:checked={preferWebGpuBake} onchange={persistBakeSettings} />
         <span>Experimental WebGPU bake</span>
       </label>
+      <label title="Controls viewport terrain detail. Higher values render finer chunks farther away; lower values trade detail for frame time.">
+        <span>LOD detail {lodAggression.toFixed(2)}</span>
+        <input
+          type="range"
+          min="0"
+          max="4"
+          step="0.05"
+          value={lodAggression}
+          oninput={(event) => setLodAggression(Number(event.currentTarget.value))}
+        />
+      </label>
       <label>
         <span>Water level</span>
         <input
@@ -1155,186 +1183,188 @@
         </div>
       </div>
 
-      {#if erosionSettings}
-        <div class="erosion-settings">
-          <div class="subpanel-title">Erosion</div>
-          <label class="toggle-row">
-            <input type="checkbox" checked={erosionSettings.enabled} onchange={(event) => updateErosionSettings({ enabled: event.currentTarget.checked })} />
-            <span>Enable erosion stage</span>
+      <div class="authoring-inspector-scroll">
+        {#if activeTool === 'landformArea' && draftAnchors.length > 0}
+          <div class="draft-row">
+            <span>{draftAnchors.length} anchors</span>
+            <button type="button" onclick={cancelDraft}>Cancel</button>
+          </div>
+        {:else if activeTool === 'mountainSpline' && draftAnchors.length > 0}
+          <div class="draft-row">
+            <span>{draftAnchors.length} anchors</span>
+            <button type="button" disabled={!canFinishMountain} onclick={finishMountainDraft}>Finish</button>
+            <button type="button" onclick={cancelDraft}>Cancel</button>
+          </div>
+        {/if}
+
+        {#if selectedPrimitive}
+          <label>
+            <span>Name</span>
+            <input value={selectedPrimitive.name} oninput={(event) => updateSelectedPrimitive({ name: event.currentTarget.value } as Partial<PrimitiveV1>)} />
           </label>
-          <div class="field-grid compact">
+          <label class="toggle-row">
+            <input type="checkbox" checked={selectedPrimitive.enabled} onchange={(event) => updateSelectedPrimitive({ enabled: event.currentTarget.checked } as Partial<PrimitiveV1>)} />
+            <span>Enabled</span>
+          </label>
+          <div class="field-picker">
             <label>
-              <span>Preset</span>
-              <select value={erosionSettings.preset} onchange={(event) => setErosionPreset(event.currentTarget.value as ErosionPresetV1)}>
-                <option value="light">light</option>
-                <option value="medium">medium</option>
-                <option value="heavy">heavy</option>
-                <option value="custom">custom</option>
+              <span>Noise field</span>
+              <select value={selectedPrimitive.fieldId ?? ''} onchange={(event) => setSelectedField(event.currentTarget.value)}>
+                <option value="">none</option>
+                {#each authoringDocument.fieldLibrary as field}
+                  <option value={field.id}>{field.name}</option>
+                {/each}
               </select>
             </label>
-            <label>
-              <span>Chunk</span>
-              <NumericInput min={64} step="64" value={erosionSettings.chunkSize} onCommit={(value) => updateErosionSettings({ chunkSize: value })} />
-            </label>
-          </div>
-          <div class="field-grid compact">
-            <label>
-              <span>Hydraulic iters</span>
-              <NumericInput min={0} step="1" value={erosionSettings.hydraulicIterations} onCommit={(value) => updateErosionSettings({ hydraulicIterations: value })} />
-            </label>
-            <label>
-              <span>Overlap</span>
-              <NumericInput min={2} step="1" value={erosionSettings.overlap} onCommit={(value) => updateErosionSettings({ overlap: value })} />
-            </label>
-          </div>
-          <label>
-            <span>Rainfall / climate</span>
-            <input type="range" min="0" max="2" step="0.01" value={erosionSettings.rainfall} oninput={(event) => updateErosionSettings({ rainfall: Number(event.currentTarget.value) })} />
-          </label>
-          <div class="field-grid compact">
-            <label>
-              <span>Erosion</span>
-              <NumericInput min={0} step="0.01" value={erosionSettings.erosionStrength} onCommit={(value) => updateErosionSettings({ erosionStrength: value })} />
-            </label>
-            <label>
-              <span>Hardness</span>
-              <NumericInput min={0} max={1} step="0.01" value={erosionSettings.hardness} onCommit={(value) => updateErosionSettings({ hardness: value })} />
-            </label>
-          </div>
-          <label class="toggle-row">
-            <input type="checkbox" checked={erosionSettings.thermalEnabled} onchange={(event) => updateErosionSettings({ thermalEnabled: event.currentTarget.checked })} />
-            <span>Thermal erosion</span>
-          </label>
-          <div class="field-grid compact">
-            <label>
-              <span>Thermal iters</span>
-              <NumericInput min={0} step="1" value={erosionSettings.thermalIterations} onCommit={(value) => updateErosionSettings({ thermalIterations: value })} />
-            </label>
-            <label>
-              <span>Talus angle</span>
-              <NumericInput min={1} max={89} step="1" value={erosionSettings.talusAngleDegrees} onCommit={(value) => updateErosionSettings({ talusAngleDegrees: value })} />
-            </label>
-          </div>
-          <label class="toggle-row">
-            <input type="checkbox" checked={erosionSettings.outputWaterMask} onchange={(event) => updateErosionSettings({ outputWaterMask: event.currentTarget.checked })} />
-            <span>Output water mask</span>
-          </label>
-          <div class="erosion-footnote">~{erosionMemoryMb.toFixed(0)} MB GPU working set per chunk</div>
-          {#if authoringDocument.lastBake?.erosion?.enabled}
-            <div class="erosion-diagnostics">
-              <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
-              <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
-              <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+            <div class="field-actions">
+              <button type="button" title="Add field" onclick={createFieldForSelectedPrimitive}><Plus size={16} /></button>
+              <button type="button" title="Edit selected field" disabled={!selectedField} onclick={editSelectedField}><Edit3 size={16} /></button>
+              <button type="button" title="Delete selected field" disabled={!selectedField} onclick={deleteSelectedField}><Trash2 size={16} /></button>
             </div>
-            {#if authoringDocument.lastBake.erosion.warnings.length > 0}
-              <div class="erosion-warning">{authoringDocument.lastBake.erosion.warnings[0]}</div>
-            {/if}
+          </div>
+          {#if selectedAnchor}
+            <div class="draft-row">
+              <span>Point {selectedPrimitive.anchors.findIndex((anchor) => anchor.id === selectedAnchor.id) + 1}</span>
+              <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Remove point</button>
+            </div>
           {/if}
-        </div>
-      {/if}
 
-      {#if activeTool === 'landformArea' && draftAnchors.length > 0}
-        <div class="draft-row">
-          <span>{draftAnchors.length} anchors</span>
-          <button type="button" onclick={cancelDraft}>Cancel</button>
-        </div>
-      {:else if activeTool === 'mountainSpline' && draftAnchors.length > 0}
-        <div class="draft-row">
-          <span>{draftAnchors.length} anchors</span>
-          <button type="button" disabled={!canFinishMountain} onclick={finishMountainDraft}>Finish</button>
-          <button type="button" onclick={cancelDraft}>Cancel</button>
-        </div>
-      {/if}
-
-      {#if selectedPrimitive}
-        <label>
-          <span>Name</span>
-          <input value={selectedPrimitive.name} oninput={(event) => updateSelectedPrimitive({ name: event.currentTarget.value } as Partial<PrimitiveV1>)} />
-        </label>
-        <label class="toggle-row">
-          <input type="checkbox" checked={selectedPrimitive.enabled} onchange={(event) => updateSelectedPrimitive({ enabled: event.currentTarget.checked } as Partial<PrimitiveV1>)} />
-          <span>Enabled</span>
-        </label>
-        <div class="field-picker">
-          <label>
-            <span>Noise field</span>
-            <select value={selectedPrimitive.fieldId ?? ''} onchange={(event) => setSelectedField(event.currentTarget.value)}>
-              <option value="">none</option>
-              {#each authoringDocument.fieldLibrary as field}
-                <option value={field.id}>{field.name}</option>
-              {/each}
-            </select>
-          </label>
-          <div class="field-actions">
-            <button type="button" title="Add field" onclick={createFieldForSelectedPrimitive}><Plus size={16} /></button>
-            <button type="button" title="Edit selected field" disabled={!selectedField} onclick={editSelectedField}><Edit3 size={16} /></button>
-            <button type="button" title="Delete selected field" disabled={!selectedField} onclick={deleteSelectedField}><Trash2 size={16} /></button>
-          </div>
-        </div>
-        {#if selectedAnchor}
-          <div class="draft-row">
-            <span>Point {selectedPrimitive.anchors.findIndex((anchor) => anchor.id === selectedAnchor.id) + 1}</span>
-            <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> Remove point</button>
-          </div>
-        {/if}
-
-        {#if selectedPrimitive.type === 'landformArea'}
-          <label>
-            <span>Mode</span>
-            <select value={selectedPrimitive.mode} onchange={(event) => updateSelectedPrimitive({ mode: event.currentTarget.value as LandformModeV1 } as Partial<PrimitiveV1>)}>
-              <option value="land">land</option>
-              <option value="water">water</option>
-              <option value="plateau">plateau</option>
-            </select>
-          </label>
-          <div class="field-grid compact">
+          {#if selectedPrimitive.type === 'landformArea'}
             <label>
-              <span>Elevation</span>
-              <NumericInput step="1" value={selectedPrimitive.elevation} onCommit={(value) => updateSelectedPrimitive({ elevation: value } as Partial<PrimitiveV1>)} />
+              <span>Mode</span>
+              <select value={selectedPrimitive.mode} onchange={(event) => updateSelectedPrimitive({ mode: event.currentTarget.value as LandformModeV1 } as Partial<PrimitiveV1>)}>
+                <option value="land">land</option>
+                <option value="water">water</option>
+                <option value="plateau">plateau</option>
+              </select>
+            </label>
+            <div class="field-grid compact">
+              <label>
+                <span>Elevation</span>
+                <NumericInput step="1" value={selectedPrimitive.elevation} onCommit={(value) => updateSelectedPrimitive({ elevation: value } as Partial<PrimitiveV1>)} />
+              </label>
+              <label>
+                <span>Priority</span>
+                <NumericInput step="1" value={selectedPrimitive.priority} onCommit={(value) => updateSelectedPrimitive({ priority: value } as Partial<PrimitiveV1>)} />
+              </label>
+            </div>
+            <label>
+              <span>Noise scale</span>
+              <NumericInput step="1" value={selectedPrimitive.noiseScale} onCommit={(value) => updateSelectedPrimitive({ noiseScale: value } as Partial<PrimitiveV1>)} />
             </label>
             <label>
-              <span>Priority</span>
-              <NumericInput step="1" value={selectedPrimitive.priority} onCommit={(value) => updateSelectedPrimitive({ priority: value } as Partial<PrimitiveV1>)} />
+              <span>Edge smoothness</span>
+              <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
             </label>
-          </div>
-          <label>
-            <span>Noise scale</span>
-            <NumericInput step="1" value={selectedPrimitive.noiseScale} onCommit={(value) => updateSelectedPrimitive({ noiseScale: value } as Partial<PrimitiveV1>)} />
-          </label>
-          <label>
-            <span>Edge smoothness</span>
-            <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
-          </label>
-          <label>
-            <span>Curve smoothness</span>
-            <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
-          </label>
+            <label>
+              <span>Curve smoothness</span>
+              <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+          {:else}
+            <div class="field-grid compact">
+              <label>
+                <span>Height</span>
+                <NumericInput min={0} step="1" value={selectedPrimitive.height} onCommit={(value) => updateSelectedPrimitive({ height: value } as Partial<PrimitiveV1>)} />
+              </label>
+              <label>
+                <span>Width</span>
+                <NumericInput min={0} step="1" value={selectedPrimitive.width} onCommit={(value) => updateSelectedPrimitive({ width: value } as Partial<PrimitiveV1>)} />
+              </label>
+            </div>
+            <label>
+              <span>Edge smoothness</span>
+              <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
+            </label>
+            <label>
+              <span>Curve smoothness</span>
+              <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
+            </label>
+          {/if}
+          <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> {selectedAnchor ? 'Delete selection' : 'Delete'}</button>
         {:else}
-          <div class="field-grid compact">
-            <label>
-              <span>Height</span>
-              <NumericInput min={0} step="1" value={selectedPrimitive.height} onCommit={(value) => updateSelectedPrimitive({ height: value } as Partial<PrimitiveV1>)} />
-            </label>
-            <label>
-              <span>Width</span>
-              <NumericInput min={0} step="1" value={selectedPrimitive.width} onCommit={(value) => updateSelectedPrimitive({ width: value } as Partial<PrimitiveV1>)} />
-            </label>
+          <div class="empty-inspector">
+            {authoringDocument.primitives.length} primitives
           </div>
-          <label>
-            <span>Edge smoothness</span>
-            <NumericInput min={0} step="1" value={selectedPrimitive.edgeSmoothness} onCommit={(value) => updateSelectedPrimitive({ edgeSmoothness: value } as Partial<PrimitiveV1>)} />
-          </label>
-          <label>
-            <span>Curve smoothness</span>
-            <input type="range" min="0" max="1" step="0.01" value={selectedPrimitive.splineSmoothness} oninput={(event) => updateSelectedPrimitive({ splineSmoothness: Number(event.currentTarget.value) } as Partial<PrimitiveV1>)} />
-          </label>
         {/if}
-        <button type="button" class="danger" onclick={deleteSelection}><Trash2 size={16} /> {selectedAnchor ? 'Delete selection' : 'Delete'}</button>
-      {:else}
-        <div class="empty-inspector">
-          {authoringDocument.primitives.length} primitives
-        </div>
-      {/if}
+
+        {#if erosionSettings}
+          <div class="erosion-settings">
+            <div class="subpanel-title">Erosion</div>
+            <label class="toggle-row" title="Runs the WebGPU erosion bake after structural terrain generation and before LOD rebuilds.">
+              <input type="checkbox" checked={erosionSettings.enabled} onchange={(event) => updateErosionSettings({ enabled: event.currentTarget.checked })} />
+              <span>Enable erosion stage</span>
+            </label>
+            <div class="field-grid compact">
+              <label title="Starting point for the erosion controls. Changing any individual value marks the preset custom.">
+                <span>Preset</span>
+                <select value={erosionSettings.preset} onchange={(event) => setErosionPreset(event.currentTarget.value as ErosionPresetV1)}>
+                  <option value="light">light</option>
+                  <option value="medium">medium</option>
+                  <option value="heavy">heavy</option>
+                  <option value="custom">custom</option>
+                </select>
+              </label>
+              <label title="Size of each WebGPU erosion work chunk in height samples. Larger chunks improve cross-terrain flow but use more GPU memory.">
+                <span>Chunk</span>
+                <NumericInput min={64} step="64" value={erosionSettings.chunkSize} onCommit={(value) => updateErosionSettings({ chunkSize: value })} />
+              </label>
+            </div>
+            <div class="field-grid compact">
+              <label title="Number of hydraulic water/sediment simulation steps. More iterations create stronger drainage networks and take longer.">
+                <span>Hydraulic iters</span>
+                <NumericInput min={0} step="1" value={erosionSettings.hydraulicIterations} onCommit={(value) => updateErosionSettings({ hydraulicIterations: value })} />
+              </label>
+              <label title="Extra samples read around each chunk so water and sediment can flow across chunk edges without visible seams.">
+                <span>Overlap</span>
+                <NumericInput min={2} step="1" value={erosionSettings.overlap} onCommit={(value) => updateErosionSettings({ overlap: value })} />
+              </label>
+            </div>
+            <label title="Adds water each hydraulic step. Higher values make wetter climates, stronger channels, and more deposition.">
+              <span>Rainfall / climate</span>
+              <input type="range" min="0" max="2" step="0.01" value={erosionSettings.rainfall} oninput={(event) => updateErosionSettings({ rainfall: Number(event.currentTarget.value) })} />
+            </label>
+            <div class="field-grid compact">
+              <label title="How aggressively flowing water removes bed material when it has spare sediment capacity.">
+                <span>Erosion</span>
+                <NumericInput min={0} step="0.01" value={erosionSettings.erosionStrength} onCommit={(value) => updateErosionSettings({ erosionStrength: value })} />
+              </label>
+              <label title="Resistance of the terrain to hydraulic erosion. 0 is soft material; 1 is very resistant bedrock.">
+                <span>Hardness</span>
+                <NumericInput min={0} max={1} step="0.01" value={erosionSettings.hardness} onCommit={(value) => updateErosionSettings({ hardness: value })} />
+              </label>
+            </div>
+            <label class="toggle-row" title="Applies dry mass-wasting after hydraulic erosion so slopes above the talus angle slump and smooth.">
+              <input type="checkbox" checked={erosionSettings.thermalEnabled} onchange={(event) => updateErosionSettings({ thermalEnabled: event.currentTarget.checked })} />
+              <span>Thermal erosion</span>
+            </label>
+            <div class="field-grid compact">
+              <label title="Number of thermal relaxation passes. Usually fewer are needed than hydraulic passes.">
+                <span>Thermal iters</span>
+                <NumericInput min={0} step="1" value={erosionSettings.thermalIterations} onCommit={(value) => updateErosionSettings({ thermalIterations: value })} />
+              </label>
+              <label title="Stable slope angle for loose material. Lower values soften hills more; higher values preserve cliffs and sharper ridges.">
+                <span>Talus angle</span>
+                <NumericInput min={1} max={89} step="1" value={erosionSettings.talusAngleDegrees} onCommit={(value) => updateErosionSettings({ talusAngleDegrees: value })} />
+              </label>
+            </div>
+            <label class="toggle-row" title="Writes a water-flow mask that later systems can use for rivers, lakes, waterfalls, wetlands, and biome hints.">
+              <input type="checkbox" checked={erosionSettings.outputWaterMask} onchange={(event) => updateErosionSettings({ outputWaterMask: event.currentTarget.checked })} />
+              <span>Output water mask</span>
+            </label>
+            <div class="erosion-footnote">~{erosionMemoryMb.toFixed(0)} MB GPU working set per chunk</div>
+            {#if authoringDocument.lastBake?.erosion?.enabled}
+              <div class="erosion-diagnostics">
+                <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
+                <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
+                <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+              </div>
+              {#if authoringDocument.lastBake.erosion.warnings.length > 0}
+                <div class="erosion-warning">{authoringDocument.lastBake.erosion.warnings[0]}</div>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+      </div>
     </section>
   {/if}
 

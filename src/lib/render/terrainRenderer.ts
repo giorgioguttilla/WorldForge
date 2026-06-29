@@ -7,15 +7,16 @@ import type { ViewMode } from './cameraController';
 export type VisualizationMode = 'wireframe' | 'topo' | 'render';
 
 const CHUNK_SEGMENTS_PER_SIDE = 64;
-const ORTHO_SUBDIVIDE_SCREEN_PX = 620;
-const PERSPECTIVE_SUBDIVIDE_SCREEN_PX: Record<Exclude<ViewMode, 'ortho'>, { near: number; far: number }> = {
-  free: { near: 1100, far: 1500 },
-  character: { near: 950, far: 1350 }
-};
+const BASE_SAMPLE_SCREEN_ERROR_PX = 15;
+const ORTHO_SAMPLE_SCREEN_ERROR_PX = 11;
 const MAX_RENDER_TILE_CACHE_ENTRIES = 80;
 const SPARE_POOL_NODES = 128;
 const MAX_CONCURRENT_CHUNK_BUILDS = 4;
 const CHUNK_WORKER_COUNT = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+
+export interface TerrainLodSettings {
+  aggression: number;
+}
 
 interface TerrainNode {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
@@ -118,6 +119,7 @@ export class TerrainQuadtreeRenderer {
   private stagedSelectionId = '';
   private viewportHeight = 720;
   private viewMode: ViewMode = 'free';
+  private lodAggression = 1;
   private readonly sparePoolNodes = SPARE_POOL_NODES;
   private nextWorkerRequestId = 1;
   private generation = 0;
@@ -200,6 +202,17 @@ export class TerrainQuadtreeRenderer {
   setViewMode(mode: ViewMode): void {
     if (this.viewMode === mode) return;
     this.viewMode = mode;
+    this.lastSelectionId = '';
+    this.lastCameraSignature = '';
+    this.releaseStagedNodes();
+  }
+
+  setLodSettings(settings: TerrainLodSettings): void {
+    const nextAggression = THREE.MathUtils.clamp(settings.aggression, 0, 4);
+    if (Math.abs(this.lodAggression - nextAggression) < 0.001) return;
+    this.lodAggression = nextAggression;
+    this.generation += 1;
+    this.cancelPendingBuilds();
     this.lastSelectionId = '';
     this.lastCameraSignature = '';
     this.releaseStagedNodes();
@@ -335,20 +348,29 @@ export class TerrainQuadtreeRenderer {
 
   private shouldSubdivide(config: WorldConfig, key: RenderChunkKey, bounds: ChunkBounds, camera: THREE.Camera): boolean {
     if (key.lod <= 0) return false;
+    const sampleScreenPx = this.getProjectedSampleSpacingPx(config, key, bounds, camera);
+    const targetErrorPx = this.getTargetSampleScreenErrorPx(camera);
+    return sampleScreenPx > targetErrorPx;
+  }
+
+  private getProjectedSampleSpacingPx(config: WorldConfig, key: RenderChunkKey, bounds: ChunkBounds, camera: THREE.Camera): number {
+    const sampleWorldSize = config.unitSize * 2 ** key.lod;
     if (camera instanceof THREE.OrthographicCamera) {
       const visibleHeight = (camera.top - camera.bottom) / Math.max(camera.zoom, 0.0001);
-      const chunkScreenPx = (bounds.size / visibleHeight) * this.viewportHeight;
-      return chunkScreenPx > ORTHO_SUBDIVIDE_SCREEN_PX;
+      return (sampleWorldSize / Math.max(1, visibleHeight)) * this.viewportHeight;
     }
 
     const distance = Math.max(1, this.distanceToBounds(camera.position.x, camera.position.z, bounds));
     const perspective = camera as THREE.PerspectiveCamera;
     const visibleWorldHeight = 2 * distance * Math.tan(THREE.MathUtils.degToRad(perspective.fov) / 2);
-    const chunkScreenPx = (bounds.size / Math.max(1, visibleWorldHeight)) * this.viewportHeight;
-    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
-    const nearBias = distance < worldSize * 0.42;
-    const thresholds = PERSPECTIVE_SUBDIVIDE_SCREEN_PX[this.viewMode === 'character' ? 'character' : 'free'];
-    return chunkScreenPx > (nearBias ? thresholds.near : thresholds.far);
+    return (sampleWorldSize / Math.max(1, visibleWorldHeight)) * this.viewportHeight;
+  }
+
+  private getTargetSampleScreenErrorPx(camera: THREE.Camera): number {
+    const base = camera instanceof THREE.OrthographicCamera
+      ? ORTHO_SAMPLE_SCREEN_ERROR_PX
+      : BASE_SAMPLE_SCREEN_ERROR_PX * (this.viewMode === 'character' ? 0.82 : 1);
+    return base * 2 ** (1 - this.lodAggression);
   }
 
   private getChunkBounds(config: WorldConfig, key: RenderChunkKey): ChunkBounds {

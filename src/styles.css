@@ -230,9 +230,12 @@ button:disabled {
   top: 68px;
   width: 280px;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
+  max-height: calc(100vh - 150px);
   padding: 12px;
   border-radius: 8px;
+  overflow: hidden;
 }
 
 .panel-header,
@@ -309,6 +312,15 @@ button:disabled {
 .authoring-panel .toggle-row input {
   width: 16px;
   height: 16px;
+}
+
+.authoring-inspector-scroll {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  overflow: auto;
+  padding-right: 3px;
 }
 
 .erosion-settings {
