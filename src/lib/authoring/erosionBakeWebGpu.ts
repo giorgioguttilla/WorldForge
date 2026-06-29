@@ -678,7 +678,7 @@ function alignTo(value: number, alignment: number): number {
   return Math.ceil(value / alignment) * alignment;
 }
 
-function createErosionShader(): string {
+export function createErosionShader(): string {
   return /* wgsl */`
 struct Params {
   width: f32,
@@ -812,6 +812,62 @@ fn sedimentOutAmount(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
   let water = max(0.000001, waterAt(source));
   let sediment = sedimentAt(source);
   return sediment * min(1.0, outAmount(fromX, fromY, toX, toY) / water);
+}
+
+fn outgoingWaterAt(x: i32, y: i32) -> f32 {
+  if (!inside(x, y)) { return 0.0; }
+  let cell = idx(x, y);
+  let card = flux[cell * 2u];
+  let diag = flux[cell * 2u + 1u];
+  return card.x + card.y + card.z + card.w + diag.x + diag.y + diag.z + diag.w;
+}
+
+fn flowVectorAt(x: i32, y: i32) -> vec2<f32> {
+  if (!inside(x, y)) { return vec2<f32>(0.0); }
+  let cell = idx(x, y);
+  let card = flux[cell * 2u];
+  let diag = flux[cell * 2u + 1u];
+  var flow = vec2<f32>(card.y - card.x, card.w - card.z);
+  flow += vec2<f32>(-diag.x + diag.y - diag.z + diag.w, -diag.x - diag.y + diag.z + diag.w) * 0.70710678;
+  let flowLength = max(0.000001, length(flow));
+  return flow / flowLength;
+}
+
+fn lateralBankErodeFrom(channelX: i32, channelY: i32, bankX: i32, bankY: i32, bankHeight: f32) -> f32 {
+  if (!inside(channelX, channelY)) { return 0.0; }
+  let channel = idx(channelX, channelY);
+  let channelHeight = hRead(channel);
+  let bankRelief = bankHeight - channelHeight;
+  if (bankRelief <= p(2) * 0.12) { return 0.0; }
+
+  let channelOut = outgoingWaterAt(channelX, channelY);
+  let channelDischarge = min(flowAccum[channel] * 0.004 + channelOut, channelOut * 4.0 + waterAt(channel));
+  let channelThreshold = p(4) * p(2) * 0.22 + 0.00001;
+  if (channelDischarge <= channelThreshold) { return 0.0; }
+
+  let bankDir = normalize(vec2<f32>(f32(bankX - channelX), f32(bankY - channelY)));
+  let flowDir = flowVectorAt(channelX, channelY);
+  let lateralWeight = pow(clamp(1.0 - abs(dot(bankDir, flowDir)), 0.0, 1.0), 0.7);
+  let dischargeWeight = clamp((channelDischarge - channelThreshold) / max(channelThreshold * 6.0, 0.0001), 0.0, 1.0);
+  let slopeWeight = clamp((bankRelief - p(2) * 0.12) / max(p(2) * 3.0, 0.0001), 0.0, 1.0);
+  return bankRelief * lateralWeight * dischargeWeight * slopeWeight;
+}
+
+fn lateralBankErodeAt(x: i32, y: i32, bankHeight: f32) -> f32 {
+  let axial =
+    lateralBankErodeFrom(x - 1, y, x, y, bankHeight) +
+    lateralBankErodeFrom(x + 1, y, x, y, bankHeight) +
+    lateralBankErodeFrom(x, y - 1, x, y, bankHeight) +
+    lateralBankErodeFrom(x, y + 1, x, y, bankHeight);
+  let diagonal = (
+    lateralBankErodeFrom(x - 1, y - 1, x, y, bankHeight) +
+    lateralBankErodeFrom(x + 1, y - 1, x, y, bankHeight) +
+    lateralBankErodeFrom(x - 1, y + 1, x, y, bankHeight) +
+    lateralBankErodeFrom(x + 1, y + 1, x, y, bankHeight)
+  ) * 0.70710678;
+  let raw = axial + diagonal;
+  let perStepLimit = p(2) * (0.015 + 0.055 * p(6) * (1.0 - p(9)));
+  return min(perStepLimit, raw * p(6) * (1.0 - p(9)) * 0.018);
 }
 
 fn thermalGive(fromX: i32, fromY: i32, toX: i32, toY: i32) -> f32 {
@@ -960,6 +1016,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     nextHeight += deposit;
     nextSediment = max(0.0, nextSediment - deposit);
   }
+
+  let lateralErode = min(nextHeight, lateralBankErodeAt(x, y, nextHeight));
+  nextHeight -= lateralErode;
+  nextSediment += lateralErode * 0.35;
 
   nextWater = max(0.0, nextWater * (1.0 - p(5) * 0.08));
   hWrite(i, clamp(nextHeight, 0.0, p(3)));
