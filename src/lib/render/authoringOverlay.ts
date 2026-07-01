@@ -131,7 +131,7 @@ export class AuthoringOverlay {
         transparent: true,
         opacity: 0.2,
         side: THREE.DoubleSide,
-        depthTest: false,
+        depthTest: true,
         depthWrite: false
       });
       const corridorMesh = new THREE.Mesh(corridorGeometry, corridorMaterial);
@@ -144,7 +144,7 @@ export class AuthoringOverlay {
       color: 0xb6ecff,
       transparent: true,
       opacity: 0.95,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false
     });
     const line = new THREE.Line(geometry, material);
@@ -159,7 +159,7 @@ export class AuthoringOverlay {
       color: 0x47b8ff,
       transparent: true,
       opacity: 0.34,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false
     });
     const marker = new THREE.Mesh(markerGeometry, markerMaterial);
@@ -182,7 +182,7 @@ export class AuthoringOverlay {
       transparent: true,
       opacity: 0.26,
       side: THREE.DoubleSide,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false
     });
     const mesh = new THREE.Mesh(geometry, material);
@@ -197,7 +197,7 @@ export class AuthoringOverlay {
       color: 0xb6ecff,
       transparent: true,
       opacity: 0.72,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false
     });
     const line = new THREE.Line(outlineGeometry, outlineMaterial);
@@ -211,7 +211,7 @@ export class AuthoringOverlay {
         color: 0xffffff,
         transparent: true,
         opacity: 0.45,
-        depthTest: false,
+        depthTest: true,
         depthWrite: false
       });
       const outlet = new THREE.Mesh(outletGeometry, outletMaterial);

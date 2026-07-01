@@ -1,6 +1,6 @@
 import { LodBuilder } from './lodBuilder';
 import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './gpuHeightmapCompute';
-import { HeightmapTileStore, waterMaskTilePath, type TileMetricsSnapshot } from './opfsStore';
+import { HeightmapTileStore, retainedWaterMaskTilePath, waterMaskTilePath, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
 import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
@@ -186,7 +186,9 @@ export class TileManager {
           readTile: (key) => this.store.readTile(key, config.tileSize, { cache: false }),
           writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false }),
           readWaterMaskTile: (key) => this.store.readWaterMaskTile(key, config.tileSize),
-          writeWaterMaskTile: (key, samples) => this.store.writeWaterMaskTile(key, samples)
+          writeWaterMaskTile: (key, samples) => this.store.writeWaterMaskTile(key, samples),
+          readRetainedWaterMaskTile: (key) => this.store.readRetainedWaterMaskTile(key, config.tileSize),
+          writeRetainedWaterMaskTile: (key, samples) => this.store.writeRetainedWaterMaskTile(key, samples)
         },
         onProgress,
         options
@@ -265,6 +267,22 @@ export class TileManager {
     return samples;
   }
 
+  async readWaterMaskTile(key: TileKey): Promise<Uint16Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    const samples = await this.store.readWaterMaskTile(key, config.tileSize);
+    this.refreshStoreMetrics();
+    return samples;
+  }
+
+  async readRetainedWaterMaskTile(key: TileKey): Promise<Uint16Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    const samples = await this.store.readRetainedWaterMaskTile(key, config.tileSize);
+    this.refreshStoreMetrics();
+    return samples;
+  }
+
   async sampleHeightAtWorld(worldX: number, worldZ: number): Promise<number | null> {
     const config = this.requireConfig();
     const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
@@ -313,6 +331,11 @@ export class TileManager {
             if (waterMask) {
               const maskBlob = await encodeGrayscale16Png(config.tileSize, config.tileSize, waterMask);
               await this.writeBlobFile(directory, waterMaskTilePath(key, 'png'), maskBlob);
+            }
+            const retainedWaterMask = await this.store.readRetainedWaterMaskTile(key, config.tileSize);
+            if (retainedWaterMask) {
+              const retainedBlob = await encodeGrayscale16Png(config.tileSize, config.tileSize, retainedWaterMask);
+              await this.writeBlobFile(directory, retainedWaterMaskTilePath(key, 'png'), retainedBlob);
             }
           }
         }

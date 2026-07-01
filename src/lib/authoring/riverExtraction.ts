@@ -38,30 +38,41 @@ export interface HydrologyAssetsV1 {
   lakes: LakeAssetV1[];
 }
 
+export interface HydrologyExtractionOptions {
+  rainfall?: number;
+  evaporation?: number;
+  infiltration?: number;
+}
+
 const TARGET_COARSE_SIDE = 512;
 const MAX_RIVERS = 120;
 const MAX_LAKES = 48;
 const MAX_TRACE_STEPS = 800;
 const MIN_TRACE_POINTS = 8;
+const DEFAULT_RAINFALL = 0.34;
+const DEFAULT_EVAPORATION = 0.32;
+const DEFAULT_INFILTRATION = 0.08;
 
 export async function extractRiverAssets(
   config: WorldConfig,
   io: RiverExtractionIO,
-  generatedAt = new Date().toISOString()
+  generatedAt = new Date().toISOString(),
+  options: HydrologyExtractionOptions = {}
 ): Promise<RiverAssetV1[]> {
-  return (await extractHydrologyAssets(config, io, generatedAt)).rivers;
+  return (await extractHydrologyAssets(config, io, generatedAt, options)).rivers;
 }
 
 export async function extractHydrologyAssets(
   config: WorldConfig,
   io: RiverExtractionIO,
-  generatedAt = new Date().toISOString()
+  generatedAt = new Date().toISOString(),
+  options: HydrologyExtractionOptions = {}
 ): Promise<HydrologyAssetsV1> {
   const coarse = await buildCoarseDrainageGrid(config, io);
   if (!coarse.cells.some((cell) => cell.samples > 0)) return { rivers: [], lakes: [] };
 
   const network = buildFlowNetwork(coarse);
-  const lakes = extractLakeAssets(config, coarse, network, generatedAt);
+  const lakes = extractLakeAssets(config, coarse, network, generatedAt, options);
   const sources = selectNetworkSources(coarse, network);
   const claimed = new Uint8Array(coarse.side * coarse.side);
   const rivers: RiverAssetV1[] = [];
@@ -255,7 +266,7 @@ function traceRiverNetwork(coarse: CoarseGrid, network: FlowNetwork, startX: num
   return trace;
 }
 
-function extractLakeAssets(config: WorldConfig, coarse: CoarseGrid, network: FlowNetwork, generatedAt: string): LakeAssetV1[] {
+function extractLakeAssets(config: WorldConfig, coarse: CoarseGrid, network: FlowNetwork, generatedAt: string, options: HydrologyExtractionOptions): LakeAssetV1[] {
   const sinkForCell = computeSinkMap(coarse, network);
   const sinkAccumulation = new Map<number, number>();
   for (let index = 0; index < sinkForCell.length; index += 1) {
@@ -277,7 +288,7 @@ function extractLakeAssets(config: WorldConfig, coarse: CoarseGrid, network: Flo
     if (lakes.length >= MAX_LAKES) break;
     const basin = collectBasinCells(sinkForCell, sink);
     if (basin.length < 4) continue;
-    const lake = createLakeFromBasin(config, coarse, basin, sink, accumulation, network.maxAccumulation, generatedAt, lakes.length + 1);
+    const lake = createLakeFromBasin(config, coarse, basin, sink, accumulation, network.maxAccumulation, generatedAt, lakes.length + 1, options);
     if (lake) lakes.push(lake);
   }
   return lakes;
@@ -332,7 +343,8 @@ function createLakeFromBasin(
   accumulation: number,
   maxAccumulation: number,
   generatedAt: string,
-  index: number
+  index: number,
+  options: HydrologyExtractionOptions
 ): LakeAssetV1 | null {
   const basinSet = new Set(basin);
   const rim = findBasinRim(coarse, basinSet);
@@ -341,12 +353,10 @@ function createLakeFromBasin(
   const relief = rim.height - sinkHeight;
   if (relief <= config.unitSize * coarse.stride * 0.04) return null;
 
-  const fillFraction = 0.48 + Math.min(0.38, (accumulation / Math.max(1, maxAccumulation)) * 0.38);
-  const waterElevation = sinkHeight + relief * fillFraction;
-  const flooded = basin.filter((cellIndex) => coarse.cells[cellIndex].height <= waterElevation);
-  if (flooded.length < 3) return null;
+  const solution = solveLakeWaterBudget(config, coarse, basin, sink, sinkHeight, rim.height, accumulation, maxAccumulation, options);
+  if (!solution) return null;
 
-  const polygon = outlineCellsAsRadialPolygon(config, coarse, flooded);
+  const polygon = outlineLakeWithMarchingSquares(config, coarse, solution.flooded, solution.waterElevation);
   if (polygon.length < 3) return null;
   const cellArea = (config.unitSize * coarse.stride) ** 2;
   return {
@@ -354,12 +364,101 @@ function createLakeFromBasin(
     name: `Lake ${index}`,
     generatedAt,
     source: 'heightmap-depression-v2',
-    waterElevation,
-    area: flooded.length * cellArea,
-    maxDepth: Math.max(0, waterElevation - sinkHeight),
+    waterElevation: solution.waterElevation,
+    area: solution.flooded.length * cellArea,
+    maxDepth: Math.max(0, solution.waterElevation - sinkHeight),
     points: polygon,
     outlet: coarseIndexToWorldPoint(config, coarse, rim.outlet)
   };
+}
+
+function solveLakeWaterBudget(
+  config: WorldConfig,
+  coarse: CoarseGrid,
+  basin: number[],
+  sink: number,
+  sinkHeight: number,
+  rimHeight: number,
+  accumulation: number,
+  maxAccumulation: number,
+  options: HydrologyExtractionOptions
+): { waterElevation: number; flooded: number[] } | null {
+  const rainfall = Math.max(0, options.rainfall ?? DEFAULT_RAINFALL);
+  const evaporation = Math.max(0, options.evaporation ?? DEFAULT_EVAPORATION);
+  const infiltration = Math.max(0, options.infiltration ?? DEFAULT_INFILTRATION);
+  const candidateCells = basin
+    .filter((cellIndex) => coarse.cells[cellIndex].height <= rimHeight)
+    .sort((a, b) => coarse.cells[a].height - coarse.cells[b].height);
+  if (candidateCells.length < 3) return null;
+
+  const cellWorldSize = config.unitSize * coarse.stride;
+  const minFloodedCells = Math.max(4, Math.ceil(10 / Math.max(1, coarse.stride)));
+  const minDepth = Math.max(cellWorldSize * 0.12, config.worldHeight * 0.0015);
+  const lossDepthPerStep = evaporation * 0.55 + infiltration;
+  const catchmentInflow = accumulation * Math.max(0.001, rainfall);
+  let stableLevel = Number.NaN;
+
+  for (let i = 0; i < candidateCells.length; i += 1) {
+    const level = coarse.cells[candidateCells[i]].height;
+    if (level <= sinkHeight + minDepth) continue;
+    const floodedCount = i + 1;
+    if (floodedCount < minFloodedCells) continue;
+    const meanInflowDepth = catchmentInflow / Math.max(1, floodedCount);
+    if (meanInflowDepth <= lossDepthPerStep) {
+      stableLevel = level;
+      break;
+    }
+  }
+
+  if (!Number.isFinite(stableLevel)) {
+    const spillBias = 0.985 - Math.min(0.08, (accumulation / Math.max(1, maxAccumulation)) * 0.08);
+    stableLevel = sinkHeight + (rimHeight - sinkHeight) * spillBias;
+  }
+
+  const candidateSet = new Set(candidateCells);
+  const flooded = collectConnectedFloodedCells(coarse, candidateSet, sink, stableLevel);
+  if (flooded.length < minFloodedCells) return null;
+  const maxDepth = stableLevel - sinkHeight;
+  if (maxDepth < minDepth) return null;
+
+  const catchmentRatio = accumulation / Math.max(1, flooded.length);
+  const minimumCatchmentRatio = 0.65 + lossDepthPerStep / Math.max(0.001, rainfall);
+  if (catchmentRatio < minimumCatchmentRatio) return null;
+
+  return {
+    waterElevation: stableLevel,
+    flooded
+  };
+}
+
+function collectConnectedFloodedCells(coarse: CoarseGrid, candidates: Set<number>, sink: number, waterElevation: number): number[] {
+  if (!candidates.has(sink) || coarse.cells[sink].height > waterElevation) return [];
+  const flooded: number[] = [];
+  const visited = new Uint8Array(coarse.side * coarse.side);
+  const queue = [sink];
+  visited[sink] = 1;
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const index = queue[cursor];
+    flooded.push(index);
+    const x = index % coarse.side;
+    const y = Math.floor(index / coarse.side);
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= coarse.side || ny >= coarse.side) continue;
+        const neighborIndex = ny * coarse.side + nx;
+        if (visited[neighborIndex] || !candidates.has(neighborIndex)) continue;
+        if (coarse.cells[neighborIndex].height > waterElevation) continue;
+        visited[neighborIndex] = 1;
+        queue.push(neighborIndex);
+      }
+    }
+  }
+
+  return flooded;
 }
 
 function findBasinRim(coarse: CoarseGrid, basin: Set<number>): { height: number; outlet: number } | null {
@@ -406,6 +505,230 @@ function outlineCellsAsRadialPolygon(config: WorldConfig, coarse: CoarseGrid, ce
   return bins
     .filter((point): point is LakePointV1 & { distance: number } => Boolean(point))
     .map(({ x, z }) => ({ x, z }));
+}
+
+function outlineLakeWithMarchingSquares(config: WorldConfig, coarse: CoarseGrid, flooded: number[], waterElevation: number): LakePointV1[] {
+  const floodedSet = new Set(flooded);
+  const bounds = boundsForCells(coarse, flooded);
+  const segments: Array<[LakePointV1, LakePointV1]> = [];
+
+  for (let y = Math.max(0, bounds.minY - 1); y <= Math.min(coarse.side - 2, bounds.maxY + 1); y += 1) {
+    for (let x = Math.max(0, bounds.minX - 1); x <= Math.min(coarse.side - 2, bounds.maxX + 1); x += 1) {
+      const c0 = y * coarse.side + x;
+      const c1 = y * coarse.side + x + 1;
+      const c2 = (y + 1) * coarse.side + x + 1;
+      const c3 = (y + 1) * coarse.side + x;
+      const inside0 = floodedSet.has(c0) && coarse.cells[c0].height <= waterElevation;
+      const inside1 = floodedSet.has(c1) && coarse.cells[c1].height <= waterElevation;
+      const inside2 = floodedSet.has(c2) && coarse.cells[c2].height <= waterElevation;
+      const inside3 = floodedSet.has(c3) && coarse.cells[c3].height <= waterElevation;
+      const mask = (inside0 ? 1 : 0) | (inside1 ? 2 : 0) | (inside2 ? 4 : 0) | (inside3 ? 8 : 0);
+      if (mask === 0 || mask === 15) continue;
+
+      const top = interpolateContourPoint(config, coarse, x, y, x + 1, y, waterElevation);
+      const right = interpolateContourPoint(config, coarse, x + 1, y, x + 1, y + 1, waterElevation);
+      const bottom = interpolateContourPoint(config, coarse, x + 1, y + 1, x, y + 1, waterElevation);
+      const left = interpolateContourPoint(config, coarse, x, y + 1, x, y, waterElevation);
+      addMarchingSegments(segments, mask, top, right, bottom, left);
+    }
+  }
+
+  const loop = traceLongestContourLoop(segments);
+  if (loop.length >= 3) return simplifyPolygon(loop);
+  return outlineCellsAsRadialPolygon(config, coarse, flooded);
+}
+
+function addMarchingSegments(
+  segments: Array<[LakePointV1, LakePointV1]>,
+  mask: number,
+  top: LakePointV1,
+  right: LakePointV1,
+  bottom: LakePointV1,
+  left: LakePointV1
+): void {
+  switch (mask) {
+    case 1:
+    case 14:
+      segments.push([left, top]);
+      break;
+    case 2:
+    case 13:
+      segments.push([top, right]);
+      break;
+    case 3:
+    case 12:
+      segments.push([left, right]);
+      break;
+    case 4:
+    case 11:
+      segments.push([right, bottom]);
+      break;
+    case 5:
+      segments.push([left, top], [right, bottom]);
+      break;
+    case 6:
+    case 9:
+      segments.push([top, bottom]);
+      break;
+    case 7:
+    case 8:
+      segments.push([left, bottom]);
+      break;
+    case 10:
+      segments.push([top, right], [bottom, left]);
+      break;
+  }
+}
+
+function interpolateContourPoint(config: WorldConfig, coarse: CoarseGrid, ax: number, ay: number, bx: number, by: number, waterElevation: number): LakePointV1 {
+  const a = cellAt(coarse, ax, ay);
+  const b = cellAt(coarse, bx, by);
+  const denom = b.height - a.height;
+  const t = Math.max(0.001, Math.min(0.999, Math.abs(denom) < 0.000001 ? 0.5 : (waterElevation - a.height) / denom));
+  const x = ax + (bx - ax) * t;
+  const y = ay + (by - ay) * t;
+  return coarseGridPointToWorld(config, coarse, x, y);
+}
+
+function traceLongestContourLoop(segments: Array<[LakePointV1, LakePointV1]>): LakePointV1[] {
+  const adjacency = new Map<string, string[]>();
+  const points = new Map<string, LakePointV1>();
+  const unused = new Set<string>();
+  for (const [a, b] of segments) {
+    const ak = contourPointKey(a);
+    const bk = contourPointKey(b);
+    points.set(ak, a);
+    points.set(bk, b);
+    adjacency.set(ak, [...(adjacency.get(ak) ?? []), bk]);
+    adjacency.set(bk, [...(adjacency.get(bk) ?? []), ak]);
+    unused.add(contourEdgeKey(ak, bk));
+  }
+
+  const loops: LakePointV1[][] = [];
+  while (unused.size > 0) {
+    const firstEdge = unused.values().next().value;
+    if (!firstEdge) break;
+    const [start, next] = firstEdge.split('|');
+    const loopKeys = traceContourLoop(start, next, adjacency, unused, points);
+    if (loopKeys.length >= 4 && loopKeys[0] === loopKeys[loopKeys.length - 1]) {
+      const loop = loopKeys
+        .slice(0, -1)
+        .map((key) => points.get(key))
+        .filter((point): point is LakePointV1 => Boolean(point));
+      if (loop.length >= 3) loops.push(loop);
+    }
+  }
+  return loops.sort((a, b) => Math.abs(polygonArea(b)) - Math.abs(polygonArea(a)))[0] ?? [];
+}
+
+function traceContourLoop(
+  start: string,
+  next: string,
+  adjacency: Map<string, string[]>,
+  unused: Set<string>,
+  points: Map<string, LakePointV1>
+): string[] {
+  const loop = [start, next];
+  unused.delete(contourEdgeKey(start, next));
+  let previous = start;
+  let current = next;
+  for (let guard = 0; guard < unused.size + 4; guard += 1) {
+    if (current === start) break;
+    const candidates = (adjacency.get(current) ?? []).filter((candidate) => unused.has(contourEdgeKey(current, candidate)));
+    if (candidates.length === 0) break;
+    const chosen = chooseNextContourKey(previous, current, candidates, points);
+    unused.delete(contourEdgeKey(current, chosen));
+    loop.push(chosen);
+    previous = current;
+    current = chosen;
+  }
+  return loop;
+}
+
+function chooseNextContourKey(previous: string, current: string, candidates: string[], points: Map<string, LakePointV1>): string {
+  if (candidates.length === 1) return candidates[0];
+  const previousPoint = points.get(previous);
+  const currentPoint = points.get(current);
+  if (!previousPoint || !currentPoint) return candidates[0];
+  const inX = currentPoint.x - previousPoint.x;
+  const inZ = currentPoint.z - previousPoint.z;
+  let best = candidates[0];
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const candidate of candidates) {
+    const candidatePoint = points.get(candidate);
+    if (!candidatePoint) continue;
+    const outX = candidatePoint.x - currentPoint.x;
+    const outZ = candidatePoint.z - currentPoint.z;
+    const score = inX * outX + inZ * outZ;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function simplifyPolygon(points: LakePointV1[]): LakePointV1[] {
+  if (points.length <= 4) return points;
+  const simplified: LakePointV1[] = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const previous = points[(i + points.length - 1) % points.length];
+    const point = points[i];
+    const next = points[(i + 1) % points.length];
+    const ax = point.x - previous.x;
+    const az = point.z - previous.z;
+    const bx = next.x - point.x;
+    const bz = next.z - point.z;
+    const cross = Math.abs(ax * bz - az * bx);
+    const length = Math.max(0.000001, Math.hypot(ax, az) * Math.hypot(bx, bz));
+    if (cross / length > 0.015 || i % 6 === 0) simplified.push(point);
+  }
+  return simplified.length >= 3 ? simplified : points;
+}
+
+function boundsForCells(coarse: CoarseGrid, cells: number[]): { minX: number; maxX: number; minY: number; maxY: number } {
+  let minX = coarse.side - 1;
+  let maxX = 0;
+  let minY = coarse.side - 1;
+  let maxY = 0;
+  for (const index of cells) {
+    const x = index % coarse.side;
+    const y = Math.floor(index / coarse.side);
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+function coarseGridPointToWorld(config: WorldConfig, coarse: CoarseGrid, x: number, y: number): LakePointV1 {
+  const fullSide = config.tileSize * config.tilesPerSide;
+  const worldSize = fullSide * config.unitSize;
+  const sampleX = Math.min(fullSide - 1, (x + 0.5) * coarse.stride);
+  const sampleY = Math.min(fullSide - 1, (y + 0.5) * coarse.stride);
+  return {
+    x: sampleX * config.unitSize - worldSize / 2,
+    z: sampleY * config.unitSize - worldSize / 2
+  };
+}
+
+function contourPointKey(point: LakePointV1): string {
+  return `${point.x.toFixed(4)}:${point.z.toFixed(4)}`;
+}
+
+function contourEdgeKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+function polygonArea(points: LakePointV1[]): number {
+  let area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    area += a.x * b.z - b.x * a.z;
+  }
+  return area * 0.5;
 }
 
 function simplifyTrace(trace: TraceCell[], coarse: CoarseGrid): TraceCell[] {

@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { TileManager } from '../heightmap/tileManager';
 import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
-import { TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
+import { TerrainQuadtreeRenderer, type TerrainDebugMode, type VisualizationMode } from './terrainRenderer';
 import { AuthoringOverlay, type AuthoringSelection } from './authoringOverlay';
 import type { AnchorV1, AuthoringDocumentV1 } from '../authoring/authoringDocument';
 
@@ -116,6 +116,11 @@ export class EditorViewport {
 
   setVisualizationMode(mode: VisualizationMode): void {
     this.terrain.setVisualizationMode(mode);
+  }
+
+  setTerrainDebugMode(mode: TerrainDebugMode): void {
+    this.terrain.setDebugMode(mode);
+    void this.terrain.update(this.controller.activeCamera);
   }
 
   setLodAggression(aggression: number): void {

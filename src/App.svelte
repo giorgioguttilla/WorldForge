@@ -5,7 +5,7 @@
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
-  import type { VisualizationMode } from './lib/render/terrainRenderer';
+  import type { TerrainDebugMode, VisualizationMode } from './lib/render/terrainRenderer';
   import { applyErosionPreset, createAnchor, createEmptyAuthoringDocument, createLandformArea, createMountainSpline, type AnchorV1, type AuthoringDocumentV1, type ErosionPresetV1, type ErosionSettingsV1, type LandformModeV1, type PrimitiveV1 } from './lib/authoring/authoringDocument';
   import { estimateErosionBakeMemoryMb } from './lib/authoring/erosionBakeWebGpu';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
@@ -36,6 +36,7 @@
   let backend = 'initializing';
   let viewMode: ViewMode = 'free';
   let visualizationMode: VisualizationMode = 'topo';
+  let terrainDebugMode: TerrainDebugMode = 'heightmap';
   let showRenderSettings = false;
   let showWater = false;
   let bakeDebugTelemetry = false;
@@ -96,6 +97,7 @@
     });
     await viewport.init();
     viewport.setLodAggression(lodAggression);
+    viewport.setTerrainDebugMode(terrainDebugMode);
     viewport.setAuthoringInputHandlers({
       pointerDown: handleAuthoringPointerDown,
       pointerMove: handleAuthoringPointerMove,
@@ -151,6 +153,11 @@
       }
       if ((event.metaKey || event.ctrlKey) && (event.code === 'KeyY' || (event.code === 'KeyZ' && event.shiftKey))) {
         redoAuthoring();
+        event.preventDefault();
+        return;
+      }
+      if (event.code === 'KeyO' && !isTextInput(event.target)) {
+        cycleTerrainDebugMode();
         event.preventDefault();
       }
     };
@@ -641,6 +648,16 @@
       preset: patch.preset ?? (patch.enabled === undefined ? 'custom' : authoringDocument.erosion.preset)
     };
     commitAuthoring({ ...authoringDocument, erosion: nextErosion });
+  }
+
+  function cycleTerrainDebugMode() {
+    terrainDebugMode = terrainDebugMode === 'heightmap' ? 'water-flow' : terrainDebugMode === 'water-flow' ? 'retained-water' : 'heightmap';
+    viewport?.setTerrainDebugMode(terrainDebugMode);
+    status = terrainDebugMode === 'water-flow'
+      ? 'Debug view: mean through-flow.'
+      : terrainDebugMode === 'retained-water'
+        ? 'Debug view: retained water.'
+        : `Editing ${manager.config?.name ?? 'world'}.`;
   }
 
   function setErosionPreset(preset: ErosionPresetV1) {
@@ -1347,16 +1364,17 @@
                 <NumericInput min={1} max={89} step="1" value={erosionSettings.talusAngleDegrees} onCommit={(value) => updateErosionSettings({ talusAngleDegrees: value })} />
               </label>
             </div>
-            <label class="toggle-row" title="Writes a water-flow mask that later systems can use for rivers, lakes, waterfalls, wetlands, and biome hints.">
+            <label class="toggle-row" title="Writes hydrology rasters: mean through-flow for rivers and retained water for lakes, wetlands, and biome hints.">
               <input type="checkbox" checked={erosionSettings.outputWaterMask} onchange={(event) => updateErosionSettings({ outputWaterMask: event.currentTarget.checked })} />
-              <span>Output water mask</span>
+              <span>Output hydrology maps</span>
             </label>
             <div class="erosion-footnote">~{erosionMemoryMb.toFixed(0)} MB GPU working set per chunk</div>
             {#if authoringDocument.lastBake?.erosion?.enabled}
             <div class="erosion-diagnostics">
               <div>Max Δ {formatDiagnostic(authoringDocument.lastBake.erosion.maxHeightDelta)}</div>
               <div>Mean Δ {formatDiagnostic(authoringDocument.lastBake.erosion.meanAbsHeightDelta)}</div>
-              <div>Mask {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+              <div>Flow {Math.round(authoringDocument.lastBake.erosion.maxWaterMask ?? 0).toLocaleString()}</div>
+              <div>Retained {Math.round(authoringDocument.lastBake.erosion.maxRetainedWaterMask ?? 0).toLocaleString()}</div>
               <div>Rivers {authoringDocument.rivers.length}</div>
               <div>Lakes {authoringDocument.lakes.length}</div>
             </div>

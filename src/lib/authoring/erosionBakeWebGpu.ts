@@ -10,6 +10,8 @@ export interface ErosionTileIO {
   writeTile(key: TileKey, samples: Uint16Array): Promise<void>;
   readWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
   writeWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readRetainedWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
+  writeRetainedWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface ErosionProgress {
@@ -61,6 +63,7 @@ interface ErosionUniforms {
   thermalStrength: number;
   talus: number;
   waterMaskScale: number;
+  hydraulicIterations: number;
 }
 
 const WORKGROUP_SIZE = 8;
@@ -149,7 +152,8 @@ export async function runWebGpuErosionBake(
     summary: createErosionSummary(settings, [...new Set(warnings)], {
       maxHeightDelta: diagnostics.maxHeightDelta,
       meanAbsHeightDelta,
-      maxWaterMask: diagnostics.maxWaterMask
+      maxWaterMask: diagnostics.maxWaterMask,
+      maxRetainedWaterMask: 0
     })
   };
 }
@@ -188,7 +192,8 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
         hardness: settings.hardness,
         thermalStrength: settings.thermalStrength,
         talus: Math.tan((settings.talusAngleDegrees * Math.PI) / 180) * config.unitSize,
-        waterMaskScale: settings.waterMaskScale
+        waterMaskScale: settings.waterMaskScale,
+        hydraulicIterations: settings.hydraulicIterations
       };
       const inputWithMacro = await applyMacroErosion(device, pipeline, config, settings, input, width, height);
       const buffers = createSimulationBuffers(device, inputWithMacro, width * height, outputCount);
@@ -217,6 +222,8 @@ async function createGpuErosionBake(device: GPUDevice, config: WorldConfig, sett
         const maskFloats = new Float32Array(buffers.valueReadback.getMappedRange());
         const waterMask = new Uint16Array(outputCount);
         for (let i = 0; i < outputCount; i += 1) waterMask[i] = Math.max(0, Math.min(65535, Math.round(maskFloats[i])));
+        buffers.valueReadback.unmap();
+        maskReadbackMapped = false;
 
         return { heights, waterMask };
       } finally {
@@ -264,7 +271,8 @@ async function applyMacroErosion(
     hardness: settings.hardness,
     thermalStrength: settings.thermalStrength,
     talus: Math.tan((settings.talusAngleDegrees * Math.PI) / 180) * config.unitSize * factor,
-    waterMaskScale: settings.waterMaskScale
+    waterMaskScale: settings.waterMaskScale,
+    hydraulicIterations: coarseSettings.hydraulicIterations
   };
   const coarseBuffers = createSimulationBuffers(device, coarseInput, coarseWidth * coarseHeight, coarseWidth * coarseHeight);
   let mapped = false;
@@ -598,7 +606,7 @@ function dedupeTiles(tiles: TileKey[]): TileKey[] {
   return [...unique.values()].sort((a, b) => a.d - b.d || a.y - b.y || a.x - b.x);
 }
 
-function createErosionSummary(settings: ErosionSettingsV1, warnings: string[], diagnostics?: { maxHeightDelta: number; meanAbsHeightDelta: number; maxWaterMask: number }): ErosionBakeSummaryV1 {
+function createErosionSummary(settings: ErosionSettingsV1, warnings: string[], diagnostics?: { maxHeightDelta: number; meanAbsHeightDelta: number; maxWaterMask: number; maxRetainedWaterMask?: number }): ErosionBakeSummaryV1 {
   return {
     enabled: settings.enabled,
     preset: settings.preset,
@@ -606,11 +614,12 @@ function createErosionSummary(settings: ErosionSettingsV1, warnings: string[], d
     thermalIterations: settings.thermalEnabled ? settings.thermalIterations : 0,
     chunkSize: settings.chunkSize,
     overlap: settings.overlap,
-    waterMask: 'accumulated-water-influence',
+    waterMask: 'hydrology-depth-v2',
     ...(diagnostics ? {
       maxHeightDelta: diagnostics.maxHeightDelta,
       meanAbsHeightDelta: diagnostics.meanAbsHeightDelta,
-      maxWaterMask: diagnostics.maxWaterMask
+      maxWaterMask: diagnostics.maxWaterMask,
+      maxRetainedWaterMask: diagnostics.maxRetainedWaterMask
     } : {}),
     warnings
   };
@@ -670,7 +679,7 @@ function packUniforms(uniforms: ErosionUniforms, passType: number, parity: numbe
     uniforms.rainfall, uniforms.evaporation, uniforms.erosionStrength, uniforms.depositionStrength,
     uniforms.sedimentCapacity, uniforms.hardness, uniforms.thermalStrength, uniforms.talus,
     uniforms.waterMaskScale, passType, parity, writeOffsetX,
-    writeOffsetY, writeWidth, writeHeight, 0
+    writeOffsetY, writeWidth, writeHeight, uniforms.hydraulicIterations
   ]);
 }
 
@@ -700,7 +709,7 @@ struct Params {
   writeOffsetY: f32,
   writeWidth: f32,
   writeHeight: f32,
-  _pad: f32,
+  hydraulicIterations: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -733,6 +742,7 @@ fn p(i: u32) -> f32 {
     case 16u: { return params.writeOffsetY; }
     case 17u: { return params.writeWidth; }
     case 18u: { return params.writeHeight; }
+    case 19u: { return params.hydraulicIterations; }
     default: { return 0.0; }
   }
 }
@@ -895,9 +905,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       outputValues[out] = clamp(hRead(source), 0.0, p(3));
       return;
     }
-    let influence = max(0.0, flowAccum[source]);
-    let normalized = 1.0 - exp(-influence / max(0.0001, p(12)));
-    outputValues[out] = round(clamp(normalized, 0.0, 1.0) * 65535.0);
+    let meanThroughFlowDepth = max(0.0, flowAccum[source]);
+    outputValues[out] = round(clamp(meanThroughFlowDepth / max(0.0001, p(12)), 0.0, 1.0) * 65535.0);
     return;
   }
 
@@ -1024,7 +1033,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   nextWater = max(0.0, nextWater * (1.0 - p(5) * 0.08));
   hWrite(i, clamp(nextHeight, 0.0, p(3)));
   hydroWrite(i, vec2<f32>(nextWater, max(0.0, nextSediment)));
-  flowAccum[i] = flowAccum[i] + nextWater + outgoingWater + incomingWater;
+  flowAccum[i] = flowAccum[i] + outgoingWater / max(1.0, p(19));
 }
 `;
 }

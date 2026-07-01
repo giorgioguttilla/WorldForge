@@ -119,10 +119,11 @@ export interface ErosionBakeSummaryV1 {
   thermalIterations: number;
   chunkSize: number;
   overlap: number;
-  waterMask: 'accumulated-water-influence';
+  waterMask: 'accumulated-water-influence' | 'hydrology-depth-v2';
   maxHeightDelta?: number;
   meanAbsHeightDelta?: number;
   maxWaterMask?: number;
+  maxRetainedWaterMask?: number;
   warnings: string[];
 }
 
@@ -484,10 +485,11 @@ function normalizeErosionBakeSummary(value: unknown): ErosionBakeSummaryV1 | und
     thermalIterations: settings.thermalIterations,
     chunkSize: settings.chunkSize,
     overlap: settings.overlap,
-    waterMask: 'accumulated-water-influence',
+    waterMask: value.waterMask === 'hydrology-depth-v2' ? 'hydrology-depth-v2' : 'accumulated-water-influence',
     maxHeightDelta: Number.isFinite(value.maxHeightDelta) ? Number(value.maxHeightDelta) : undefined,
     meanAbsHeightDelta: Number.isFinite(value.meanAbsHeightDelta) ? Number(value.meanAbsHeightDelta) : undefined,
     maxWaterMask: Number.isFinite(value.maxWaterMask) ? Number(value.maxWaterMask) : undefined,
+    maxRetainedWaterMask: Number.isFinite(value.maxRetainedWaterMask) ? Number(value.maxRetainedWaterMask) : undefined,
     warnings: Array.isArray(value.warnings) ? value.warnings.filter((warning): warning is string => typeof warning === 'string') : []
   };
 }

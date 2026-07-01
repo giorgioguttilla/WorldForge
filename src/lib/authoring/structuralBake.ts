@@ -17,6 +17,7 @@ import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../no
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
 import { extractHydrologyAssets } from './riverExtraction';
+import { bakeRetainedWaterMasks, type RetainedWaterBakeResult } from './retainedWaterBake';
 
 export interface BakeProgress {
   phase: 'baking' | 'eroding' | 'extracting-rivers' | 'building-lod';
@@ -30,6 +31,8 @@ export interface BakeTileIO {
   writeTile(key: TileKey, samples: Uint16Array): Promise<void>;
   readWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
   writeWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readRetainedWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
+  writeRetainedWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface BakePassResult {
@@ -71,6 +74,8 @@ interface RiverExtractionPassResult extends BakePassResult {
   rivers: RiverAssetV1[];
   lakes: LakeAssetV1[];
 }
+
+interface RetainedWaterPassResult extends BakePassResult, RetainedWaterBakeResult {}
 
 interface BakeWorkerResponse {
   id: number;
@@ -136,13 +141,19 @@ export async function bakeStructuralAuthoring(
   };
   const riverExtraction = await riverPass.run();
 
+  const retainedWaterPass: BakePass<RetainedWaterPassResult> = {
+    id: 'retained-water-v1',
+    run: () => runRetainedWaterPass(config, document, riverExtraction.lakes, io, onProgress)
+  };
+  const retainedWater = await retainedWaterPass.run();
+
   const lodPass: BakePass<LodPassResult> = {
     id: 'lod-rebuild',
     run: () => runLodRebuildPass(config, lodSourceTiles, io, onProgress)
   };
   const lod = await lodPass.run();
 
-  const erosionSummary = erosion.summary;
+  const erosionSummary = mergeRetainedWaterSummary(erosion.summary, retainedWater);
   return {
     metadata: {
       id: crypto.randomUUID(),
@@ -157,7 +168,7 @@ export async function bakeStructuralAuthoring(
     dirtyTiles: lodSourceTiles,
     lodTileCount: lod.lodTileCount,
     rivers: riverExtraction.rivers,
-    lakes: riverExtraction.lakes
+    lakes: retainedWater.lakes
   };
 }
 
@@ -452,9 +463,29 @@ async function runRiverExtractionPass(
   onProgress?: (progress: BakeProgress) => void
 ): Promise<RiverExtractionPassResult> {
   onProgress?.({ phase: 'extracting-rivers', current: 0, total: 1, label: 'Extracting hydrology assets from heightmap flow' });
-  const hydrology = await extractHydrologyAssets(config, io);
+  const hydrology = await extractHydrologyAssets(config, io, new Date().toISOString(), {
+    rainfall: _document.erosion.rainfall,
+    evaporation: _document.erosion.evaporation
+  });
   onProgress?.({ phase: 'extracting-rivers', current: 1, total: 1, label: `Extracted ${hydrology.rivers.length} rivers and ${hydrology.lakes.length} lakes` });
   return { id: 'river-extraction-v1', ...hydrology };
+}
+
+async function runRetainedWaterPass(
+  config: WorldConfig,
+  document: AuthoringDocumentV1,
+  lakes: LakeAssetV1[],
+  io: BakeTileIO,
+  onProgress?: (progress: BakeProgress) => void
+): Promise<RetainedWaterPassResult> {
+  if (!document.erosion?.outputWaterMask || !io.writeRetainedWaterMaskTile) {
+    return { id: 'retained-water-v1', maxRetainedWaterMask: 0, lakes };
+  }
+  onProgress?.({ phase: 'extracting-rivers', current: 0, total: 1, label: 'Rasterizing retained water basins' });
+  const result = await bakeRetainedWaterMasks(config, document.erosion, lakes, io, (current, total) => {
+    onProgress?.({ phase: 'extracting-rivers', current, total, label: `Rasterizing retained water ${current} / ${total}` });
+  });
+  return { id: 'retained-water-v1', ...result };
 }
 
 async function runLodRebuildPass(
@@ -570,6 +601,14 @@ function getDirtyAncestors(dirtyTiles: TileKey[], fullTilesPerSide: number): Til
     }
   }
   return [...unique.values()].sort((a, b) => a.d - b.d || a.y - b.y || a.x - b.x);
+}
+
+function mergeRetainedWaterSummary(summary: ErosionBakeSummaryV1 | undefined, retainedWater: RetainedWaterBakeResult): ErosionBakeSummaryV1 | undefined {
+  if (!summary) return undefined;
+  return {
+    ...summary,
+    maxRetainedWaterMask: retainedWater.maxRetainedWaterMask
+  };
 }
 
 function createBakeWorker(): Worker {

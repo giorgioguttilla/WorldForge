@@ -130,7 +130,39 @@ describe('river extraction', () => {
 
     expect(hydrology.lakes.length).toBeGreaterThan(0);
     expect(hydrology.lakes[0].source).toBe('heightmap-depression-v2');
-    expect(hydrology.lakes[0].points.length).toBeGreaterThanOrEqual(3);
+    expect(hydrology.lakes[0].points.length).toBeGreaterThanOrEqual(8);
     expect(hydrology.lakes[0].maxDepth).toBeGreaterThan(0);
+    expect(maxClosedPolygonSegmentLength(hydrology.lakes[0].points)).toBeLessThan(8);
+  });
+
+  it('uses water budget to reject dry basins and keep wet basins', async () => {
+    const heights = new Uint16Array(config.tileSize * config.tileSize);
+    for (let y = 0; y < config.tileSize; y += 1) {
+      for (let x = 0; x < config.tileSize; x += 1) {
+        const distance = Math.hypot(x - 16, y - 16);
+        const basin = Math.min(1, distance / 14);
+        heights[y * config.tileSize + x] = Math.round((0.25 + basin * 0.48) * 65535);
+      }
+    }
+
+    const dry = await extractHydrologyAssets(config, {
+      readTile: async () => heights
+    }, 'test-time', { rainfall: 0.01, evaporation: 2, infiltration: 0.7 });
+    const wet = await extractHydrologyAssets(config, {
+      readTile: async () => heights
+    }, 'test-time', { rainfall: 1.2, evaporation: 0.05, infiltration: 0.02 });
+
+    expect(dry.lakes.length).toBe(0);
+    expect(wet.lakes.length).toBeGreaterThan(0);
   });
 });
+
+function maxClosedPolygonSegmentLength(points: Array<{ x: number; z: number }>): number {
+  let maxLength = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    maxLength = Math.max(maxLength, Math.hypot(a.x - b.x, a.z - b.z));
+  }
+  return maxLength;
+}

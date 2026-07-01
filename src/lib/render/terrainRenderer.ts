@@ -5,6 +5,7 @@ import type { TileKey } from '../heightmap/tileKey';
 import type { ViewMode } from './cameraController';
 
 export type VisualizationMode = 'wireframe' | 'topo' | 'render';
+export type TerrainDebugMode = 'heightmap' | 'water-flow' | 'retained-water';
 
 const CHUNK_SEGMENTS_PER_SIDE = 64;
 const BASE_SAMPLE_SCREEN_ERROR_PX = 15;
@@ -22,6 +23,12 @@ interface TerrainNode {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
   key: string;
   inUse: boolean;
+}
+
+interface WaterMaskNode {
+  mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+  texture: THREE.DataTexture;
+  key: string;
 }
 
 interface ChunkBounds {
@@ -42,6 +49,11 @@ interface RenderChunkKey {
 
 interface RenderTileCacheEntry {
   samples: Promise<Uint16Array>;
+  lastUsed: number;
+}
+
+interface WaterMaskTileCacheEntry {
+  samples: Promise<Uint16Array | null>;
   lastUsed: number;
 }
 
@@ -100,12 +112,15 @@ class StaleTerrainBuildError extends Error {
 export class TerrainQuadtreeRenderer {
   readonly group = new THREE.Group();
   visualizationMode: VisualizationMode = 'topo';
+  debugMode: TerrainDebugMode = 'heightmap';
 
   private readonly pool: TerrainNode[] = [];
   private readonly freeNodes: TerrainNode[] = [];
   private readonly active = new Map<string, TerrainNode>();
   private readonly staged = new Map<string, TerrainNode>();
+  private readonly waterMaskActive = new Map<string, WaterMaskNode>();
   private readonly tileCache = new Map<string, RenderTileCacheEntry>();
+  private readonly waterMaskCache = new Map<string, WaterMaskTileCacheEntry>();
   private readonly workers: ChunkWorkerState[] = [];
   private readonly material = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -163,12 +178,15 @@ export class TerrainQuadtreeRenderer {
       state.tileCache.clear();
       state.pending = 0;
     }
+    this.clearWaterMaskNodes();
     this.material.dispose();
     this.pool.length = 0;
     this.freeNodes.length = 0;
     this.active.clear();
     this.staged.clear();
+    this.clearWaterMaskNodes();
     this.tileCache.clear();
+    this.waterMaskCache.clear();
     for (const state of this.workers) state.tileCache.clear();
   }
 
@@ -184,6 +202,7 @@ export class TerrainQuadtreeRenderer {
     this.active.clear();
     this.staged.clear();
     this.tileCache.clear();
+    this.waterMaskCache.clear();
     for (const state of this.workers) state.tileCache.clear();
     this.lastSelectionId = '';
     this.lastCameraSignature = '';
@@ -195,6 +214,27 @@ export class TerrainQuadtreeRenderer {
     this.visualizationMode = mode;
     for (const node of this.pool) {
       node.mesh.geometry.computeVertexNormals();
+    }
+    this.applyVisualizationMode();
+  }
+
+  setDebugMode(mode: TerrainDebugMode): void {
+    if (this.debugMode === mode) return;
+    const previousMode = this.debugMode;
+    this.debugMode = mode;
+    this.generation += 1;
+    this.cancelPendingBuilds();
+    this.lastSelectionId = '';
+    this.lastCameraSignature = '';
+    if (previousMode !== 'heightmap' && mode !== 'heightmap') {
+      this.clearWaterMaskNodes();
+    }
+    if (mode !== 'heightmap') {
+      for (const node of this.active.values()) node.mesh.visible = false;
+      for (const node of this.staged.values()) node.mesh.visible = false;
+    } else {
+      this.clearWaterMaskNodes();
+      for (const node of this.active.values()) node.mesh.visible = true;
     }
     this.applyVisualizationMode();
   }
@@ -225,6 +265,11 @@ export class TerrainQuadtreeRenderer {
   private async updateSelection(camera: THREE.Camera): Promise<void> {
     const config = this.manager.config;
     if (!config) return;
+    if (this.debugMode !== 'heightmap') {
+      await this.updateWaterMaskSelection(config, camera);
+      return;
+    }
+
     const generation = this.generation;
 
     const cameraSignature = this.getCameraSignature(camera);
@@ -330,6 +375,68 @@ export class TerrainQuadtreeRenderer {
 
     visit(root);
     return keys.sort((a, b) => b.lod - a.lod || a.y - b.y || a.x - b.x);
+  }
+
+  private selectVisibleWaterMaskTiles(config: WorldConfig, camera: THREE.Camera): TileKey[] {
+    camera.updateMatrixWorld();
+    const frustum = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+    const tileWorldSize = config.tileSize * config.unitSize;
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    const keys: TileKey[] = [];
+    const maxY = Math.max(config.worldHeight, config.unitSize);
+    const visit = (tileX: number, tileY: number, tileCount: number): void => {
+      const minX = tileX * tileWorldSize - worldSize / 2;
+      const minZ = tileY * tileWorldSize - worldSize / 2;
+      const size = tileCount * tileWorldSize;
+      const box = new THREE.Box3(
+        new THREE.Vector3(minX, 0, minZ),
+        new THREE.Vector3(minX + size, maxY, minZ + size)
+      );
+      if (!frustum.intersectsBox(box)) return;
+      if (tileCount <= 1) {
+        keys.push({ x: tileX, y: tileY, d: 0 });
+        return;
+      }
+      const half = tileCount / 2;
+      visit(tileX, tileY, half);
+      visit(tileX + half, tileY, half);
+      visit(tileX, tileY + half, half);
+      visit(tileX + half, tileY + half, half);
+    };
+
+    visit(0, 0, config.tilesPerSide);
+
+    return keys;
+  }
+
+  private async updateWaterMaskSelection(config: WorldConfig, camera: THREE.Camera): Promise<void> {
+    const generation = this.generation;
+    const keys = this.selectVisibleWaterMaskTiles(config, camera);
+    const nextIds = new Set(keys.map((key) => `${key.x}:${key.y}`));
+
+    for (const [id, node] of this.waterMaskActive) {
+      if (nextIds.has(id)) {
+        node.mesh.visible = true;
+        continue;
+      }
+      this.disposeWaterMaskNode(node);
+      this.waterMaskActive.delete(id);
+    }
+
+    for (const key of keys) {
+      const id = `${key.x}:${key.y}`;
+      if (this.waterMaskActive.has(id)) continue;
+      const node = await this.createWaterMaskNode(config, key, generation);
+      if (!node) continue;
+      if (this.generation !== generation || this.debugMode === 'heightmap' || this.manager.config?.id !== config.id) {
+        this.disposeWaterMaskNode(node);
+        return;
+      }
+      this.waterMaskActive.set(id, node);
+      this.group.add(node.mesh);
+    }
+
+    this.updateMetrics();
   }
 
   private shouldRenderTile(bounds: ChunkBounds, camera: THREE.Camera): boolean {
@@ -596,14 +703,79 @@ export class TerrainQuadtreeRenderer {
     return entry.samples;
   }
 
+  private readWaterMaskSamples(config: WorldConfig, key: TileKey): Promise<Uint16Array | null> {
+    const id = `${config.id}:${this.debugMode}:${key.d}:${key.x}:${key.y}`;
+    const cached = this.waterMaskCache.get(id);
+    if (cached) {
+      cached.lastUsed = performance.now();
+      return cached.samples;
+    }
+
+    const entry: WaterMaskTileCacheEntry = {
+      samples: this.debugMode === 'retained-water' ? this.manager.readRetainedWaterMaskTile(key) : this.manager.readWaterMaskTile(key),
+      lastUsed: performance.now()
+    };
+    this.waterMaskCache.set(id, entry);
+    if (this.waterMaskCache.size > MAX_RENDER_TILE_CACHE_ENTRIES) {
+      const oldest = [...this.waterMaskCache.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+      if (oldest) this.waterMaskCache.delete(oldest[0]);
+    }
+    return entry.samples;
+  }
+
   private updateMetrics(): void {
     let vertices = 0;
     let triangles = 0;
+    if (this.debugMode !== 'heightmap') {
+      for (const node of this.waterMaskActive.values()) {
+        vertices += node.mesh.geometry.attributes.position.count;
+        triangles += (node.mesh.geometry.index?.count ?? 0) / 3;
+      }
+      this.manager.setRenderMetrics(this.waterMaskActive.size, vertices, triangles);
+      return;
+    }
     for (const node of this.active.values()) {
+      if (!node.mesh.visible) continue;
       vertices += node.mesh.geometry.attributes.position.count;
       triangles += (node.mesh.geometry.index?.count ?? 0) / 3;
     }
     this.manager.setRenderMetrics(this.active.size, vertices, triangles);
+  }
+
+  private async createWaterMaskNode(config: WorldConfig, key: TileKey, generation: number): Promise<WaterMaskNode | null> {
+    const samples = await this.readWaterMaskSamples(config, key);
+    if (this.generation !== generation || this.manager.config?.id !== config.id) throw new StaleTerrainBuildError();
+    const texture = createWaterMaskTexture(samples, config.tileSize);
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      side: THREE.DoubleSide,
+      toneMapped: false
+    });
+    const tileWorldSize = config.tileSize * config.unitSize;
+    const geometry = new THREE.PlaneGeometry(tileWorldSize, tileWorldSize, 1, 1);
+    geometry.rotateX(-Math.PI / 2);
+    const mesh = new THREE.Mesh(geometry, material);
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    mesh.position.set(
+      (key.x + 0.5) * tileWorldSize - worldSize / 2,
+      Math.max(config.unitSize * 0.2, config.worldHeight * 0.012),
+      (key.y + 0.5) * tileWorldSize - worldSize / 2
+    );
+    mesh.renderOrder = 4;
+    mesh.frustumCulled = true;
+    return { mesh, texture, key: `${key.x}:${key.y}` };
+  }
+
+  private clearWaterMaskNodes(): void {
+    for (const node of this.waterMaskActive.values()) this.disposeWaterMaskNode(node);
+    this.waterMaskActive.clear();
+  }
+
+  private disposeWaterMaskNode(node: WaterMaskNode): void {
+    this.group.remove(node.mesh);
+    node.mesh.geometry.dispose();
+    node.texture.dispose();
+    node.mesh.material.dispose();
   }
 
   private getCameraSignature(camera: THREE.Camera): string {
@@ -657,10 +829,10 @@ export class TerrainQuadtreeRenderer {
   }
 
   private applyVisualizationMode(): void {
-    this.material.wireframe = this.visualizationMode === 'wireframe';
-    this.material.vertexColors = this.visualizationMode === 'topo';
-    this.material.color.set(this.visualizationMode === 'render' ? 0xf4f3ee : 0xdff8e9);
-    this.material.roughness = this.visualizationMode === 'render' ? 0.96 : 0.82;
+    this.material.wireframe = this.debugMode === 'heightmap' && this.visualizationMode === 'wireframe';
+    this.material.vertexColors = this.debugMode !== 'heightmap' || this.visualizationMode === 'topo';
+    this.material.color.set(this.debugMode !== 'heightmap' ? 0xffffff : this.visualizationMode === 'render' ? 0xf4f3ee : 0xdff8e9);
+    this.material.roughness = this.debugMode !== 'heightmap' ? 0.72 : this.visualizationMode === 'render' ? 0.96 : 0.82;
     this.material.metalness = 0;
     this.material.needsUpdate = true;
   }
@@ -674,4 +846,24 @@ export class TerrainQuadtreeRenderer {
     return attribute;
   }
 
+}
+
+function createWaterMaskTexture(samples: Uint16Array | null, tileSize: number): THREE.DataTexture {
+  const data = new Uint8Array(tileSize * tileSize * 4);
+  for (let i = 0; i < tileSize * tileSize; i += 1) {
+    const wet = samples ? Math.sqrt((samples[i] ?? 0) / 65535) : 0;
+    const offset = i * 4;
+    data[offset] = Math.round(6 + wet * 46);
+    data[offset + 1] = Math.round(12 + wet * 158);
+    data[offset + 2] = Math.round(18 + wet * 237);
+    data[offset + 3] = 255;
+  }
+  const texture = new THREE.DataTexture(data, tileSize, tileSize, THREE.RGBAFormat, THREE.UnsignedByteType);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.flipY = true;
+  texture.generateMipmaps = false;
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+  return texture;
 }
