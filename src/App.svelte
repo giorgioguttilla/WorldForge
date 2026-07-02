@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { CircleDot, CirclePlus, Crosshair, Download, Edit3, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
-  import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
+  import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
   import type { ViewMode } from './lib/render/cameraController';
@@ -24,6 +24,7 @@
   let viewport: EditorViewport | null = null;
   const manager = new TileManager();
 
+  let activeConfig: WorldConfig | null = null;
   let worldInput: WorldConfigInput = { ...DEFAULT_WORLD_INPUT };
   let showDialog = false;
   let replacingExistingWorld = false;
@@ -36,7 +37,7 @@
   let backend = 'initializing';
   let viewMode: ViewMode = 'free';
   let visualizationMode: VisualizationMode = 'topo';
-  let showRenderSettings = false;
+  let showSettings = false;
   let showWater = false;
   let bakeDebugTelemetry = false;
   let preferWebGpuBake = true;
@@ -87,6 +88,7 @@
   $: hasAuthoringWorld = Boolean(activeWorldId && authoringDocument);
   $: modalInputLocked = Boolean(editingField);
   $: viewport?.setInputLocked(modalInputLocked);
+  $: currentWorldHeight = activeConfig?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight;
 
   onMount(async () => {
     preferWebGpuBake = readBooleanSetting(WEBGPU_BAKE_SETTING_KEY, true);
@@ -187,10 +189,11 @@
     try {
       const replaceProjectId = replacingExistingWorld ? manager.config?.id : undefined;
       viewport?.terrain.clear();
-      await manager.createWorld(worldInput, {
+      const created = await manager.createWorld(worldInput, {
         replaceProjectId,
         onProgress: updateBulkProgress
       });
+      setActiveConfig(created);
       showDialog = false;
       replacingExistingWorld = false;
       confirmedReplace = false;
@@ -216,10 +219,12 @@
     try {
       const restored = await manager.openLastProject();
       if (!restored) {
+        setActiveConfig(null);
         showDialog = true;
         status = 'Create a world to begin.';
         return;
       }
+      setActiveConfig(restored);
       showDialog = false;
       status = `Editing ${restored.name}.`;
       metrics = { ...manager.metrics };
@@ -258,7 +263,8 @@
         status = 'No OPFS worlds found in this browser.';
         return;
       }
-      await manager.openProject(projects[0].id);
+      const opened = await manager.openProject(projects[0].id);
+      setActiveConfig(opened);
       viewport?.terrain.clear();
       showDialog = false;
       status = `Editing ${manager.config?.name ?? 'world'}.`;
@@ -290,14 +296,14 @@
   }
 
   function loadWaterSettings() {
-    const water = manager.config?.water ?? { visible: false, level: 0 };
+    const water = activeConfig?.water ?? { visible: false, level: 0 };
     showWater = water.visible;
     waterLevel = water.level;
     applyWaterSettings(false);
   }
 
   function applyWaterSettings(persist = true) {
-    const maxHeight = manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight;
+    const maxHeight = currentWorldHeight;
     waterLevel = Math.max(0, Math.min(maxHeight, waterLevel));
     viewport?.setWater({ visible: showWater, level: waterLevel });
     if (persist) scheduleWaterSettingsSave();
@@ -315,7 +321,8 @@
   async function saveWaterSettings() {
     if (!manager.config) return;
     try {
-      await manager.updateWaterConfig({ visible: showWater, level: waterLevel });
+      const updated = await manager.updateWaterConfig({ visible: showWater, level: waterLevel });
+      setActiveConfig(updated);
     } catch (error) {
       status = error instanceof Error ? error.message : 'Water settings save failed.';
     }
@@ -329,10 +336,33 @@
     }
   }
 
+  async function updateWorldHeight(value: number) {
+    if (!activeConfig) return;
+    const nextHeight = Math.max(1, Math.round(value));
+    if (nextHeight === activeConfig.worldHeight) return;
+    if (waterSaveTimer !== null) {
+      window.clearTimeout(waterSaveTimer);
+      waterSaveTimer = null;
+    }
+    try {
+      const updated = await manager.updateWorldHeight(nextHeight, { visible: showWater, level: waterLevel });
+      setActiveConfig(updated);
+      showWater = updated.water.visible;
+      waterLevel = updated.water.level;
+      viewport?.setWater({ visible: showWater, level: waterLevel });
+      viewport?.refreshTerrain();
+      metrics = { ...manager.metrics };
+      status = `World height set to ${updated.worldHeight.toLocaleString()}.`;
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'World height update failed.';
+    }
+  }
+
   async function loadAuthoringDocument() {
     if (!manager.config) {
       authoringDocument = null;
       activeWorldId = null;
+      setActiveConfig(null);
       syncAuthoringViewport();
       return;
     }
@@ -349,6 +379,10 @@
     redoStack = [];
     bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
     syncAuthoringViewport();
+  }
+
+  function setActiveConfig(config: WorldConfig | null) {
+    activeConfig = config ? { ...config, water: { ...config.water } } : null;
   }
 
   function syncAuthoringViewport() {
@@ -1039,7 +1073,7 @@
       <button type="button" title="New world" onclick={newWorld}><Plus size={17} /></button>
       <button type="button" title="Open latest OPFS world" onclick={openLatestWorld} disabled={opening}><FolderOpen size={17} /></button>
       <button type="button" title="Export world" onclick={exportWorld} disabled={exporting || !manager.config}><Download size={17} /></button>
-      <button type="button" title="Rendering settings" class:active={showRenderSettings} onclick={() => { showRenderSettings = !showRenderSettings; }}>
+      <button type="button" title="World settings" class:active={showSettings} onclick={() => { showSettings = !showSettings; }}>
         <Settings size={17} />
       </button>
     </div>
@@ -1119,9 +1153,19 @@
     </dl>
   </section>
 
-  {#if showRenderSettings}
-    <section class="render-settings" aria-label="Rendering settings">
-      <div class="metric-title">Rendering</div>
+  {#if showSettings}
+    <section class="render-settings" aria-label="World settings">
+      <div class="metric-title">Settings</div>
+      <label>
+        <span>World height</span>
+        <NumericInput
+          min={1}
+          step="1"
+          value={currentWorldHeight}
+          commitOnInput={false}
+          onCommit={(value) => void updateWorldHeight(value)}
+        />
+      </label>
       <label class="toggle-row">
         <input type="checkbox" bind:checked={showWater} onchange={() => applyWaterSettings()} />
         <span>Show water</span>
@@ -1150,7 +1194,7 @@
         <input
           type="range"
           min="0"
-          max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
+          max={currentWorldHeight}
           step="1"
           bind:value={waterLevel}
           oninput={() => applyWaterSettings()}
@@ -1158,7 +1202,7 @@
       </label>
       <NumericInput
         min="0"
-        max={manager.config?.worldHeight ?? DEFAULT_WORLD_INPUT.worldHeight}
+        max={currentWorldHeight}
         step="1"
         value={waterLevel}
         onCommit={(value) => {

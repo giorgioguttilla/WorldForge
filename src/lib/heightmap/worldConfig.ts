@@ -34,7 +34,7 @@ export const DEFAULT_WORLD_INPUT: WorldConfigInput = {
   unitSize: 1,
   unit: 'foot',
   tilesPerSide: 16,
-  worldHeight: 512
+  worldHeight: 1024
 };
 
 export function isPowerOfTwo(value: number): boolean {
