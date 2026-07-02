@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { TileManager } from '../heightmap/tileManager';
 import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
-import { TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
+import { LakeFillHeightDebugRenderer, TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
 import { AuthoringOverlay, type AuthoringSelection } from './authoringOverlay';
 import type { AnchorV1, AuthoringDocumentV1 } from '../authoring/authoringDocument';
 
@@ -37,6 +37,7 @@ export interface AuthoringPointerHandlers {
 export class EditorViewport {
   readonly controller: CameraController;
   readonly terrain: TerrainQuadtreeRenderer;
+  readonly fillDebug: LakeFillHeightDebugRenderer;
   readonly authoringOverlay = new AuthoringOverlay();
   readonly stats = new Stats();
   backend: 'webgpu' | 'webgl' = 'webgl';
@@ -55,6 +56,7 @@ export class EditorViewport {
   private authoringHandlers: AuthoringPointerHandlers | null = null;
   private authoringPointerId: number | null = null;
   private inputLocked = false;
+  private fillDebugVisible = false;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -64,6 +66,7 @@ export class EditorViewport {
   ) {
     this.controller = new CameraController(canvas, manager);
     this.terrain = new TerrainQuadtreeRenderer(manager);
+    this.fillDebug = new LakeFillHeightDebugRenderer(manager);
     const waterGeometry = new THREE.PlaneGeometry(1, 1, 1, 1);
     waterGeometry.rotateX(-Math.PI / 2);
     const waterMaterial = new THREE.MeshStandardMaterial({
@@ -85,6 +88,7 @@ export class EditorViewport {
     this.scene.background = new THREE.Color(0x0c1116);
     this.scene.fog = new THREE.FogExp2(0x0c1116, 0.000045);
     this.scene.add(this.terrain.group);
+    this.scene.add(this.fillDebug.group);
     this.scene.add(this.water);
     this.scene.add(this.authoringOverlay.group);
     this.scene.add(new THREE.HemisphereLight(0xcdeaff, 0x30402d, 1.8));
@@ -103,6 +107,7 @@ export class EditorViewport {
       this.canvas.addEventListener('pointerleave', this.onPointerLeave);
     }
     this.canvas.addEventListener('pointerdown', this.onAuthoringPointerDown);
+    window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('pointermove', this.onAuthoringPointerMove);
     window.addEventListener('pointerup', this.onAuthoringPointerUp);
     this.resize();
@@ -145,11 +150,13 @@ export class EditorViewport {
     this.stats.dom.remove();
     this.controller.dispose();
     this.terrain.dispose();
+    this.fillDebug.dispose();
     if (ENABLE_TERRAIN_RAYCAST) {
       this.canvas.removeEventListener('pointermove', this.onPointerMove);
       this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
     }
     this.canvas.removeEventListener('pointerdown', this.onAuthoringPointerDown);
+    window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('pointermove', this.onAuthoringPointerMove);
     window.removeEventListener('pointerup', this.onAuthoringPointerUp);
     this.water.geometry.dispose();
@@ -195,7 +202,12 @@ export class EditorViewport {
 
   refreshTerrain(): void {
     this.terrain.clear();
-    void this.terrain.update(this.controller.activeCamera);
+    this.fillDebug.clear();
+    if (this.fillDebugVisible) {
+      void this.fillDebug.rebuild();
+    } else {
+      void this.terrain.update(this.controller.activeCamera);
+    }
   }
 
   private animate = (): void => {
@@ -207,7 +219,7 @@ export class EditorViewport {
     this.lastFrameTime = now;
     this.controller.update(delta);
     this.updateAuthoringControlScale();
-    if (this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
+    if (!this.fillDebugVisible && this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
     this.rendererAdapter?.renderer.render(this.scene, this.controller.activeCamera);
     this.frame += 1;
     this.stats.end();
@@ -239,6 +251,22 @@ export class EditorViewport {
   private readonly onPointerLeave = (): void => {
     this.onHoverCoordinates?.(null);
   };
+
+  private readonly onKeyDown = (event: KeyboardEvent): void => {
+    if (this.inputLocked || event.repeat || event.code !== 'KeyO' || isTextInput(event.target)) return;
+    this.setFillDebugVisible(!this.fillDebugVisible);
+    event.preventDefault();
+  };
+
+  private setFillDebugVisible(visible: boolean): void {
+    this.fillDebugVisible = visible;
+    this.terrain.group.visible = !visible;
+    this.fillDebug.setVisible(visible);
+    this.water.visible = visible ? false : this.waterSettings.visible && Boolean(this.manager.config);
+    if (!visible) {
+      void this.terrain.update(this.controller.activeCamera);
+    }
+  }
 
   private readonly onAuthoringPointerDown = (event: PointerEvent): void => {
     if (this.inputLocked) return;
@@ -282,7 +310,7 @@ export class EditorViewport {
 
   private updateWaterPlane(): void {
     const config = this.manager.config;
-    this.water.visible = this.waterSettings.visible && Boolean(config);
+    this.water.visible = !this.fillDebugVisible && this.waterSettings.visible && Boolean(config);
     if (!config) return;
     const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
     const planeSize = Math.max(worldSize * 3, 10000);
@@ -375,4 +403,10 @@ export class EditorViewport {
     if (!this.raycaster.ray.intersectPlane(plane, hit)) return null;
     return { x: hit.x, z: hit.z, event };
   }
+}
+
+function isTextInput(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable;
 }

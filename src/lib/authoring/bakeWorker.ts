@@ -4,6 +4,7 @@ import type { TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
 import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { prepareStructuralDocument, type PreparedStructuralDocument } from './geometry';
+import { createHydrologyWorkerResponse, type HydrologyWorkerRequest } from './hydrologyBake';
 
 interface InitDepthZeroBakeRequest {
   id: number;
@@ -29,7 +30,7 @@ interface DownsampleLodTileRequest {
   children: ArrayBuffer[];
 }
 
-type BakeWorkerRequest = InitDepthZeroBakeRequest | BakeDepthZeroTileRequest | DownsampleLodTileRequest;
+type BakeWorkerRequest = InitDepthZeroBakeRequest | BakeDepthZeroTileRequest | DownsampleLodTileRequest | HydrologyWorkerRequest;
 
 interface BakeWorkerResponse {
   id: number;
@@ -47,6 +48,12 @@ let depthZeroState: { config: WorldConfig; prepared: PreparedStructuralDocument;
 self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
   const request = event.data;
   try {
+    if (request.type === 'hydrology-analyze-tile' || request.type === 'hydrology-materialize-tile') {
+      const { response, transfers } = createHydrologyWorkerResponse(request);
+      self.postMessage(response, transfers);
+      return;
+    }
+
     if (request.type === 'init-depth-zero-bake') {
       depthZeroState = {
         config: request.config,

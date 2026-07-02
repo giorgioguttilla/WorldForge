@@ -54,6 +54,7 @@ export interface BakeMetadataV1 {
   primitiveCount: number;
   tileCount: number;
   erosion?: ErosionBakeSummaryV1;
+  hydrology?: HydrologyBakeSummaryV1;
   error?: string;
 }
 
@@ -88,6 +89,29 @@ export interface ErosionBakeSummaryV1 {
   maxHeightDelta?: number;
   meanAbsHeightDelta?: number;
   maxWaterMask?: number;
+  warnings: string[];
+}
+
+export interface HydrologyBasinSummaryV1 {
+  id: number;
+  fillHeight: number;
+  minTerrainHeight: number;
+  maxDepth: number;
+  areaCells: number;
+  volumeCellHeight: number;
+  touchesOcean: boolean;
+}
+
+export interface HydrologyBakeSummaryV1 {
+  enabled: boolean;
+  epsilonR16: number;
+  tileCount: number;
+  basinCount: number;
+  lakeCellCount: number;
+  maxDepth: number;
+  volumeCellHeight: number;
+  lakeFillHeight: 'closed-basin-fill-height-r16';
+  basins: HydrologyBasinSummaryV1[];
   warnings: string[];
 }
 
@@ -343,6 +367,7 @@ function normalizeBakeMetadata(value: unknown): BakeMetadataV1 | undefined {
     primitiveCount: Math.max(0, finiteNumber(value.primitiveCount, 0)),
     tileCount: Math.max(0, finiteNumber(value.tileCount, 0)),
     erosion: normalizeErosionBakeSummary(value.erosion),
+    hydrology: normalizeHydrologyBakeSummary(value.hydrology),
     error: typeof value.error === 'string' ? value.error : undefined
   };
 }
@@ -386,6 +411,36 @@ function normalizeErosionBakeSummary(value: unknown): ErosionBakeSummaryV1 | und
     maxHeightDelta: Number.isFinite(value.maxHeightDelta) ? Number(value.maxHeightDelta) : undefined,
     meanAbsHeightDelta: Number.isFinite(value.meanAbsHeightDelta) ? Number(value.meanAbsHeightDelta) : undefined,
     maxWaterMask: Number.isFinite(value.maxWaterMask) ? Number(value.maxWaterMask) : undefined,
+    warnings: Array.isArray(value.warnings) ? value.warnings.filter((warning): warning is string => typeof warning === 'string') : []
+  };
+}
+
+function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 | undefined {
+  if (!isRecord(value)) return undefined;
+  const basins = Array.isArray(value.basins)
+    ? value.basins.map((basin) => {
+        if (!isRecord(basin)) return null;
+        return {
+          id: Math.max(0, Math.trunc(finiteNumber(basin.id, 0))),
+          fillHeight: finiteNumber(basin.fillHeight, 0),
+          minTerrainHeight: finiteNumber(basin.minTerrainHeight, 0),
+          maxDepth: finiteNumber(basin.maxDepth, 0),
+          areaCells: Math.max(0, Math.trunc(finiteNumber(basin.areaCells, 0))),
+          volumeCellHeight: Math.max(0, finiteNumber(basin.volumeCellHeight, 0)),
+          touchesOcean: Boolean(basin.touchesOcean)
+        };
+      }).filter((basin): basin is HydrologyBasinSummaryV1 => Boolean(basin))
+    : [];
+  return {
+    enabled: Boolean(value.enabled),
+    epsilonR16: Math.max(1, Math.trunc(finiteNumber(value.epsilonR16, 1))),
+    tileCount: Math.max(0, Math.trunc(finiteNumber(value.tileCount, 0))),
+    basinCount: Math.max(0, Math.trunc(finiteNumber(value.basinCount, basins.length))),
+    lakeCellCount: Math.max(0, Math.trunc(finiteNumber(value.lakeCellCount, 0))),
+    maxDepth: Math.max(0, finiteNumber(value.maxDepth, 0)),
+    volumeCellHeight: Math.max(0, finiteNumber(value.volumeCellHeight, 0)),
+    lakeFillHeight: 'closed-basin-fill-height-r16',
+    basins,
     warnings: Array.isArray(value.warnings) ? value.warnings.filter((warning): warning is string => typeof warning === 'string') : []
   };
 }

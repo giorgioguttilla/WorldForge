@@ -675,3 +675,112 @@ export class TerrainQuadtreeRenderer {
   }
 
 }
+
+interface LakeFillDebugTile {
+  mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+  texture: THREE.DataTexture;
+}
+
+export class LakeFillHeightDebugRenderer {
+  readonly group = new THREE.Group();
+
+  private readonly tiles: LakeFillDebugTile[] = [];
+  private generation = 0;
+  private loading = false;
+
+  constructor(private readonly manager: TileManager) {
+    this.group.visible = false;
+  }
+
+  async rebuild(): Promise<void> {
+    const config = this.manager.config;
+    if (!config) {
+      this.clear();
+      return;
+    }
+    const generation = this.generation + 1;
+    this.generation = generation;
+    this.loading = true;
+    this.clearTiles();
+
+    const jobs: Array<{ x: number; y: number }> = [];
+    for (let y = 0; y < config.tilesPerSide; y += 1) {
+      for (let x = 0; x < config.tilesPerSide; x += 1) jobs.push({ x, y });
+    }
+
+    const concurrency = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+    let nextJob = 0;
+    try {
+      await Promise.all(Array.from({ length: concurrency }, async () => {
+        while (nextJob < jobs.length) {
+          const job = jobs[nextJob];
+          nextJob += 1;
+          if (this.generation !== generation) return;
+          const samples = await this.manager.readLakeFillHeightTile({ x: job.x, y: job.y, d: 0 });
+          if (!samples || this.generation !== generation || this.manager.config?.id !== config.id) continue;
+          this.addTile(config, job.x, job.y, samples);
+        }
+      }));
+    } finally {
+      if (this.generation === generation) this.loading = false;
+    }
+  }
+
+  setVisible(visible: boolean): void {
+    this.group.visible = visible;
+    if (visible && !this.loading && this.tiles.length === 0) {
+      void this.rebuild();
+    }
+  }
+
+  clear(): void {
+    this.generation += 1;
+    this.loading = false;
+    this.clearTiles();
+  }
+
+  dispose(): void {
+    this.clear();
+  }
+
+  private addTile(config: WorldConfig, tileX: number, tileY: number, samples: Uint16Array): void {
+    const textureSamples = new Uint8Array(samples.length);
+    for (let i = 0; i < samples.length; i += 1) textureSamples[i] = samples[i] >>> 8;
+    const texture = new THREE.DataTexture(textureSamples, config.tileSize, config.tileSize, THREE.RedFormat, THREE.UnsignedByteType);
+    texture.needsUpdate = true;
+    texture.colorSpace = THREE.NoColorSpace;
+    texture.flipY = true;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.wrapS = THREE.ClampToEdgeWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+
+    const geometry = new THREE.PlaneGeometry(config.tileSize * config.unitSize, config.tileSize * config.unitSize, 1, 1);
+    geometry.rotateX(-Math.PI / 2);
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      side: THREE.DoubleSide,
+      toneMapped: false
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    mesh.position.set(
+      (tileX + 0.5) * config.tileSize * config.unitSize - worldSize / 2,
+      0,
+      (tileY + 0.5) * config.tileSize * config.unitSize - worldSize / 2
+    );
+    mesh.renderOrder = 3;
+    this.group.add(mesh);
+    this.tiles.push({ mesh, texture });
+  }
+
+  private clearTiles(): void {
+    for (const tile of this.tiles) {
+      this.group.remove(tile.mesh);
+      tile.mesh.geometry.dispose();
+      tile.mesh.material.dispose();
+      tile.texture.dispose();
+    }
+    this.tiles.length = 0;
+  }
+}

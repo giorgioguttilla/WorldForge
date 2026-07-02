@@ -1362,6 +1362,13 @@
                 <div class="erosion-warning">{authoringDocument.lastBake.erosion.warnings[0]}</div>
               {/if}
             {/if}
+            {#if authoringDocument.lastBake?.hydrology?.enabled}
+              <div class="erosion-diagnostics">
+                <div>Lakes {authoringDocument.lastBake.hydrology.lakeCellCount.toLocaleString()}</div>
+                <div>Depth {Math.round(authoringDocument.lastBake.hydrology.maxDepth).toLocaleString()}</div>
+                <div>Basins {authoringDocument.lastBake.hydrology.basinCount.toLocaleString()}</div>
+              </div>
+            {/if}
           </div>
         {/if}
       </div>

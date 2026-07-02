@@ -96,10 +96,22 @@ export class HeightmapTileStore {
   }
 
   async writeWaterMaskTile(key: TileKey, samples: Uint16Array): Promise<void> {
+    await this.writeMaskTile(waterMaskTilePath(key), samples, 'water mask');
+  }
+
+  async writeLakeFillHeightTile(key: TileKey, samples: Uint16Array): Promise<void> {
+    await this.writeMaskTile(lakeFillHeightTilePath(key), samples, 'lake fill height');
+  }
+
+  async readLakeFillHeightTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
+    return this.readOptionalMaskTile(lakeFillHeightTilePath(key), tileSize);
+  }
+
+  private async writeMaskTile(path: string, samples: Uint16Array, label: string): Promise<void> {
     const root = this.requireRoot();
-    const pathParts = waterMaskTilePath(key).split('/');
+    const pathParts = path.split('/');
     const fileName = pathParts.pop();
-    if (!fileName) throw new Error('Invalid water mask tile path.');
+    if (!fileName) throw new Error(`Invalid ${label} tile path.`);
     const dir = await this.ensureDirectory(root, pathParts);
     const handle = await dir.getFileHandle(fileName, { create: true });
     const writable = await handle.createWritable({ keepExistingData: false });
@@ -108,9 +120,13 @@ export class HeightmapTileStore {
   }
 
   async readWaterMaskTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
+    return this.readOptionalMaskTile(waterMaskTilePath(key), tileSize);
+  }
+
+  private async readOptionalMaskTile(path: string, tileSize: number): Promise<Uint16Array | null> {
     const root = this.requireRoot();
     try {
-      const file = await (await this.getFile(root, waterMaskTilePath(key))).getFile();
+      const file = await (await this.getFile(root, path)).getFile();
       return R16HeightmapCodec.decode(await file.arrayBuffer(), tileSize);
     } catch (error) {
       if (error instanceof DOMException && error.name === 'NotFoundError') return null;
@@ -185,4 +201,8 @@ export class HeightmapTileStore {
 
 export function waterMaskTilePath(key: TileKey, extension = 'r16'): string {
   return `masks/water/d${key.d}/y${key.y}/x${key.x}.${extension}`;
+}
+
+export function lakeFillHeightTilePath(key: TileKey, extension = 'r16'): string {
+  return `masks/lakes/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }

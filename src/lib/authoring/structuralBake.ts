@@ -1,7 +1,7 @@
 import { downsample2x2Children } from '../heightmap/lodBuilder';
 import { ancestorsForDirtyTile, childTileKeys, tileKeyToId, type TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
-import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1 } from './authoringDocument';
+import type { AuthoringDocumentV1, BakeMetadataV1, ErosionBakeSummaryV1, HydrologyBakeSummaryV1 } from './authoringDocument';
 import {
   clamp,
   elevationToR16,
@@ -16,9 +16,10 @@ import {
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
+import { runHydrologyBasinBake, type HydrologyProgress } from './hydrologyBake';
 
 export interface BakeProgress {
-  phase: 'baking' | 'eroding' | 'building-lod';
+  phase: 'baking' | 'eroding' | 'hydrology' | 'building-lod';
   current: number;
   total: number;
   label: string;
@@ -29,6 +30,7 @@ export interface BakeTileIO {
   writeTile(key: TileKey, samples: Uint16Array): Promise<void>;
   readWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
   writeWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  writeLakeFillHeightTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface BakePassResult {
@@ -58,6 +60,10 @@ interface DepthZeroPassResult extends BakePassResult {
 interface ErosionPassResult extends BakePassResult {
   dirtyTiles: TileKey[];
   summary?: ErosionBakeSummaryV1;
+}
+
+interface HydrologyPassResult extends BakePassResult {
+  summary: HydrologyBakeSummaryV1;
 }
 
 interface LodPassResult extends BakePassResult {
@@ -122,6 +128,12 @@ export async function bakeStructuralAuthoring(
   const erosion = await erosionPass.run();
   const lodSourceTiles = erosion.dirtyTiles.length > 0 ? erosion.dirtyTiles : depthZero.dirtyTiles;
 
+  const hydrologyPass: BakePass<HydrologyPassResult> = {
+    id: 'hydrology-basins-v1',
+    run: () => runHydrologyPass(config, io, onProgress)
+  };
+  const hydrology = await hydrologyPass.run();
+
   const lodPass: BakePass<LodPassResult> = {
     id: 'lod-rebuild',
     run: () => runLodRebuildPass(config, lodSourceTiles, io, onProgress)
@@ -138,7 +150,8 @@ export async function bakeStructuralAuthoring(
       inputHash: stableAuthoringHash(config, document, waterLevel),
       primitiveCount: document.primitives.filter((primitive) => primitive.enabled).length,
       tileCount,
-      ...(erosionSummary ? { erosion: erosionSummary } : {})
+      ...(erosionSummary ? { erosion: erosionSummary } : {}),
+      hydrology: hydrology.summary
     },
     dirtyTiles: lodSourceTiles,
     lodTileCount: lod.lodTileCount
@@ -425,6 +438,18 @@ async function runErosionPass(
   return {
     id: 'erosion-v1',
     dirtyTiles: result.dirtyTiles,
+    summary: result.summary
+  };
+}
+
+async function runHydrologyPass(
+  config: WorldConfig,
+  io: BakeTileIO,
+  onProgress?: (progress: BakeProgress) => void
+): Promise<HydrologyPassResult> {
+  const result = await runHydrologyBasinBake(config, io, (progress: HydrologyProgress) => onProgress?.(progress));
+  return {
+    id: 'hydrology-basins-v1',
     summary: result.summary
   };
 }
