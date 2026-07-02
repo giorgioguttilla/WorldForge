@@ -4,6 +4,7 @@
   export let max: number | undefined = undefined;
   export let step: number | string = 'any';
   export let onCommit: (value: number) => void = () => {};
+  export let commitOnInput = true;
 
   let draft = String(value);
   let focused = false;
@@ -16,7 +17,7 @@
     draft = (event.currentTarget as HTMLInputElement).value;
     const parsed = Number(draft);
     if (!Number.isFinite(parsed)) return;
-    onCommit(clamp(parsed));
+    if (commitOnInput) onCommit(clamp(parsed));
   }
 
   function handleFocus() {

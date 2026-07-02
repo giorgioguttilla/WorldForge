@@ -3,7 +3,7 @@ import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './g
 import { HeightmapTileStore, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
-import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
+import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, validateWorldConfig, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
 import { createEmptyAuthoringDocument, type AuthoringDocumentV1 } from '../authoring/authoringDocument';
 import { bakeStructuralAuthoring, createFailedBakeMetadata, type BakeProgress } from '../authoring/structuralBake';
 
@@ -144,12 +144,37 @@ export class TileManager {
     const config = this.requireConfig();
     const updated: WorldConfig = {
       ...config,
-      water: normalizeWaterConfig(water),
+      water: normalizeWaterConfig({
+        ...water,
+        level: Math.max(0, Math.min(config.worldHeight, water.level))
+      }),
       updatedAt: new Date().toISOString()
     };
     await this.store.writeConfig(updated);
     await this.registerProject(updated);
     this.config = updated;
+    return updated;
+  }
+
+  async updateWorldHeight(worldHeight: number, water = this.requireConfig().water): Promise<WorldConfig> {
+    const config = this.requireConfig();
+    const nextHeight = Math.max(1, Math.round(worldHeight));
+    const errors = validateWorldConfig({ ...config, worldHeight: nextHeight });
+    if (errors.length > 0) throw new Error(errors.join(' '));
+    const updated: WorldConfig = {
+      ...config,
+      worldHeight: nextHeight,
+      water: normalizeWaterConfig({
+        ...water,
+        level: Math.max(0, Math.min(nextHeight, water.level))
+      }),
+      updatedAt: new Date().toISOString()
+    };
+    await this.store.writeConfig(updated);
+    await this.registerProject(updated);
+    this.config = updated;
+    this.store.clearCache();
+    this.refreshStoreMetrics();
     return updated;
   }
 
