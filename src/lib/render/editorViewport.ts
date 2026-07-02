@@ -45,6 +45,7 @@ export class EditorViewport {
   private readonly raycaster = new THREE.Raycaster();
   private readonly water: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
   private tileGrid: THREE.GridHelper | null = null;
+  private worldBounds: THREE.LineSegments<THREE.EdgesGeometry, THREE.LineBasicMaterial> | null = null;
   private rendererAdapter: RendererAdapter | null = null;
   private lastFrameTime = performance.now();
   private frame = 0;
@@ -151,6 +152,7 @@ export class EditorViewport {
     this.water.geometry.dispose();
     this.water.material.dispose();
     this.disposeTileGrid();
+    this.disposeWorldBounds();
     this.authoringOverlay.dispose();
     this.rendererAdapter?.renderer.dispose();
   }
@@ -183,6 +185,7 @@ export class EditorViewport {
   setAuthoringVisible(visible: boolean): void {
     this.authoringOverlay.setVisible(visible);
     this.updateTileGrid();
+    this.updateWorldBounds();
   }
 
   getWorldUnitsPerScreenPixelAt(x: number, z: number): number {
@@ -292,6 +295,7 @@ export class EditorViewport {
     const config = this.manager.config;
     if (!config) {
       if (this.tileGrid) this.tileGrid.visible = false;
+      if (this.worldBounds) this.worldBounds.visible = false;
       return;
     }
 
@@ -307,6 +311,40 @@ export class EditorViewport {
 
     this.tileGrid.position.y = this.waterSettings.level + 1;
     this.tileGrid.visible = this.authoringOverlay.group.visible;
+    this.updateWorldBounds();
+  }
+
+  private updateWorldBounds(): void {
+    const config = this.manager.config;
+    if (!config) {
+      if (this.worldBounds) this.worldBounds.visible = false;
+      return;
+    }
+
+    const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+    const needsRebuild = !this.worldBounds
+      || this.worldBounds.userData.worldSize !== worldSize
+      || this.worldBounds.userData.worldHeight !== config.worldHeight;
+    if (needsRebuild) {
+      this.disposeWorldBounds();
+      const boxGeometry = new THREE.BoxGeometry(worldSize, config.worldHeight, worldSize);
+      const geometry = new THREE.EdgesGeometry(boxGeometry);
+      boxGeometry.dispose();
+      const material = new THREE.LineBasicMaterial({
+        color: 0xb8e6ff,
+        transparent: true,
+        opacity: 0.72,
+        depthWrite: false
+      });
+      this.worldBounds = new THREE.LineSegments(geometry, material);
+      this.worldBounds.userData.worldSize = worldSize;
+      this.worldBounds.userData.worldHeight = config.worldHeight;
+      this.worldBounds.position.set(0, config.worldHeight / 2, 0);
+      this.worldBounds.renderOrder = 20;
+      this.scene.add(this.worldBounds);
+    }
+
+    this.worldBounds.visible = this.authoringOverlay.group.visible;
   }
 
   private updateAuthoringControlScale(): void {
@@ -357,6 +395,14 @@ export class EditorViewport {
       material.dispose();
     }
     this.tileGrid = null;
+  }
+
+  private disposeWorldBounds(): void {
+    if (!this.worldBounds) return;
+    this.scene.remove(this.worldBounds);
+    this.worldBounds.geometry.dispose();
+    this.worldBounds.material.dispose();
+    this.worldBounds = null;
   }
 
   private projectPointerToAuthoringPlane(event: PointerEvent): AuthoringPointerPoint | null {
