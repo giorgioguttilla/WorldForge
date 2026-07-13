@@ -48,7 +48,13 @@ let depthZeroState: { config: WorldConfig; prepared: PreparedStructuralDocument;
 self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
   const request = event.data;
   try {
-    if (request.type === 'hydrology-analyze-tile' || request.type === 'hydrology-materialize-tile') {
+    if (
+      request.type === 'hydrology-analyze-tile' ||
+      request.type === 'hydrology-materialize-tile' ||
+      request.type === 'hydrology-flow-analyze-tile' ||
+      request.type === 'hydrology-flow-max-tile' ||
+      request.type === 'hydrology-flow-materialize-tile'
+    ) {
       const { response, transfers } = createHydrologyWorkerResponse(request);
       self.postMessage(response, transfers);
       return;

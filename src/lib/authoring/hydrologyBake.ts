@@ -5,6 +5,7 @@ import type { WorldConfig } from '../heightmap/worldConfig';
 export interface HydrologyTileIO {
   readTile(key: TileKey): Promise<Uint16Array>;
   writeLakeFillHeightTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface HydrologyProgress {
@@ -43,9 +44,34 @@ export interface MaterializeBasinResult {
   minTerrain: Uint16Array;
   maxDepth: Uint16Array;
   volumeCellHeight: Float64Array;
+  minGlobalX: Uint32Array;
+  minGlobalY: Uint32Array;
+  maxGlobalX: Uint32Array;
+  maxGlobalY: Uint32Array;
   lakeCellCount: number;
   maxTileDepth: number;
   tileVolumeCellHeight: number;
+}
+
+export interface FlowTileAnalysisResult {
+  tileX: number;
+  tileY: number;
+  baseTargetCells: Uint32Array;
+  baseFlows: Float64Array;
+  transferFromCells: Uint32Array;
+  transferToCells: Uint32Array;
+}
+
+export interface FlowTileMaxResult {
+  tileX: number;
+  tileY: number;
+  maxFlowAccumulation: number;
+}
+
+export interface MaterializeFlowResult {
+  tileX: number;
+  tileY: number;
+  flowStrength: ArrayBuffer;
 }
 
 interface TileJob {
@@ -74,11 +100,15 @@ interface BasinAccumulator {
   minTerrain: number;
   maxDepth: number;
   volumeCellHeight: number;
+  minGlobalX: number;
+  minGlobalY: number;
+  maxGlobalX: number;
+  maxGlobalY: number;
 }
 
 const OCEAN_NODE = 0;
 const UINT16_MAX = 65535;
-
+const NO_FLOW_TARGET = 0xffffffff;
 export async function runHydrologyBasinBake(
   config: WorldConfig,
   io: HydrologyTileIO,
@@ -88,7 +118,7 @@ export async function runHydrologyBasinBake(
   const jobs = createTileJobs(config);
   const analyses = new Array<TileAnalysis>(jobs.length);
   let completed = 0;
-  const total = jobs.length * 2 + 1;
+  const total = jobs.length * 5 + 2;
   const useWorkers = options.useWorkers !== false && canUseHydrologyWorkers() && jobs.length > 1;
 
   await runHydrologyWorkerPool(
@@ -127,11 +157,7 @@ export async function runHydrologyBasinBake(
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Analyzing basins ${completed} / ${jobs.length}` });
     },
-    useWorkers,
-    (request) => {
-      const typed = request as Extract<HydrologyWorkerRequest, { type: 'hydrology-analyze-tile' }>;
-      return analyzeHydrologyTile(typed.tileX, typed.tileY, typed.tileSize, new Uint16Array(typed.heights));
-    }
+    useWorkers
   );
 
   let nextLabelOffset = 1;
@@ -176,17 +202,34 @@ export async function runHydrologyBasinBake(
       const minTerrain = new Uint16Array(result.minTerrain);
       const maxDepths = new Uint16Array(result.maxDepth);
       const volumes = new Float64Array(result.volumeCellHeight);
+      const minGlobalX = new Uint32Array(result.minGlobalX);
+      const minGlobalY = new Uint32Array(result.minGlobalY);
+      const maxGlobalX = new Uint32Array(result.maxGlobalX);
+      const maxGlobalY = new Uint32Array(result.maxGlobalY);
       for (let i = 0; i < basinIds.length; i += 1) {
         const id = basinIds[i];
         let accumulator = basinStats.get(id);
         if (!accumulator) {
-          accumulator = { areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0 };
+          accumulator = {
+            areaCells: 0,
+            minTerrain: UINT16_MAX,
+            maxDepth: 0,
+            volumeCellHeight: 0,
+            minGlobalX: Number.POSITIVE_INFINITY,
+            minGlobalY: Number.POSITIVE_INFINITY,
+            maxGlobalX: 0,
+            maxGlobalY: 0
+          };
           basinStats.set(id, accumulator);
         }
         accumulator.areaCells += areaCells[i];
         accumulator.minTerrain = Math.min(accumulator.minTerrain, minTerrain[i]);
         accumulator.maxDepth = Math.max(accumulator.maxDepth, maxDepths[i]);
         accumulator.volumeCellHeight += volumes[i];
+        accumulator.minGlobalX = Math.min(accumulator.minGlobalX, minGlobalX[i]);
+        accumulator.minGlobalY = Math.min(accumulator.minGlobalY, minGlobalY[i]);
+        accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, maxGlobalX[i]);
+        accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, maxGlobalY[i]);
       }
       lakeCellCount += result.lakeCellCount;
       maxDepth = Math.max(maxDepth, result.maxTileDepth);
@@ -194,21 +237,13 @@ export async function runHydrologyBasinBake(
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Writing lake fill heights ${completed - jobs.length - 1} / ${jobs.length}` });
     },
-    useWorkers,
-    (request) => {
-      const typed = request as Extract<HydrologyWorkerRequest, { type: 'hydrology-materialize-tile' }>;
-      return materializeHydrologyTile(
-        typed.tileX,
-        typed.tileY,
-        typed.tileSize,
-        typed.labelOffset,
-        new Uint16Array(typed.heights),
-        new Uint16Array(typed.globalFillHeights)
-      );
-    }
+    useWorkers
   );
 
   analyses.length = 0;
+
+  const flowResult = await runFlowStrengthBake(config, io, jobs, useWorkers, completed, total, onProgress);
+  completed = flowResult.completed;
 
   const basins = [...basinStats.entries()]
     .map(([id, stats]): HydrologyBasinSummaryV1 => ({
@@ -222,7 +257,6 @@ export async function runHydrologyBasinBake(
     }))
     .sort((a, b) => b.areaCells - a.areaCells)
     .slice(0, 256);
-
   return {
     summary: {
       enabled: true,
@@ -233,6 +267,9 @@ export async function runHydrologyBasinBake(
       maxDepth,
       volumeCellHeight,
       lakeFillHeight: 'closed-basin-fill-height-r16',
+      flowStrength: flowResult.enabled ? 'log1p-upstream-cell-count-r16' : undefined,
+      maxFlowAccumulation: flowResult.enabled ? flowResult.maxFlowAccumulation : undefined,
+      flowTileCount: flowResult.enabled ? jobs.length : undefined,
       basins,
       warnings: []
     }
@@ -324,13 +361,28 @@ export function materializeHydrologyTile(
       const basinId = labelOffset + localLabel - 1;
       let accumulator = stats.get(basinId);
       if (!accumulator) {
-        accumulator = { areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0 };
+        accumulator = {
+          areaCells: 0,
+          minTerrain: UINT16_MAX,
+          maxDepth: 0,
+          volumeCellHeight: 0,
+          minGlobalX: Number.POSITIVE_INFINITY,
+          minGlobalY: Number.POSITIVE_INFINITY,
+          maxGlobalX: 0,
+          maxGlobalY: 0
+        };
         stats.set(basinId, accumulator);
       }
+      const globalX = tileX * tileSize + (i % tileSize);
+      const globalY = tileY * tileSize + Math.floor(i / tileSize);
       accumulator.areaCells += 1;
       accumulator.minTerrain = Math.min(accumulator.minTerrain, heights[i]);
       accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
       accumulator.volumeCellHeight += depth;
+      accumulator.minGlobalX = Math.min(accumulator.minGlobalX, globalX);
+      accumulator.minGlobalY = Math.min(accumulator.minGlobalY, globalY);
+      accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, globalX);
+      accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, globalY);
     }
   }
 
@@ -339,6 +391,10 @@ export function materializeHydrologyTile(
   const minTerrain = new Uint16Array(stats.size);
   const maxDepth = new Uint16Array(stats.size);
   const volumeCellHeight = new Float64Array(stats.size);
+  const minGlobalX = new Uint32Array(stats.size);
+  const minGlobalY = new Uint32Array(stats.size);
+  const maxGlobalX = new Uint32Array(stats.size);
+  const maxGlobalY = new Uint32Array(stats.size);
   let index = 0;
   for (const [id, accumulator] of stats) {
     basinIds[index] = id;
@@ -346,6 +402,10 @@ export function materializeHydrologyTile(
     minTerrain[index] = accumulator.minTerrain;
     maxDepth[index] = accumulator.maxDepth;
     volumeCellHeight[index] = accumulator.volumeCellHeight;
+    minGlobalX[index] = Number.isFinite(accumulator.minGlobalX) ? accumulator.minGlobalX : 0;
+    minGlobalY[index] = Number.isFinite(accumulator.minGlobalY) ? accumulator.minGlobalY : 0;
+    maxGlobalX[index] = accumulator.maxGlobalX;
+    maxGlobalY[index] = accumulator.maxGlobalY;
     index += 1;
   }
 
@@ -358,12 +418,192 @@ export function materializeHydrologyTile(
     minTerrain,
     maxDepth,
     volumeCellHeight,
+    minGlobalX,
+    minGlobalY,
+    maxGlobalX,
+    maxGlobalY,
     lakeCellCount,
     maxTileDepth,
     tileVolumeCellHeight
   };
 }
 
+async function runFlowStrengthBake(
+  config: WorldConfig,
+  io: HydrologyTileIO,
+  jobs: TileJob[],
+  useWorkers: boolean,
+  completedStart: number,
+  total: number,
+  onProgress?: (progress: HydrologyProgress) => void
+): Promise<{ enabled: boolean; maxFlowAccumulation: number; completed: number }> {
+  if (!io.writeFlowStrengthTile) return { enabled: false, maxFlowAccumulation: 0, completed: completedStart };
+
+  let completed = completedStart;
+  const analyses = new Array<FlowTileAnalysisResult>(jobs.length);
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => ({
+      id,
+      type: 'hydrology-flow-analyze-tile',
+      tileX: job.x,
+      tileY: job.y,
+      tileSize: config.tileSize,
+      tilesPerSide: config.tilesPerSide,
+      heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer
+    }),
+    async (response) => {
+      if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      analyses[tileIndex(config, response.tileX, response.tileY)] = {
+        tileX: response.tileX,
+        tileY: response.tileY,
+        baseTargetCells: new Uint32Array(response.baseTargetCells),
+        baseFlows: new Float64Array(response.baseFlows),
+        transferFromCells: new Uint32Array(response.transferFromCells),
+        transferToCells: new Uint32Array(response.transferToCells)
+      };
+      completed += 1;
+      onProgress?.({ phase: 'hydrology', current: completed, total, label: `Analyzing flow ${completed - config.tilesPerSide * config.tilesPerSide * 2 - 1} / ${jobs.length}` });
+    },
+    useWorkers
+  );
+
+  const incomingByCell = solveFlowPortGraph(analyses);
+  analyses.length = 0;
+  const incomingByTile = groupIncomingByTile(config, incomingByCell);
+  incomingByCell.clear();
+  completed += 1;
+  onProgress?.({ phase: 'hydrology', current: completed, total, label: 'Resolving cross-tile flow' });
+
+  let maxFlowAccumulation = 1;
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => {
+      const incoming = incomingByTile[tileIndex(config, job.x, job.y)];
+      return {
+        id,
+        type: 'hydrology-flow-max-tile',
+        tileX: job.x,
+        tileY: job.y,
+        tileSize: config.tileSize,
+        tilesPerSide: config.tilesPerSide,
+        heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer,
+        incomingCells: new Uint32Array(incoming.cells).buffer,
+        incomingFlows: new Float64Array(incoming.flows).buffer
+      };
+    },
+    async (response) => {
+      if (response.type !== 'hydrology-flow-max-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      maxFlowAccumulation = Math.max(maxFlowAccumulation, response.maxFlowAccumulation);
+      completed += 1;
+      onProgress?.({ phase: 'hydrology', current: completed, total, label: `Measuring flow ${completed - config.tilesPerSide * config.tilesPerSide * 3 - 2} / ${jobs.length}` });
+    },
+    useWorkers
+  );
+
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => {
+      const incoming = incomingByTile[tileIndex(config, job.x, job.y)];
+      return {
+        id,
+        type: 'hydrology-flow-materialize-tile',
+        tileX: job.x,
+        tileY: job.y,
+        tileSize: config.tileSize,
+        tilesPerSide: config.tilesPerSide,
+        heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer,
+        incomingCells: new Uint32Array(incoming.cells).buffer,
+        incomingFlows: new Float64Array(incoming.flows).buffer,
+        maxFlowAccumulation
+      };
+    },
+    async (response) => {
+      if (response.type !== 'hydrology-flow-materialize-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      await io.writeFlowStrengthTile?.({ x: response.tileX, y: response.tileY, d: 0 }, new Uint16Array(response.flowStrength));
+      completed += 1;
+      onProgress?.({ phase: 'hydrology', current: completed, total, label: `Writing flow strength ${completed - config.tilesPerSide * config.tilesPerSide * 4 - 2} / ${jobs.length}` });
+    },
+    useWorkers
+  );
+
+  return { enabled: true, maxFlowAccumulation, completed };
+}
+
+export function analyzeFlowTile(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, heightHalo: Uint16Array): FlowTileAnalysisResult {
+  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
+  const accumulation = accumulateLocalFlow(routing, undefined);
+  const baseMap = new Map<number, number>();
+  for (let i = 0; i < routing.outboundTargets.length; i += 1) {
+    const target = routing.outboundTargets[i];
+    if (target !== NO_FLOW_TARGET) baseMap.set(target, (baseMap.get(target) ?? 0) + accumulation.values[i]);
+  }
+
+  const destination = computeLocalFlowDestinations(routing);
+  const borderCells = collectTileBorderCells(tileSize);
+  const transferFrom: number[] = [];
+  const transferTo: number[] = [];
+  const fullSide = tileSize * tilesPerSide;
+  const originX = tileX * tileSize;
+  const originY = tileY * tileSize;
+  for (const localIndex of borderCells) {
+    const to = destination[localIndex];
+    if (to === NO_FLOW_TARGET) continue;
+    const x = localIndex % tileSize;
+    const y = Math.floor(localIndex / tileSize);
+    transferFrom.push((originY + y) * fullSide + originX + x);
+    transferTo.push(to);
+  }
+
+  return {
+    tileX,
+    tileY,
+    baseTargetCells: Uint32Array.from(baseMap.keys()),
+    baseFlows: Float64Array.from(baseMap.values()),
+    transferFromCells: Uint32Array.from(transferFrom),
+    transferToCells: Uint32Array.from(transferTo)
+  };
+}
+
+export function computeFlowTileMax(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  tilesPerSide: number,
+  heightHalo: Uint16Array,
+  incomingCells: Uint32Array,
+  incomingFlows: Float64Array
+): FlowTileMaxResult {
+  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
+  const accumulation = accumulateLocalFlow(routing, incomingFromArrays(tileSize, incomingCells, incomingFlows));
+  return { tileX, tileY, maxFlowAccumulation: accumulation.max };
+}
+
+export function materializeFlowTile(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  tilesPerSide: number,
+  heightHalo: Uint16Array,
+  incomingCells: Uint32Array,
+  incomingFlows: Float64Array,
+  maxFlowAccumulation: number
+): MaterializeFlowResult {
+  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
+  const accumulation = accumulateLocalFlow(routing, incomingFromArrays(tileSize, incomingCells, incomingFlows));
+  const output = new Uint16Array(tileSize * tileSize);
+  const denominator = Math.log1p(Math.max(0, maxFlowAccumulation - 1));
+  for (let i = 0; i < output.length; i += 1) {
+    const effective = Math.max(0, accumulation.values[i] - 1);
+    const encoded = denominator > 0 && effective > 0 ? Math.min(UINT16_MAX, Math.round(UINT16_MAX * Math.log1p(effective) / denominator)) : 0;
+    output[i] = encoded;
+  }
+  return {
+    tileX,
+    tileY,
+    flowStrength: output.buffer
+  };
+}
 type HydrologyAnalyzeResponse = {
   id: number;
   type: 'hydrology-analyze-result';
@@ -393,12 +633,43 @@ type HydrologyMaterializeResponse = {
   minTerrain: ArrayBuffer;
   maxDepth: ArrayBuffer;
   volumeCellHeight: ArrayBuffer;
+  minGlobalX: ArrayBuffer;
+  minGlobalY: ArrayBuffer;
+  maxGlobalX: ArrayBuffer;
+  maxGlobalY: ArrayBuffer;
   lakeCellCount: number;
   maxTileDepth: number;
   tileVolumeCellHeight: number;
 };
 
-export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse;
+type HydrologyFlowAnalyzeResponse = {
+  id: number;
+  type: 'hydrology-flow-analyze-result';
+  tileX: number;
+  tileY: number;
+  baseTargetCells: ArrayBuffer;
+  baseFlows: ArrayBuffer;
+  transferFromCells: ArrayBuffer;
+  transferToCells: ArrayBuffer;
+};
+
+type HydrologyFlowMaxResponse = {
+  id: number;
+  type: 'hydrology-flow-max-result';
+  tileX: number;
+  tileY: number;
+  maxFlowAccumulation: number;
+};
+
+type HydrologyFlowMaterializeResponse = {
+  id: number;
+  type: 'hydrology-flow-materialize-result';
+  tileX: number;
+  tileY: number;
+  flowStrength: ArrayBuffer;
+};
+
+export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse | HydrologyFlowAnalyzeResponse | HydrologyFlowMaxResponse | HydrologyFlowMaterializeResponse;
 
 export type HydrologyWorkerRequest =
   | {
@@ -418,6 +689,38 @@ export type HydrologyWorkerRequest =
       labelOffset: number;
       heights: ArrayBuffer;
       globalFillHeights: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-flow-analyze-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      tilesPerSide: number;
+      heightHalo: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-flow-max-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      tilesPerSide: number;
+      heightHalo: ArrayBuffer;
+      incomingCells: ArrayBuffer;
+      incomingFlows: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-flow-materialize-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      tilesPerSide: number;
+      heightHalo: ArrayBuffer;
+      incomingCells: ArrayBuffer;
+      incomingFlows: ArrayBuffer;
+      maxFlowAccumulation: number;
     };
 
 export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): { response: HydrologyWorkerResponse; transfers: Transferable[] } {
@@ -443,6 +746,70 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
   }
 
+  if (request.type === 'hydrology-flow-analyze-tile') {
+    const result = analyzeFlowTile(
+      request.tileX,
+      request.tileY,
+      request.tileSize,
+      request.tilesPerSide,
+      new Uint16Array(request.heightHalo)
+    );
+    const response: HydrologyFlowAnalyzeResponse = {
+      id: request.id,
+      type: 'hydrology-flow-analyze-result',
+      tileX: result.tileX,
+      tileY: result.tileY,
+      baseTargetCells: result.baseTargetCells.buffer,
+      baseFlows: result.baseFlows.buffer,
+      transferFromCells: result.transferFromCells.buffer,
+      transferToCells: result.transferToCells.buffer
+    };
+    return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
+  }
+
+  if (request.type === 'hydrology-flow-max-tile') {
+    const result = computeFlowTileMax(
+      request.tileX,
+      request.tileY,
+      request.tileSize,
+      request.tilesPerSide,
+      new Uint16Array(request.heightHalo),
+      new Uint32Array(request.incomingCells),
+      new Float64Array(request.incomingFlows)
+    );
+    return {
+      response: {
+        id: request.id,
+        type: 'hydrology-flow-max-result',
+        tileX: result.tileX,
+        tileY: result.tileY,
+        maxFlowAccumulation: result.maxFlowAccumulation
+      },
+      transfers: []
+    };
+  }
+
+  if (request.type === 'hydrology-flow-materialize-tile') {
+    const result = materializeFlowTile(
+      request.tileX,
+      request.tileY,
+      request.tileSize,
+      request.tilesPerSide,
+      new Uint16Array(request.heightHalo),
+      new Uint32Array(request.incomingCells),
+      new Float64Array(request.incomingFlows),
+      request.maxFlowAccumulation
+    );
+    const response: HydrologyFlowMaterializeResponse = {
+      id: request.id,
+      type: 'hydrology-flow-materialize-result',
+      tileX: result.tileX,
+      tileY: result.tileY,
+      flowStrength: result.flowStrength
+    };
+    return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
+  }
+
   const result = materializeHydrologyTile(
     request.tileX,
     request.tileY,
@@ -462,6 +829,10 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     minTerrain: result.minTerrain.buffer,
     maxDepth: result.maxDepth.buffer,
     volumeCellHeight: result.volumeCellHeight.buffer,
+    minGlobalX: result.minGlobalX.buffer,
+    minGlobalY: result.minGlobalY.buffer,
+    maxGlobalX: result.maxGlobalX.buffer,
+    maxGlobalY: result.maxGlobalY.buffer,
     lakeCellCount: result.lakeCellCount,
     maxTileDepth: result.maxTileDepth,
     tileVolumeCellHeight: result.tileVolumeCellHeight
@@ -473,50 +844,14 @@ async function runHydrologyWorkerPool(
   jobs: TileJob[],
   createRequest: (job: TileJob, id: number) => Promise<HydrologyWorkerRequest>,
   handleResult: (response: HydrologyWorkerResponse) => Promise<void>,
-  useWorkers: boolean,
-  runInline: (request: HydrologyWorkerRequest) => LocalBasinSolveResult | MaterializeBasinResult
+  useWorkers: boolean
 ): Promise<void> {
   if (!useWorkers) {
     let id = 1;
     for (const job of jobs) {
       const request = await createRequest(job, id);
       id += 1;
-      const result = runInline(request);
-      if ('labelCount' in result) {
-        await handleResult({
-          id: request.id,
-          type: 'hydrology-analyze-result',
-          tileX: result.tileX,
-          tileY: result.tileY,
-          labelCount: result.labelCount,
-          edges: result.edges.buffer,
-          edgeWeights: result.edgeWeights.buffer,
-          northLabels: result.northLabels.buffer,
-          northHeights: result.northHeights.buffer,
-          southLabels: result.southLabels.buffer,
-          southHeights: result.southHeights.buffer,
-          westLabels: result.westLabels.buffer,
-          westHeights: result.westHeights.buffer,
-          eastLabels: result.eastLabels.buffer,
-          eastHeights: result.eastHeights.buffer
-        });
-      } else {
-        await handleResult({
-          id: request.id,
-          type: 'hydrology-materialize-result',
-          tileX: result.tileX,
-          tileY: result.tileY,
-          lakeFillHeights: result.lakeFillHeights,
-          basinIds: result.basinIds.buffer,
-          areaCells: result.areaCells.buffer,
-          minTerrain: result.minTerrain.buffer,
-          maxDepth: result.maxDepth.buffer,
-          volumeCellHeight: result.volumeCellHeight.buffer,
-          lakeCellCount: result.lakeCellCount,
-          maxTileDepth: result.maxTileDepth,
-          tileVolumeCellHeight: result.tileVolumeCellHeight
-        });
-      }
+      await handleResult(createHydrologyWorkerResponse(request).response);
     }
     return;
   }
@@ -537,9 +872,7 @@ async function runHydrologyWorkerPool(
         const id = nextRequestId;
         nextRequestId += 1;
         void createRequest(job, id).then((request) => {
-          const transfers = request.type === 'hydrology-analyze-tile'
-            ? [request.heights]
-            : [request.heights, request.globalFillHeights];
+          const transfers = getHydrologyRequestTransfers(request);
           worker.postMessage(request, transfers);
         }, rejectWorker);
       };
@@ -557,6 +890,178 @@ async function runHydrologyWorkerPool(
   } finally {
     for (const worker of workers) worker.terminate();
   }
+}
+
+function getHydrologyRequestTransfers(request: HydrologyWorkerRequest): Transferable[] {
+  if (request.type === 'hydrology-analyze-tile') return [request.heights];
+  if (request.type === 'hydrology-materialize-tile') return [request.heights, request.globalFillHeights];
+  if (request.type === 'hydrology-flow-analyze-tile') return [request.heightHalo];
+  if (request.type === 'hydrology-flow-max-tile') return [request.heightHalo, request.incomingCells, request.incomingFlows];
+  return [request.heightHalo, request.incomingCells, request.incomingFlows];
+}
+
+interface FlowRouting {
+  receivers: Int32Array;
+  outboundTargets: Uint32Array;
+  indegree: Uint32Array;
+  order: Uint32Array;
+}
+
+function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, heightHalo: Uint16Array): FlowRouting {
+  const sampleCount = tileSize * tileSize;
+  const receivers = new Int32Array(sampleCount);
+  const outboundTargets = new Uint32Array(sampleCount);
+  const indegree = new Uint32Array(sampleCount);
+  receivers.fill(-1);
+  outboundTargets.fill(NO_FLOW_TARGET);
+  const fullSide = tileSize * tilesPerSide;
+  const originX = tileX * tileSize;
+  const originY = tileY * tileSize;
+  const haloStride = tileSize + 2;
+  const directions = [
+    [1, 0], [0, 1], [1, 1], [-1, 0],
+    [0, -1], [-1, -1], [1, -1], [-1, 1]
+  ];
+
+  for (let y = 0; y < tileSize; y += 1) {
+    for (let x = 0; x < tileSize; x += 1) {
+      const index = y * tileSize + x;
+      const current = heightHalo[(y + 1) * haloStride + x + 1];
+      const currentGlobalX = originX + x;
+      const currentGlobalY = originY + y;
+      const currentGlobal = currentGlobalY * fullSide + currentGlobalX;
+      let bestDx = 0;
+      let bestDy = 0;
+      let bestScore = -1;
+      let bestEqual = false;
+      for (const [dx, dy] of directions) {
+        const globalX = currentGlobalX + dx;
+        const globalY = currentGlobalY + dy;
+        if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) continue;
+        const neighbor = heightHalo[(y + 1 + dy) * haloStride + x + 1 + dx];
+        if (neighbor < current) {
+          const drop = current - neighbor;
+          const score = drop * (dx !== 0 && dy !== 0 ? 707 : 1000);
+          if (bestEqual || score > bestScore) {
+            bestDx = dx;
+            bestDy = dy;
+            bestScore = score;
+            bestEqual = false;
+          }
+        } else if (neighbor === current && bestScore < 0) {
+          const neighborGlobal = globalY * fullSide + globalX;
+          if (neighborGlobal > currentGlobal) {
+            bestDx = dx;
+            bestDy = dy;
+            bestScore = 0;
+            bestEqual = true;
+          }
+        }
+      }
+
+      if (bestScore < 0) continue;
+      const rx = x + bestDx;
+      const ry = y + bestDy;
+      if (rx >= 0 && ry >= 0 && rx < tileSize && ry < tileSize) {
+        const receiver = ry * tileSize + rx;
+        receivers[index] = receiver;
+        indegree[receiver] += 1;
+      } else {
+        outboundTargets[index] = (currentGlobalY + bestDy) * fullSide + currentGlobalX + bestDx;
+      }
+    }
+  }
+
+  const order = buildFlowTopologicalOrder(receivers, indegree);
+  return { receivers, outboundTargets, indegree, order };
+}
+
+function buildFlowTopologicalOrder(receivers: Int32Array, indegree: Uint32Array): Uint32Array {
+  const degree = new Uint32Array(indegree);
+  const queue = new Uint32Array(receivers.length);
+  const order = new Uint32Array(receivers.length);
+  let head = 0;
+  let tail = 0;
+  let orderLength = 0;
+  for (let i = 0; i < degree.length; i += 1) {
+    if (degree[i] === 0) {
+      queue[tail] = i;
+      tail += 1;
+    }
+  }
+  while (head < tail) {
+    const current = queue[head];
+    head += 1;
+    order[orderLength] = current;
+    orderLength += 1;
+    const receiver = receivers[current];
+    if (receiver >= 0) {
+      degree[receiver] -= 1;
+      if (degree[receiver] === 0) {
+        queue[tail] = receiver;
+        tail += 1;
+      }
+    }
+  }
+  for (let i = 0; i < receivers.length; i += 1) {
+    if (degree[i] > 0) {
+      order[orderLength] = i;
+      orderLength += 1;
+    }
+  }
+  return order;
+}
+
+function accumulateLocalFlow(routing: FlowRouting, incoming?: Float64Array): { values: Float64Array; max: number } {
+  const values = new Float64Array(routing.receivers.length);
+  values.fill(1);
+  if (incoming) {
+    for (let i = 0; i < incoming.length; i += 1) values[i] += incoming[i];
+  }
+  let max = 1;
+  for (let i = 0; i < routing.order.length; i += 1) {
+    const current = routing.order[i];
+    const flow = values[current];
+    if (flow > max) max = flow;
+    const receiver = routing.receivers[current];
+    if (receiver >= 0) values[receiver] += flow;
+  }
+  return { values, max };
+}
+
+function computeLocalFlowDestinations(routing: FlowRouting): Uint32Array {
+  const destination = new Uint32Array(routing.receivers.length);
+  destination.fill(NO_FLOW_TARGET);
+  for (let i = routing.order.length - 1; i >= 0; i -= 1) {
+    const current = routing.order[i];
+    const outbound = routing.outboundTargets[current];
+    if (outbound !== NO_FLOW_TARGET) {
+      destination[current] = outbound;
+      continue;
+    }
+    const receiver = routing.receivers[current];
+    destination[current] = receiver >= 0 ? destination[receiver] : NO_FLOW_TARGET;
+  }
+  return destination;
+}
+
+function collectTileBorderCells(tileSize: number): Uint32Array {
+  if (tileSize <= 1) return Uint32Array.of(0);
+  const cells = new Uint32Array(tileSize * 4 - 4);
+  let index = 0;
+  for (let x = 0; x < tileSize; x += 1) cells[index++] = x;
+  for (let y = 1; y < tileSize - 1; y += 1) cells[index++] = y * tileSize + tileSize - 1;
+  for (let x = tileSize - 1; x >= 0; x -= 1) cells[index++] = (tileSize - 1) * tileSize + x;
+  for (let y = tileSize - 2; y >= 1; y -= 1) cells[index++] = y * tileSize;
+  return cells;
+}
+
+function incomingFromArrays(tileSize: number, incomingCells: Uint32Array, incomingFlows: Float64Array): Float64Array {
+  const incoming = new Float64Array(tileSize * tileSize);
+  for (let i = 0; i < incomingCells.length; i += 1) {
+    incoming[incomingCells[i]] += incomingFlows[i] ?? 0;
+  }
+  return incoming;
 }
 
 function solveLocalTile(tileSize: number, heights: Uint16Array): { filled: Uint16Array; labels: Uint32Array; labelCount: number } {
@@ -817,6 +1322,113 @@ function createTileJobs(config: WorldConfig): TileJob[] {
 
 function tileIndex(config: WorldConfig, x: number, y: number): number {
   return y * config.tilesPerSide + x;
+}
+
+async function readHeightHalo(config: WorldConfig, io: HydrologyTileIO, tileX: number, tileY: number): Promise<Uint16Array> {
+  const tileSize = config.tileSize;
+  const stride = tileSize + 2;
+  const halo = new Uint16Array(stride * stride);
+  const center = await io.readTile({ x: tileX, y: tileY, d: 0 });
+  for (let y = 0; y < tileSize; y += 1) {
+    halo.set(center.subarray(y * tileSize, (y + 1) * tileSize), (y + 1) * stride + 1);
+  }
+
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = tileX + dx;
+      const ny = tileY + dy;
+      if (nx < 0 || ny < 0 || nx >= config.tilesPerSide || ny >= config.tilesPerSide) continue;
+      const neighbor = await io.readTile({ x: nx, y: ny, d: 0 });
+      const sourceX = dx < 0 ? tileSize - 1 : dx > 0 ? 0 : 0;
+      const sourceY = dy < 0 ? tileSize - 1 : dy > 0 ? 0 : 0;
+      const width = dx === 0 ? tileSize : 1;
+      const height = dy === 0 ? tileSize : 1;
+      const targetX = dx < 0 ? 0 : dx > 0 ? tileSize + 1 : 1;
+      const targetY = dy < 0 ? 0 : dy > 0 ? tileSize + 1 : 1;
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          halo[(targetY + y) * stride + targetX + x] = neighbor[(sourceY + y) * tileSize + sourceX + x];
+        }
+      }
+    }
+  }
+  return halo;
+}
+
+function solveFlowPortGraph(analyses: FlowTileAnalysisResult[]): Map<number, number> {
+  const nodeMap = new Map<number, number>();
+  const nodeCells: number[] = [];
+  const nodeFor = (cell: number): number => {
+    let node = nodeMap.get(cell);
+    if (node !== undefined) return node;
+    node = nodeCells.length;
+    nodeMap.set(cell, node);
+    nodeCells.push(cell);
+    return node;
+  };
+
+  const edgeFrom: number[] = [];
+  const edgeTo: number[] = [];
+  const base = new Map<number, number>();
+  for (const analysis of analyses) {
+    for (let i = 0; i < analysis.baseTargetCells.length; i += 1) {
+      const node = nodeFor(analysis.baseTargetCells[i]);
+      base.set(node, (base.get(node) ?? 0) + analysis.baseFlows[i]);
+    }
+    for (let i = 0; i < analysis.transferFromCells.length; i += 1) {
+      const from = nodeFor(analysis.transferFromCells[i]);
+      const to = nodeFor(analysis.transferToCells[i]);
+      if (from === to) continue;
+      edgeFrom.push(from);
+      edgeTo.push(to);
+    }
+  }
+
+  const indegree = new Uint32Array(nodeCells.length);
+  const receiver = new Int32Array(nodeCells.length);
+  receiver.fill(-1);
+  for (let i = 0; i < edgeFrom.length; i += 1) {
+    receiver[edgeFrom[i]] = edgeTo[i];
+    indegree[edgeTo[i]] += 1;
+  }
+  const routing: FlowRouting = {
+    receivers: receiver,
+    outboundTargets: new Uint32Array(nodeCells.length),
+    indegree,
+    order: buildFlowTopologicalOrder(receiver, indegree)
+  };
+  routing.outboundTargets.fill(NO_FLOW_TARGET);
+  const accumulation = new Float64Array(nodeCells.length);
+  for (const [node, flow] of base) accumulation[node] += flow;
+  for (let i = 0; i < routing.order.length; i += 1) {
+    const current = routing.order[i];
+    const next = routing.receivers[current];
+    if (next >= 0) accumulation[next] += accumulation[current];
+  }
+
+  const incoming = new Map<number, number>();
+  for (let node = 0; node < nodeCells.length; node += 1) {
+    if (accumulation[node] > 0) incoming.set(nodeCells[node], accumulation[node]);
+  }
+  return incoming;
+}
+
+function groupIncomingByTile(config: WorldConfig, incomingByCell: Map<number, number>): Array<{ cells: Uint32Array; flows: Float64Array }> {
+  const grouped = Array.from({ length: config.tilesPerSide * config.tilesPerSide }, () => ({ cells: [] as number[], flows: [] as number[] }));
+  const fullSide = config.tileSize * config.tilesPerSide;
+  for (const [cell, flow] of incomingByCell) {
+    const x = cell % fullSide;
+    const y = Math.floor(cell / fullSide);
+    const tileX = Math.floor(x / config.tileSize);
+    const tileY = Math.floor(y / config.tileSize);
+    const localX = x - tileX * config.tileSize;
+    const localY = y - tileY * config.tileSize;
+    const group = grouped[tileIndex(config, tileX, tileY)];
+    group.cells.push(localY * config.tileSize + localX);
+    group.flows.push(flow);
+  }
+  return grouped.map((group) => ({ cells: Uint32Array.from(group.cells), flows: Float64Array.from(group.flows) }));
 }
 
 function canUseHydrologyWorkers(): boolean {

@@ -60,6 +60,49 @@ describe('hydrology basin bake', () => {
     expect(result.summary.maxDepth).toBe(8);
   });
 
+  it('calculates non-rectangular fill regions without generating scene objects', async () => {
+    const samples = [
+      10, 10, 10, 10, 10,
+      10, 2, 10, 10, 10,
+      10, 2, 2, 2, 10,
+      10, 10, 10, 10, 10,
+      10, 10, 10, 10, 10
+    ];
+    const result = await bakeSmallMap(config(5, 1), samples);
+
+    expect([...result.lakeFill]).toEqual(referenceLakeFill(5, 5, samples));
+    expect(result.summary).not.toHaveProperty('generatedHydrology');
+  });
+
+  it('writes tiled flow strength matching a full-map O(N) D8 reference on a slope', async () => {
+    const samples = [
+      9, 8, 7, 6,
+      8, 7, 6, 5,
+      7, 6, 5, 4,
+      6, 5, 4, 3
+    ];
+    const result = await bakeSmallMap(config(2, 2), samples);
+
+    expect([...result.flowStrength]).toEqual(referenceFlowStrength(4, 4, samples));
+    expect(result.summary.flowStrength).toBe('log1p-upstream-cell-count-r16');
+    expect(result.summary.flowTileCount).toBe(4);
+    expect(result.summary.maxFlowAccumulation).toBeGreaterThan(1);
+    expect(result).not.toHaveProperty('generatedHydrology');
+  });
+
+  it('routes flow across tile boundaries on the raw heightmap even when basins fill separately', async () => {
+    const samples = [
+      10, 10, 10, 10,
+      10, 2, 2, 9,
+      10, 2, 2, 8,
+      10, 10, 7, 6
+    ];
+    const result = await bakeSmallMap(config(2, 2), samples);
+
+    expect([...result.lakeFill]).toEqual(referenceLakeFill(4, 4, samples));
+    expect([...result.flowStrength]).toEqual(referenceFlowStrength(4, 4, samples));
+  });
+
   it('uses diagonal 8-connected outlets', async () => {
     const samples = [
       1, 10, 10,
@@ -71,11 +114,30 @@ describe('hydrology basin bake', () => {
     expect([...result.lakeFill]).toEqual(referenceLakeFill(3, 3, samples));
     expect(result.lakeFill[4]).toBe(0);
   });
+
+  it('keeps flow strength deterministic without workers', async () => {
+    const samples = [
+      9, 9, 9, 9,
+      9, 1, 1, 8,
+      9, 1, 1, 7,
+      9, 8, 7, 6
+    ];
+    const first = await bakeSmallMap(config(2, 2), samples);
+    const second = await bakeSmallMap(config(2, 2), samples);
+
+    expect([...second.flowStrength]).toEqual([...first.flowStrength]);
+    expect(second.summary.maxFlowAccumulation).toBe(first.summary.maxFlowAccumulation);
+  });
 });
 
-async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{ lakeFill: Uint16Array; summary: Awaited<ReturnType<typeof runHydrologyBasinBake>>['summary'] }> {
+async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{
+  lakeFill: Uint16Array;
+  flowStrength: Uint16Array;
+  summary: Awaited<ReturnType<typeof runHydrologyBasinBake>>['summary'];
+}> {
   const tiles = new Map<string, Uint16Array>();
   const lakeFillTiles = new Map<string, Uint16Array>();
+  const flowStrengthTiles = new Map<string, Uint16Array>();
   const fullSide = config.tileSize * config.tilesPerSide;
   for (let ty = 0; ty < config.tilesPerSide; ty += 1) {
     for (let tx = 0; tx < config.tilesPerSide; tx += 1) {
@@ -99,11 +161,15 @@ async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{ l
     },
     async writeLakeFillHeightTile(key, tile) {
       lakeFillTiles.set(id(key), tile);
+    },
+    async writeFlowStrengthTile(key, tile) {
+      flowStrengthTiles.set(id(key), tile);
     }
   }, undefined, { useWorkers: false });
 
   return {
     lakeFill: stitch(config, lakeFillTiles),
+    flowStrength: stitch(config, flowStrengthTiles),
     summary: result.summary
   };
 }
@@ -171,6 +237,77 @@ function referenceFill(width: number, height: number, input: number[]): number[]
 function referenceLakeFill(width: number, height: number, input: number[]): number[] {
   const filled = referenceFill(width, height, input);
   return filled.map((fill, index) => fill >= input[index] + 1 ? fill : 0);
+}
+
+function referenceFlowStrength(width: number, height: number, input: number[]): number[] {
+  const receivers = new Int32Array(input.length);
+  const indegree = new Uint32Array(input.length);
+  receivers.fill(-1);
+  const directions = [
+    [1, 0], [0, 1], [1, 1], [-1, 0],
+    [0, -1], [-1, -1], [1, -1], [-1, 1]
+  ];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const current = input[index];
+      let best = -1;
+      let bestScore = -1;
+      let bestEqual = false;
+      for (const [dx, dy] of directions) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const neighborIndex = ny * width + nx;
+        const neighbor = input[neighborIndex];
+        if (neighbor < current) {
+          const score = (current - neighbor) * (dx !== 0 && dy !== 0 ? 707 : 1000);
+          if (bestEqual || score > bestScore) {
+            best = neighborIndex;
+            bestScore = score;
+            bestEqual = false;
+          }
+        } else if (neighbor === current && bestScore < 0 && neighborIndex > index) {
+          best = neighborIndex;
+          bestScore = 0;
+          bestEqual = true;
+        }
+      }
+      receivers[index] = best;
+      if (best >= 0) indegree[best] += 1;
+    }
+  }
+  const queue = new Uint32Array(input.length);
+  const order = new Uint32Array(input.length);
+  let head = 0;
+  let tail = 0;
+  let orderLength = 0;
+  for (let i = 0; i < indegree.length; i += 1) {
+    if (indegree[i] === 0) queue[tail++] = i;
+  }
+  while (head < tail) {
+    const current = queue[head++];
+    order[orderLength++] = current;
+    const receiver = receivers[current];
+    if (receiver >= 0) {
+      indegree[receiver] -= 1;
+      if (indegree[receiver] === 0) queue[tail++] = receiver;
+    }
+  }
+  const accumulation = new Float64Array(input.length);
+  accumulation.fill(1);
+  let maxFlow = 1;
+  for (let i = 0; i < orderLength; i += 1) {
+    const current = order[i];
+    maxFlow = Math.max(maxFlow, accumulation[current]);
+    const receiver = receivers[current];
+    if (receiver >= 0) accumulation[receiver] += accumulation[current];
+  }
+  const denominator = Math.log1p(Math.max(0, maxFlow - 1));
+  return [...accumulation].map((flow) => {
+    const effective = Math.max(0, flow - 1);
+    return denominator > 0 && effective > 0 ? Math.min(65535, Math.round(65535 * Math.log1p(effective) / denominator)) : 0;
+  });
 }
 
 function id(key: TileKey): string {

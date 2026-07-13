@@ -1,6 +1,8 @@
 import * as THREE from 'three';
-import type { AnchorV1, AuthoringDocumentV1, PrimitiveV1 } from '../authoring/authoringDocument';
+import type { AnchorV1, AuthoringDocumentV1, HydrologyPointV1, HydrologySceneV1, PrimitiveV1 } from '../authoring/authoringDocument';
 import { DEFAULT_SPLINE_SMOOTHNESS, sampleSplineAnchors, type SplinePoint2D } from '../authoring/spline';
+import { RIVER_SIMPLIFY_TOLERANCE_CELLS, simplifyRiverPolyline } from '../authoring/hydrologyAuthoring';
+import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
 
 export interface AuthoringSelection {
   primitiveId: string | null;
@@ -328,6 +330,151 @@ export class AuthoringOverlay {
   private track(object: THREE.Object3D): void {
     this.group.add(object);
     this.disposable.push(object);
+  }
+}
+
+export class HydrologyOverlay {
+  readonly group = new THREE.Group();
+
+  private hydrology: HydrologySceneV1 | null = null;
+  private config: WorldConfig | null = null;
+  private visible = true;
+  private readonly disposable: THREE.Object3D[] = [];
+
+  constructor() {
+    this.group.renderOrder = 18;
+  }
+
+  setHydrology(hydrology: HydrologySceneV1 | null | undefined): void {
+    this.hydrology = hydrology ?? null;
+    this.rebuild();
+  }
+
+  setConfig(config: WorldConfig | null): void {
+    this.config = config;
+    this.rebuild();
+  }
+
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    this.group.visible = visible;
+  }
+
+  dispose(): void {
+    this.clear();
+  }
+
+  private rebuild(): void {
+    this.clear();
+    this.group.visible = this.visible;
+    if (!this.hydrology || !this.config) return;
+    for (const body of this.hydrology.waterBodies) {
+      const y = r16ToElevation(body.waterLevelR16, this.config.worldHeight) + 3;
+      for (const ring of body.rings) this.addWaterBodyRing(ring, y);
+    }
+    for (const river of this.hydrology.rivers) {
+      for (const segment of river.segments) {
+        this.addRiver(simplifyRiverPolyline(segment.points, RIVER_SIMPLIFY_TOLERANCE_CELLS * this.config.unitSize, this.config.worldHeight), Math.max(1, river.widthHint));
+      }
+    }
+  }
+
+  private addWaterBodyRing(ring: HydrologyPointV1[], y: number): void {
+    if (ring.length < 4) return;
+    const shape = new THREE.Shape(ring.map((point) => new THREE.Vector2(point.x, point.z)));
+    const geometry = new THREE.ShapeGeometry(shape);
+    geometry.rotateX(Math.PI / 2);
+    const fill = new THREE.MeshBasicMaterial({
+      color: 0x35a8ff,
+      transparent: true,
+      opacity: 0.34,
+      side: THREE.DoubleSide,
+      depthTest: true,
+      depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geometry, fill);
+    mesh.position.y = y;
+    mesh.renderOrder = 18;
+    this.track(mesh);
+
+    const linePoints = ring.map((point) => new THREE.Vector3(point.x, y + 1, point.z));
+    const lineGeometry = new THREE.BufferGeometry().setFromPoints(linePoints);
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: 0xaee8ff,
+      transparent: true,
+      opacity: 0.92,
+      depthTest: true,
+      depthWrite: false
+    });
+    const line = new THREE.Line(lineGeometry, lineMaterial);
+    line.renderOrder = 19;
+    this.track(line);
+  }
+
+  private addRiver(points: HydrologyPointV1[], widthHint: number): void {
+    if (points.length < 2 || !this.config) return;
+    const vertices = points.map((point) => new THREE.Vector3(
+      point.x,
+      r16ToElevation(point.heightR16 ?? 0, this.config?.worldHeight ?? 1) + 5,
+      point.z
+    ));
+    const geometry = new THREE.BufferGeometry().setFromPoints(vertices);
+    const material = new THREE.LineBasicMaterial({
+      color: 0x47d7ff,
+      transparent: true,
+      opacity: 0.96,
+      depthTest: false,
+      depthWrite: false
+    });
+    const line = new THREE.Line(geometry, material);
+    line.renderOrder = 20;
+    this.track(line);
+
+    for (let i = 0; i < vertices.length - 1; i += 1) {
+      const a = vertices[i];
+      const b = vertices[i + 1];
+      const length = a.distanceTo(b);
+      if (length <= 0) continue;
+      const radius = Math.min(10, Math.max(1.5, widthHint * 0.75));
+      const cylinder = new THREE.CylinderGeometry(radius, radius, length, 8, 1);
+      cylinder.rotateZ(Math.PI / 2);
+      const mesh = new THREE.Mesh(cylinder, new THREE.MeshBasicMaterial({
+        color: 0x0aa7ff,
+        transparent: true,
+        opacity: 0.3,
+        depthTest: false,
+        depthWrite: false
+      }));
+      const midpoint = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+      mesh.position.copy(midpoint);
+      const direction = new THREE.Vector3().subVectors(b, a).normalize();
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), direction);
+      mesh.renderOrder = 19;
+      this.track(mesh);
+    }
+  }
+
+  private clear(): void {
+    for (const object of this.disposable) {
+      this.group.remove(object);
+      object.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose();
+        const material = mesh.material;
+        if (Array.isArray(material)) {
+          for (const item of material) item.dispose();
+        } else {
+          material?.dispose();
+        }
+      });
+    }
+    this.disposable.length = 0;
+  }
+
+  private track<T extends THREE.Object3D>(object: T): T {
+    this.group.add(object);
+    this.disposable.push(object);
+    return object;
   }
 }
 

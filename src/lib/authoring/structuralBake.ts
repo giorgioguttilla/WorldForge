@@ -31,6 +31,7 @@ export interface BakeTileIO {
   readWaterMaskTile?(key: TileKey): Promise<Uint16Array | null>;
   writeWaterMaskTile?(key: TileKey, samples: Uint16Array): Promise<void>;
   writeLakeFillHeightTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
 }
 
 export interface BakePassResult {

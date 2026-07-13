@@ -10,11 +10,12 @@
   import { estimateErosionBakeMemoryMb } from './lib/authoring/erosionBakeWebGpu';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
   import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
+  import { addRiverSourceAtWorld, addWaterFillAtWorld } from './lib/authoring/hydrologyAuthoring';
   import NoiseGraphEditor from './lib/noiseGraph/NoiseGraphEditor.svelte';
   import { createNoiseGraph, type NoiseFieldGraphV1 } from './lib/noiseGraph';
   import NumericInput from './lib/ui/NumericInput.svelte';
 
-  type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline';
+  type AuthoringTool = 'select' | 'addPoint' | 'landformArea' | 'mountainSpline' | 'waterFill' | 'riverSource';
 
   const WEBGPU_BAKE_SETTING_KEY = 'worldforge:preferWebGpuBake';
   const LOD_AGGRESSION_SETTING_KEY = 'worldforge:lodAggression';
@@ -75,6 +76,7 @@
   let dragStarted = false;
   let authoringSyncFrame: number | null = null;
   let editingField: NoiseFieldGraphV1 | null = null;
+  let hydrologyToolBusy = false;
 
   $: worldAreaSquareMiles = getWorldAreaSquareMiles(worldInput);
   $: configErrors = validateWorldConfig(worldInput);
@@ -447,6 +449,7 @@
   function setActiveTool(tool: AuthoringTool) {
     if (tool !== activeTool) cancelDraft();
     activeTool = tool;
+    viewport?.setAuthoringPointerUsesTerrain(tool === 'waterFill' || tool === 'riverSource');
   }
 
   function cancelDraft() {
@@ -459,6 +462,14 @@
 
   function handleAuthoringPointerDown(point: AuthoringPointerPoint): boolean {
     if (!authoringDocument || !manager.config || showDialog) return false;
+    if (activeTool === 'waterFill') {
+      if (!hydrologyToolBusy) void applyWaterFill(point);
+      return true;
+    }
+    if (activeTool === 'riverSource') {
+      if (!hydrologyToolBusy) void applyRiverSource(point);
+      return true;
+    }
     if (activeTool === 'landformArea') {
       const threshold = hitThreshold();
       if (draftAnchors.length >= 3 && Math.hypot(point.x - draftAnchors[0].x, point.z - draftAnchors[0].z) <= threshold) {
@@ -531,6 +542,44 @@
     selectedAnchorId = null;
     syncAuthoringViewport();
     return Boolean(primitive);
+  }
+
+  async function applyWaterFill(point: AuthoringPointerPoint) {
+    if (!authoringDocument) return;
+    hydrologyToolBusy = true;
+    status = 'Reading fill region...';
+    try {
+      const result = await addWaterFillAtWorld(manager, authoringDocument.hydrology, point.x, point.z);
+      if (!result.ok) {
+        status = result.reason;
+        return;
+      }
+      if (result.created) commitAuthoring({ ...authoringDocument, hydrology: result.hydrology }, { stale: false });
+      status = result.created ? `${result.waterBody.name} created.` : 'That fill region already has a water body.';
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'Could not create the water body.';
+    } finally {
+      hydrologyToolBusy = false;
+    }
+  }
+
+  async function applyRiverSource(point: AuthoringPointerPoint) {
+    if (!authoringDocument) return;
+    hydrologyToolBusy = true;
+    status = 'Routing river downhill...';
+    try {
+      const result = await addRiverSourceAtWorld(manager, authoringDocument.hydrology, point.x, point.z);
+      if (!result.ok) {
+        status = result.reason;
+        return;
+      }
+      commitAuthoring({ ...authoringDocument, hydrology: result.hydrology }, { stale: false });
+      status = `${result.river.name} ${result.replaced ? 'rerouted' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}.`;
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'Could not route the river.';
+    } finally {
+      hydrologyToolBusy = false;
+    }
   }
 
   function handleAuthoringPointerMove(point: AuthoringPointerPoint): boolean {
@@ -611,6 +660,22 @@
     selectedPrimitiveId = null;
     selectedAnchorId = null;
     commitAuthoring({ ...authoringDocument, primitives: authoringDocument.primitives.filter((item) => item.id !== primitive.id) });
+  }
+
+  function clearHydrologyObjects() {
+    if (!authoringDocument) return;
+    const lakeCount = authoringDocument.hydrology.waterBodies.length;
+    const riverCount = authoringDocument.hydrology.rivers.length;
+    if (lakeCount === 0 && riverCount === 0) return;
+    commitAuthoring({
+      ...authoringDocument,
+      hydrology: {
+        ...authoringDocument.hydrology,
+        waterBodies: [],
+        rivers: []
+      }
+    }, { stale: false });
+    status = `Cleared ${lakeCount} ${lakeCount === 1 ? 'lake' : 'lakes'} and ${riverCount} ${riverCount === 1 ? 'river' : 'rivers'}.`;
   }
 
   function findControlPointInsertion(x: number, z: number): { primitive: PrimitiveV1; insertIndex: number; distance: number } | null {
@@ -1060,7 +1125,9 @@
     { id: 'select', label: 'Select primitive', icon: MousePointer2 },
     { id: 'addPoint', label: 'Add control point', icon: CirclePlus },
     { id: 'landformArea', label: 'Landform area', icon: Paintbrush },
-    { id: 'mountainSpline', label: 'Mountain spline', icon: Route }
+    { id: 'mountainSpline', label: 'Mountain spline', icon: Route },
+    { id: 'waterFill', label: 'Water fill', icon: Paintbrush },
+    { id: 'riverSource', label: 'River source', icon: CircleDot }
   ];
 </script>
 
@@ -1115,7 +1182,7 @@
       <button
         type="button"
         class:active={activeTool === tool.id}
-        disabled={!hasAuthoringWorld}
+        disabled={!hasAuthoringWorld || hydrologyToolBusy}
         title={hasAuthoringWorld ? tool.label : 'Create or open a world first'}
         aria-label={tool.label}
         onclick={() => setActiveTool(tool.id)}
@@ -1228,6 +1295,33 @@
       </div>
 
       <div class="authoring-inspector-scroll">
+        <label title="Maximum carried river momentum in map cells. Downhill acceleration approaches this value asymptotically.">
+          <span>River max momentum</span>
+          <NumericInput
+            min="0.25"
+            max="32"
+            step="0.25"
+            value={authoringDocument.hydrology.riverTrace.maxMomentum}
+            onCommit={(value) => commitAuthoring({
+              ...authoringDocument,
+              hydrology: {
+                ...authoringDocument.hydrology,
+                riverTrace: { maxMomentum: Math.max(0.25, Math.min(32, value)) }
+              }
+            }, { stale: false })}
+          />
+        </label>
+
+        <div class="draft-row">
+          <span>{authoringDocument.hydrology.waterBodies.length} lakes · {authoringDocument.hydrology.rivers.length} rivers</span>
+          <button
+            type="button"
+            disabled={authoringDocument.hydrology.waterBodies.length === 0 && authoringDocument.hydrology.rivers.length === 0}
+            title="Clear all authored lakes and rivers"
+            onclick={clearHydrologyObjects}
+          ><Trash2 size={14} /> Clear lakes & rivers</button>
+        </div>
+
         {#if activeTool === 'landformArea' && draftAnchors.length > 0}
           <div class="draft-row">
             <span>{draftAnchors.length} anchors</span>

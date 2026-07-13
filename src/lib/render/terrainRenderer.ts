@@ -676,20 +676,30 @@ export class TerrainQuadtreeRenderer {
 
 }
 
-interface LakeFillDebugTile {
+export type HydrologyDebugLayer = 'lake-fill' | 'flow-strength';
+
+interface HydrologyDebugTile {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
   texture: THREE.DataTexture;
 }
 
-export class LakeFillHeightDebugRenderer {
+export class HydrologyDebugRenderer {
   readonly group = new THREE.Group();
 
-  private readonly tiles: LakeFillDebugTile[] = [];
+  private readonly tiles: HydrologyDebugTile[] = [];
   private generation = 0;
   private loading = false;
+  private layer: HydrologyDebugLayer = 'lake-fill';
 
   constructor(private readonly manager: TileManager) {
     this.group.visible = false;
+  }
+
+  setLayer(layer: HydrologyDebugLayer): void {
+    if (this.layer === layer) return;
+    this.layer = layer;
+    this.clear();
+    if (this.group.visible) void this.rebuild();
   }
 
   async rebuild(): Promise<void> {
@@ -716,7 +726,7 @@ export class LakeFillHeightDebugRenderer {
           const job = jobs[nextJob];
           nextJob += 1;
           if (this.generation !== generation) return;
-          const samples = await this.manager.readLakeFillHeightTile({ x: job.x, y: job.y, d: 0 });
+          const samples = await this.readLayerTile(job.x, job.y);
           if (!samples || this.generation !== generation || this.manager.config?.id !== config.id) continue;
           this.addTile(config, job.x, job.y, samples);
         }
@@ -772,6 +782,13 @@ export class LakeFillHeightDebugRenderer {
     mesh.renderOrder = 3;
     this.group.add(mesh);
     this.tiles.push({ mesh, texture });
+  }
+
+  private readLayerTile(tileX: number, tileY: number): Promise<Uint16Array | null> {
+    const key = { x: tileX, y: tileY, d: 0 };
+    return this.layer === 'flow-strength'
+      ? this.manager.readFlowStrengthTile(key)
+      : this.manager.readLakeFillHeightTile(key);
   }
 
   private clearTiles(): void {

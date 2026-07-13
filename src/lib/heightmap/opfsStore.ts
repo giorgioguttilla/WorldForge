@@ -103,8 +103,16 @@ export class HeightmapTileStore {
     await this.writeMaskTile(lakeFillHeightTilePath(key), samples, 'lake fill height');
   }
 
+  async writeFlowStrengthTile(key: TileKey, samples: Uint16Array): Promise<void> {
+    await this.writeMaskTile(flowStrengthTilePath(key), samples, 'flow strength');
+  }
+
   async readLakeFillHeightTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
     return this.readOptionalMaskTile(lakeFillHeightTilePath(key), tileSize);
+  }
+
+  async readFlowStrengthTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
+    return this.readOptionalMaskTile(flowStrengthTilePath(key), tileSize);
   }
 
   private async writeMaskTile(path: string, samples: Uint16Array, label: string): Promise<void> {
@@ -205,4 +213,8 @@ export function waterMaskTilePath(key: TileKey, extension = 'r16'): string {
 
 export function lakeFillHeightTilePath(key: TileKey, extension = 'r16'): string {
   return `masks/lakes/d${key.d}/y${key.y}/x${key.x}.${extension}`;
+}
+
+export function flowStrengthTilePath(key: TileKey, extension = 'r16'): string {
+  return `masks/flow-strength/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }

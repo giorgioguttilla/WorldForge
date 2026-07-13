@@ -1,6 +1,6 @@
 import { LodBuilder } from './lodBuilder';
 import { createHeightmapComputeBackend, type HeightmapComputeBackend } from './gpuHeightmapCompute';
-import { HeightmapTileStore, lakeFillHeightTilePath, waterMaskTilePath, type TileMetricsSnapshot } from './opfsStore';
+import { flowStrengthTilePath, HeightmapTileStore, lakeFillHeightTilePath, waterMaskTilePath, type TileMetricsSnapshot } from './opfsStore';
 import { encodeGrayscale16Png } from './png16';
 import { assertTileKey, tilePath, tilesPerSideAtDepth, type TileKey } from './tileKey';
 import { createWorldConfig, getMaxLodDepth, normalizeWaterConfig, normalizeWorldConfig, r16ToElevation, validateWorldConfig, type WaterConfig, type WorldConfig, type WorldConfigInput } from './worldConfig';
@@ -212,7 +212,8 @@ export class TileManager {
           writeTile: (key, samples) => this.store.writeTile(key, samples, { cache: false }),
           readWaterMaskTile: (key) => this.store.readWaterMaskTile(key, config.tileSize),
           writeWaterMaskTile: (key, samples) => this.store.writeWaterMaskTile(key, samples),
-          writeLakeFillHeightTile: (key, samples) => this.store.writeLakeFillHeightTile(key, samples)
+          writeLakeFillHeightTile: (key, samples) => this.store.writeLakeFillHeightTile(key, samples),
+          writeFlowStrengthTile: (key, samples) => this.store.writeFlowStrengthTile(key, samples)
         },
         onProgress,
         options
@@ -299,6 +300,14 @@ export class TileManager {
     return samples;
   }
 
+  async readFlowStrengthTile(key: TileKey): Promise<Uint16Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    const samples = await this.store.readFlowStrengthTile(key, config.tileSize);
+    this.refreshStoreMetrics();
+    return samples;
+  }
+
   async sampleHeightAtWorld(worldX: number, worldZ: number): Promise<number | null> {
     const config = this.requireConfig();
     const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
@@ -352,6 +361,11 @@ export class TileManager {
             if (lakeFillHeight) {
               const lakeFillHeightBlob = await encodeGrayscale16Png(config.tileSize, config.tileSize, lakeFillHeight);
               await this.writeBlobFile(directory, lakeFillHeightTilePath(key, 'png'), lakeFillHeightBlob);
+            }
+            const flowStrength = await this.store.readFlowStrengthTile(key, config.tileSize);
+            if (flowStrength) {
+              const flowStrengthBlob = await encodeGrayscale16Png(config.tileSize, config.tileSize, flowStrength);
+              await this.writeBlobFile(directory, flowStrengthTilePath(key, 'png'), flowStrengthBlob);
             }
           }
         }

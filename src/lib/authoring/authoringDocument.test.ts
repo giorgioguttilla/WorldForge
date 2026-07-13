@@ -100,4 +100,53 @@ describe('authoring document', () => {
       splineSmoothness: 0.65
     });
   });
+
+  it('normalizes authored hydrology objects conservatively', () => {
+    const document = normalizeAuthoringDocument({
+      hydrology: {
+        version: 1,
+        waterBodies: [{
+          id: 'waterBody-1',
+          name: 'Lake One',
+          sourceCellX: 4,
+          sourceCellY: 5,
+          waterLevelR16: 10,
+          areaCells: 4,
+          maxDepthR16: 8,
+          rings: [[
+            { x: 0, z: 0 },
+            { x: 1, z: 0 },
+            { x: 1, z: 1 },
+            { x: 0, z: 0 }
+          ]]
+        }, {
+          id: 'bad',
+          rings: []
+        }],
+        rivers: [{
+          id: 'river-1',
+          points: [{ x: 0, z: 0, heightR16: 9 }, { x: 1, z: 1, heightR16: 8 }],
+          mouth: 'edge',
+          waterBodyIds: ['waterBody-1'],
+          maxFlowStrengthR16: 40000,
+          widthHint: 2
+        }, {
+          id: 'bad-river',
+          points: [{ x: 0, z: 0 }]
+        }]
+      }
+    }, 'world-a');
+
+    expect(document.hydrology.waterBodies).toHaveLength(1);
+    expect(document.hydrology.waterBodies[0]).toMatchObject({ name: 'Lake One', sourceCellX: 4, sourceCellY: 5 });
+    expect(document.hydrology.rivers).toHaveLength(1);
+    expect(document.hydrology.rivers[0]).toMatchObject({ mouth: 'edge', waterBodyIds: ['waterBody-1'] });
+    expect(document.hydrology.rivers[0].segments).toEqual([expect.objectContaining({
+      id: 'river-1-segment-1',
+      termination: 'edge',
+      initialMomentum: { x: 0, z: 0 },
+      finalMomentum: { x: 0, z: 0 }
+    })]);
+    expect(document.hydrology.riverTrace).toEqual({ maxMomentum: 6 });
+  });
 });

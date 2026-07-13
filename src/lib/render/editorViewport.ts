@@ -3,12 +3,13 @@ import * as THREE from 'three';
 import type { TileManager } from '../heightmap/tileManager';
 import { CameraController, type ViewMode } from './cameraController';
 import { createRenderer, type RendererAdapter } from './rendererAdapter';
-import { LakeFillHeightDebugRenderer, TerrainQuadtreeRenderer, type VisualizationMode } from './terrainRenderer';
-import { AuthoringOverlay, type AuthoringSelection } from './authoringOverlay';
+import { HydrologyDebugRenderer, TerrainQuadtreeRenderer, type HydrologyDebugLayer, type VisualizationMode } from './terrainRenderer';
+import { AuthoringOverlay, HydrologyOverlay, type AuthoringSelection } from './authoringOverlay';
 import type { AnchorV1, AuthoringDocumentV1 } from '../authoring/authoringDocument';
 
 const TERRAIN_UPDATE_INTERVAL_FRAMES = 8;
 const ENABLE_TERRAIN_RAYCAST = false;
+type HydrologyDebugMode = 'terrain' | HydrologyDebugLayer;
 
 export interface HoverCoordinates {
   x: number;
@@ -37,8 +38,9 @@ export interface AuthoringPointerHandlers {
 export class EditorViewport {
   readonly controller: CameraController;
   readonly terrain: TerrainQuadtreeRenderer;
-  readonly fillDebug: LakeFillHeightDebugRenderer;
+  readonly hydrologyDebug: HydrologyDebugRenderer;
   readonly authoringOverlay = new AuthoringOverlay();
+  readonly hydrologyOverlay = new HydrologyOverlay();
   readonly stats = new Stats();
   backend: 'webgpu' | 'webgl' = 'webgl';
 
@@ -56,8 +58,9 @@ export class EditorViewport {
   private waterSettings: WaterSettings = { visible: false, level: 0 };
   private authoringHandlers: AuthoringPointerHandlers | null = null;
   private authoringPointerId: number | null = null;
+  private authoringPointerUsesTerrain = false;
   private inputLocked = false;
-  private fillDebugVisible = false;
+  private hydrologyDebugMode: HydrologyDebugMode = 'terrain';
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -67,7 +70,7 @@ export class EditorViewport {
   ) {
     this.controller = new CameraController(canvas, manager);
     this.terrain = new TerrainQuadtreeRenderer(manager);
-    this.fillDebug = new LakeFillHeightDebugRenderer(manager);
+    this.hydrologyDebug = new HydrologyDebugRenderer(manager);
     const waterGeometry = new THREE.PlaneGeometry(1, 1, 1, 1);
     waterGeometry.rotateX(-Math.PI / 2);
     const waterMaterial = new THREE.MeshStandardMaterial({
@@ -89,8 +92,9 @@ export class EditorViewport {
     this.scene.background = new THREE.Color(0x0c1116);
     this.scene.fog = new THREE.FogExp2(0x0c1116, 0.000045);
     this.scene.add(this.terrain.group);
-    this.scene.add(this.fillDebug.group);
+    this.scene.add(this.hydrologyDebug.group);
     this.scene.add(this.water);
+    this.scene.add(this.hydrologyOverlay.group);
     this.scene.add(this.authoringOverlay.group);
     this.scene.add(new THREE.HemisphereLight(0xcdeaff, 0x30402d, 1.8));
 
@@ -151,7 +155,7 @@ export class EditorViewport {
     this.stats.dom.remove();
     this.controller.dispose();
     this.terrain.dispose();
-    this.fillDebug.dispose();
+    this.hydrologyDebug.dispose();
     if (ENABLE_TERRAIN_RAYCAST) {
       this.canvas.removeEventListener('pointermove', this.onPointerMove);
       this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
@@ -165,11 +169,16 @@ export class EditorViewport {
     this.disposeTileGrid();
     this.disposeWorldBounds();
     this.authoringOverlay.dispose();
+    this.hydrologyOverlay.dispose();
     this.rendererAdapter?.renderer.dispose();
   }
 
   setAuthoringInputHandlers(handlers: AuthoringPointerHandlers | null): void {
     this.authoringHandlers = handlers;
+  }
+
+  setAuthoringPointerUsesTerrain(enabled: boolean): void {
+    this.authoringPointerUsesTerrain = enabled;
   }
 
   setInputLocked(locked: boolean): void {
@@ -183,6 +192,8 @@ export class EditorViewport {
 
   setAuthoringDocument(document: AuthoringDocumentV1 | null): void {
     this.authoringOverlay.setDocument(document);
+    this.hydrologyOverlay.setConfig(this.manager.config);
+    this.hydrologyOverlay.setHydrology(document?.hydrology);
   }
 
   setAuthoringSelection(selection: AuthoringSelection): void {
@@ -195,6 +206,7 @@ export class EditorViewport {
 
   setAuthoringVisible(visible: boolean): void {
     this.authoringOverlay.setVisible(visible);
+    this.hydrologyOverlay.setVisible(visible);
     this.updateTileGrid();
     this.updateWorldBounds();
   }
@@ -205,9 +217,9 @@ export class EditorViewport {
 
   refreshTerrain(): void {
     this.terrain.clear();
-    this.fillDebug.clear();
-    if (this.fillDebugVisible) {
-      void this.fillDebug.rebuild();
+    this.hydrologyDebug.clear();
+    if (this.hydrologyDebugMode !== 'terrain') {
+      void this.hydrologyDebug.rebuild();
     } else {
       void this.terrain.update(this.controller.activeCamera);
     }
@@ -222,7 +234,7 @@ export class EditorViewport {
     this.lastFrameTime = now;
     this.controller.update(delta);
     this.updateAuthoringControlScale();
-    if (!this.fillDebugVisible && this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
+    if (this.hydrologyDebugMode === 'terrain' && this.frame % TERRAIN_UPDATE_INTERVAL_FRAMES === 0) void this.terrain.update(this.controller.activeCamera);
     this.rendererAdapter?.renderer.render(this.scene, this.controller.activeCamera);
     this.frame += 1;
     this.stats.end();
@@ -257,16 +269,27 @@ export class EditorViewport {
 
   private readonly onKeyDown = (event: KeyboardEvent): void => {
     if (this.inputLocked || event.repeat || event.code !== 'KeyO' || isTextInput(event.target)) return;
-    this.setFillDebugVisible(!this.fillDebugVisible);
+    this.cycleHydrologyDebugMode();
     event.preventDefault();
   };
 
-  private setFillDebugVisible(visible: boolean): void {
-    this.fillDebugVisible = visible;
-    this.terrain.group.visible = !visible;
-    this.fillDebug.setVisible(visible);
-    this.water.visible = visible ? false : this.waterSettings.visible && Boolean(this.manager.config);
-    if (!visible) {
+  private cycleHydrologyDebugMode(): void {
+    const next: HydrologyDebugMode = this.hydrologyDebugMode === 'terrain'
+      ? 'lake-fill'
+      : this.hydrologyDebugMode === 'lake-fill'
+        ? 'flow-strength'
+        : 'terrain';
+    this.setHydrologyDebugMode(next);
+  }
+
+  private setHydrologyDebugMode(mode: HydrologyDebugMode): void {
+    this.hydrologyDebugMode = mode;
+    const debugVisible = mode !== 'terrain';
+    this.terrain.group.visible = !debugVisible;
+    if (debugVisible) this.hydrologyDebug.setLayer(mode);
+    this.hydrologyDebug.setVisible(debugVisible);
+    this.water.visible = debugVisible ? false : this.waterSettings.visible && Boolean(this.manager.config);
+    if (!debugVisible) {
       void this.terrain.update(this.controller.activeCamera);
     }
   }
@@ -313,7 +336,8 @@ export class EditorViewport {
 
   private updateWaterPlane(): void {
     const config = this.manager.config;
-    this.water.visible = !this.fillDebugVisible && this.waterSettings.visible && Boolean(config);
+    this.hydrologyOverlay.setConfig(config);
+    this.water.visible = this.hydrologyDebugMode === 'terrain' && this.waterSettings.visible && Boolean(config);
     if (!config) return;
     const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
     const planeSize = Math.max(worldSize * 3, 10000);
@@ -444,6 +468,11 @@ export class EditorViewport {
       -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1)
     );
     this.raycaster.setFromCamera(pointer, this.controller.activeCamera);
+    if (this.authoringPointerUsesTerrain) {
+      const terrainHit = this.raycaster.intersectObjects(this.terrain.getRaycastTargets(), false)
+        .find((intersection) => intersection.object.visible);
+      if (terrainHit) return { x: terrainHit.point.x, z: terrainHit.point.z, event };
+    }
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.waterSettings.level);
     const hit = new THREE.Vector3();
     if (!this.raycaster.ray.intersectPlane(plane, hit)) return null;
