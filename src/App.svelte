@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { CircleDot, CirclePlus, Crosshair, Download, Edit3, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound } from '@lucide/svelte';
+  import { CircleDot, CirclePlus, Crosshair, Download, Edit3, Eye, EyeOff, FolderOpen, Grid3X3, Hammer, Map, Mountain, MousePointer2, Navigation, Paintbrush, Palette, Plus, Redo2, Route, Settings, Trash2, Undo2, UserRound, Waves } from '@lucide/svelte';
   import { DEFAULT_WORLD_INPUT, getWorldAreaSquareMiles, validateWorldConfig, type WorldConfig, type WorldConfigInput } from './lib/heightmap/worldConfig';
   import { TileManager, type BulkProgress, type EditorMetrics } from './lib/heightmap/tileManager';
   import { EditorViewport, type AuthoringPointerPoint, type HoverCoordinates } from './lib/render/editorViewport';
@@ -58,6 +58,7 @@
   let selectedPrimitiveId: string | null = null;
   let selectedAnchorId: string | null = null;
   let showAuthoring = true;
+  let showWaterDetails = true;
   let draftAnchors: AnchorV1[] = [];
   let bakeState: 'clean' | 'stale' | 'failed' | 'baking' = 'clean';
   let undoStack: AuthoringDocumentV1[] = [];
@@ -396,6 +397,7 @@
     viewport?.setAuthoringSelection({ primitiveId: selectedPrimitiveId, anchorId: selectedAnchorId });
     viewport?.setAuthoringPreview(draftAnchors);
     viewport?.setAuthoringVisible(showAuthoring);
+    viewport?.setWaterDetailsVisible(showWaterDetails);
   }
 
   function scheduleAuthoringViewportSync() {
@@ -1175,6 +1177,20 @@
         <span class="icon-tooltip" role="tooltip">{visualization.label}</span>
       </button>
     {/each}
+  </div>
+
+  <div class="water-stack" aria-label="Water details layer">
+    <button
+      type="button"
+      class:active={showWaterDetails}
+      disabled={!hasAuthoringWorld}
+      title={hasAuthoringWorld ? (showWaterDetails ? 'Hide water details' : 'Show water details') : 'Create or open a world first'}
+      aria-label={showWaterDetails ? 'Hide water details' : 'Show water details'}
+      onclick={() => { showWaterDetails = !showWaterDetails; viewport?.setWaterDetailsVisible(showWaterDetails); }}
+    >
+      <Waves size={18} />
+      <span class="icon-tooltip" role="tooltip">{showWaterDetails ? 'Hide water details' : 'Show water details'}</span>
+    </button>
   </div>
 
   <div class="authoring-stack" aria-label="Authoring tools">

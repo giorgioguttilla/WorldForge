@@ -7,6 +7,11 @@ interface Cell {
   y: number;
 }
 
+interface TracePosition {
+  x: number;
+  y: number;
+}
+
 interface FillRegion {
   level: number;
   cells: Cell[];
@@ -25,9 +30,17 @@ interface SpillOutlet {
 
 const DOWNHILL_ACCELERATION = 1.25;
 const DOWNHILL_STEERING = 0.75;
+const LATERAL_MOMENTUM_RESPONSE = 1.5;
+const MOMENTUM_RETENTION_PER_STEP = 0.985;
+const RIVER_TRACE_STEP_CELLS = 0.25;
+const MIN_TRACE_MOMENTUM = 0.01;
+const TRACE_VISIT_RESOLUTION_CELLS = RIVER_TRACE_STEP_CELLS / 4;
+const MAX_TRACE_TURN_RADIANS = Math.PI / 18;
 const SLOPE_RESPONSE_R16 = 256;
 const OUTLET_MOMENTUM_FRACTION = 0.6;
-export const RIVER_SIMPLIFY_TOLERANCE_CELLS = 0.18;
+// Remove sub-cell raster jitter while preserving bends that move the channel by a cell or more.
+export const RIVER_SIMPLIFY_TOLERANCE_CELLS = 0.6;
+export const LAKE_RING_SIMPLIFY_TOLERANCE_CELLS = 0.75;
 const MAX_RIVER_SEGMENTS = 128;
 
 export type WaterFillResult =
@@ -97,7 +110,7 @@ export async function addRiverSourceAtWorld(
         createdWaterBodies += 1;
       }
       if (!waterBodyIds.includes(targetBody.id)) waterBodyIds.push(targetBody.id);
-      if (traced.points.length >= 2) segments.push(createRiverSegment(traced, config, sourceWaterBody?.id, targetBody.id));
+      if (traced.points.length >= 2) segments.push(createRiverSegment(traced, sourceWaterBody?.id, targetBody.id));
       if (!traced.hitRegion.outlet) break;
       sourceWaterBody = targetBody;
       segmentStart = traced.hitRegion.outlet.rim;
@@ -105,7 +118,7 @@ export async function addRiverSourceAtWorld(
       continue;
     }
 
-    if (traced.points.length >= 2) segments.push(createRiverSegment(traced, config, sourceWaterBody?.id));
+    if (traced.points.length >= 2) segments.push(createRiverSegment(traced, sourceWaterBody?.id));
     if (traced.termination === 'edge') mouth = 'edge';
     break;
   }
@@ -157,34 +170,52 @@ async function traceMomentumSegment(
   sourceWaterBody?: WaterBodyV1
 ): Promise<MomentumTraceResult> {
   const points: HydrologyPointV1[] = [];
-  const visited = new Set<number>();
-  let current = start;
+  const visited = new Set<string>();
+  let currentPosition: TracePosition = { x: start.x, y: start.y };
+  let currentCell = start;
   let momentum = { ...initialMomentum };
+  let heading = normalizeVector(initialMomentum);
   let maxFlowStrengthR16 = 0;
-  let height = await sampler.height(current);
-  const initialTermination = await sampleCell(current, height);
+  let height = await sampler.heightAt(currentPosition);
+  const initialTermination = await samplePosition(currentPosition, currentCell, height);
   if (initialTermination) return initialTermination;
 
-  for (let tick = 0; tick < sampler.side * sampler.side; tick += 1) {
-    const slope = await downhillSlope(sampler, current, height, momentum);
-    momentum = accumulateMomentum(momentum, slope, settings.maxMomentum);
+  const maxSteps = Math.ceil((sampler.side * sampler.side) / RIVER_TRACE_STEP_CELLS);
+  for (let step = 0; step < maxSteps; step += 1) {
+    const retention = MOMENTUM_RETENTION_PER_STEP ** RIVER_TRACE_STEP_CELLS;
+    momentum = {
+      x: momentum.x * retention,
+      z: momentum.z * retention
+    };
+    const slope = await downhillSlopeAtPosition(sampler, currentPosition, height, momentum);
+    momentum = accumulateMomentum(momentum, slope, settings.maxMomentum, RIVER_TRACE_STEP_CELLS);
     const resultant = {
       x: momentum.x + slope.x * slope.strength * DOWNHILL_STEERING,
       z: momentum.z + slope.z * slope.strength * DOWNHILL_STEERING
     };
-    const traversed = cellsAlongVector(current, resultant, sampler.side);
-    if (traversed.length === 0) return traceResult('stuck');
-    for (const next of traversed) {
-      current = next;
-      height = await sampler.height(current);
-      const termination = await sampleCell(current, height);
-      if (termination) return termination;
-    }
+    const desiredDirection = normalizeVector(resultant);
+    if (Math.hypot(resultant.x, resultant.z) < MIN_TRACE_MOMENTUM) return traceResult('stuck');
+    const direction = limitHeadingTurn(heading, desiredDirection, MAX_TRACE_TURN_RADIANS);
+    heading = direction;
+    const unclamped = {
+      x: currentPosition.x + direction.x * RIVER_TRACE_STEP_CELLS,
+      y: currentPosition.y + direction.z * RIVER_TRACE_STEP_CELLS
+    };
+    const nextPosition = {
+      x: Math.max(0, Math.min(sampler.side - 1, unclamped.x)),
+      y: Math.max(0, Math.min(sampler.side - 1, unclamped.y))
+    };
+    if (nextPosition.x === currentPosition.x && nextPosition.y === currentPosition.y) return traceResult('edge');
+    currentPosition = nextPosition;
+    currentCell = positionToCell(currentPosition, sampler.side);
+    height = await sampler.heightAt(currentPosition);
+    const termination = await samplePosition(currentPosition, currentCell, height);
+    if (termination) return termination;
   }
   return traceResult('stuck');
 
-  async function sampleCell(cell: Cell, terrainHeight: number): Promise<MomentumTraceResult | null> {
-    const id = sampler.cellId(cell);
+  async function samplePosition(position: TracePosition, cell: Cell, terrainHeight: number): Promise<MomentumTraceResult | null> {
+    const id = `${Math.round(position.x / TRACE_VISIT_RESOLUTION_CELLS)},${Math.round(position.y / TRACE_VISIT_RESOLUTION_CELLS)}`;
     if (visited.has(id)) return traceResult('stuck');
     visited.add(id);
     maxFlowStrengthR16 = Math.max(maxFlowStrengthR16, await sampler.flow(cell));
@@ -192,12 +223,12 @@ async function traceMomentumSegment(
     if (fillLevel > 0) {
       const region = await collectFillRegion(sampler, cell, momentum);
       if (!region) return traceResult('stuck');
-      points.push(cellToWorld(sampler.config, cell, region.level));
+      points.push(positionToWorld(sampler.config, position, region.level));
       const selfTerminated = Boolean(sourceWaterBody && region.cellIds.has(sourceWaterBody.sourceCellY * sampler.side + sourceWaterBody.sourceCellX));
       return { ...traceResult('water-body'), hitRegion: region, selfTerminated };
     }
-    points.push(cellToWorld(sampler.config, cell, terrainHeight));
-    return isEdge(cell, sampler.side) ? traceResult('edge') : null;
+    points.push(positionToWorld(sampler.config, position, terrainHeight));
+    return isPositionEdge(position, sampler.side) ? traceResult('edge') : null;
   }
 
   function traceResult(termination: RiverSegmentV1['termination']): MomentumTraceResult {
@@ -256,33 +287,72 @@ async function downhillSlope(
   };
 }
 
-function accumulateMomentum(momentum: HydrologyVectorV1, slope: DownhillSlope, maxMomentum: number): HydrologyVectorV1 {
+async function downhillSlopeAtPosition(
+  sampler: HydrologyMapSampler,
+  position: TracePosition,
+  height: number,
+  forward: HydrologyVectorV1
+): Promise<DownhillSlope> {
+  const sampleDistance = 0.5;
+  const left = await sampler.heightAt({ x: position.x - sampleDistance, y: position.y });
+  const right = await sampler.heightAt({ x: position.x + sampleDistance, y: position.y });
+  const up = await sampler.heightAt({ x: position.x, y: position.y - sampleDistance });
+  const down = await sampler.heightAt({ x: position.x, y: position.y + sampleDistance });
+  const x = left - right;
+  const z = up - down;
+  const magnitude = Math.hypot(x, z);
+  if (magnitude < 1e-6) return downhillSlope(sampler, positionToCell(position, sampler.side), height, forward);
+  return {
+    x: x / magnitude,
+    z: z / magnitude,
+    strength: 1 - Math.exp(-(magnitude / (sampleDistance * 2)) / SLOPE_RESPONSE_R16)
+  };
+}
+
+function accumulateMomentum(
+  momentum: HydrologyVectorV1,
+  slope: DownhillSlope,
+  maxMomentum: number,
+  responseScale = 1
+): HydrologyVectorV1 {
   const currentMagnitude = Math.hypot(momentum.x, momentum.z);
   const remainingFraction = Math.max(0, 1 - currentMagnitude / Math.max(0.001, maxMomentum));
-  const acceleration = DOWNHILL_ACCELERATION * slope.strength * remainingFraction;
-  const next = { x: momentum.x + slope.x * acceleration, z: momentum.z + slope.z * acceleration };
+  const acceleration = DOWNHILL_ACCELERATION * slope.strength * responseScale;
+  if (acceleration === 0) return { ...momentum };
+  const forwardX = currentMagnitude > 0 ? momentum.x / currentMagnitude : slope.x;
+  const forwardZ = currentMagnitude > 0 ? momentum.z / currentMagnitude : slope.z;
+  const alignment = slope.x * forwardX + slope.z * forwardZ;
+  const parallelScale = alignment > 0 ? remainingFraction : 1;
+  const lateralX = slope.x - forwardX * alignment;
+  const lateralZ = slope.z - forwardZ * alignment;
+  const next = {
+    x: momentum.x + forwardX * alignment * acceleration * parallelScale + lateralX * acceleration * LATERAL_MOMENTUM_RESPONSE,
+    z: momentum.z + forwardZ * alignment * acceleration * parallelScale + lateralZ * acceleration * LATERAL_MOMENTUM_RESPONSE
+  };
   const magnitude = Math.hypot(next.x, next.z);
   if (magnitude <= maxMomentum || magnitude === 0) return next;
   const scale = maxMomentum / magnitude;
   return { x: next.x * scale, z: next.z * scale };
 }
 
-function cellsAlongVector(cell: Cell, vector: HydrologyVectorV1, side: number): Cell[] {
+function normalizeVector(vector: HydrologyVectorV1): HydrologyVectorV1 {
   const magnitude = Math.hypot(vector.x, vector.z);
-  if (magnitude < 1e-6) return [];
-  const distance = Math.max(1, magnitude);
-  const directionX = vector.x / magnitude;
-  const directionY = vector.z / magnitude;
-  const steps = Math.ceil(distance);
-  const cells: Cell[] = [];
-  for (let step = 1; step <= steps; step += 1) {
-    const travel = Math.min(distance, step);
-    const next = { x: Math.round(cell.x + directionX * travel), y: Math.round(cell.y + directionY * travel) };
-    if (next.x < 0 || next.y < 0 || next.x >= side || next.y >= side) break;
-    const previous = cells[cells.length - 1];
-    if ((!previous || previous.x !== next.x || previous.y !== next.y) && (next.x !== cell.x || next.y !== cell.y)) cells.push(next);
-  }
-  return cells;
+  return magnitude > 0 ? { x: vector.x / magnitude, z: vector.z / magnitude } : { x: 0, z: 0 };
+}
+
+function limitHeadingTurn(current: HydrologyVectorV1, desired: HydrologyVectorV1, maxRadians: number): HydrologyVectorV1 {
+  if (Math.hypot(current.x, current.z) < 1e-6) return desired;
+  const dot = Math.max(-1, Math.min(1, current.x * desired.x + current.z * desired.z));
+  const cross = current.x * desired.z - current.z * desired.x;
+  const angle = Math.atan2(cross, dot);
+  if (Math.abs(angle) <= maxRadians) return desired;
+  const limited = Math.sign(angle) * maxRadians;
+  const cosine = Math.cos(limited);
+  const sine = Math.sin(limited);
+  return {
+    x: current.x * cosine - current.z * sine,
+    z: current.x * sine + current.z * cosine
+  };
 }
 
 function seedOutletMomentum(outlet: SpillOutlet, maxMomentum: number): HydrologyVectorV1 {
@@ -291,12 +361,12 @@ function seedOutletMomentum(outlet: SpillOutlet, maxMomentum: number): Hydrology
   return { x: outlet.dx / magnitude * speed, z: outlet.dy / magnitude * speed };
 }
 
-function createRiverSegment(trace: MomentumTraceResult, config: WorldConfig, sourceWaterBodyId?: string, targetWaterBodyId?: string): RiverSegmentV1 {
+function createRiverSegment(trace: MomentumTraceResult, sourceWaterBodyId?: string, targetWaterBodyId?: string): RiverSegmentV1 {
   return {
     id: crypto.randomUUID(),
     sourceWaterBodyId,
     targetWaterBodyId,
-    points: simplifyRiverPolyline(trace.points, RIVER_SIMPLIFY_TOLERANCE_CELLS * config.unitSize, config.worldHeight),
+    points: trace.points.map((point) => ({ ...point })),
     initialMomentum: trace.initialMomentum,
     finalMomentum: trace.finalMomentum,
     termination: trace.termination
@@ -325,6 +395,48 @@ export function simplifyRiverPolyline(points: HydrologyPointV1[], tolerance: num
     stack.push([start, split], [split, end]);
   }
   return points.filter((_, index) => keep[index] === 1).map((point) => ({ ...point }));
+}
+
+/**
+ * Removes cell-to-cell lateral oscillation without changing the sampled terrain
+ * elevation. The symmetric five-point kernel preserves straight trends, while
+ * cancelling the common one-cell left/right raster pattern. Segment endpoints
+ * remain exact so lake contacts and river mouths cannot drift.
+ */
+export function smoothRiverLateralJitter(points: HydrologyPointV1[]): HydrologyPointV1[] {
+  if (points.length < 5) return points.map((point) => ({ ...point }));
+  return points.map((point, index) => {
+    if (index < 2 || index > points.length - 3) return { ...point };
+    const previous2 = points[index - 2];
+    const previous = points[index - 1];
+    const next = points[index + 1];
+    const next2 = points[index + 2];
+    return {
+      ...point,
+      x: (previous2.x + 4 * previous.x + 6 * point.x + 4 * next.x + next2.x) / 16,
+      z: (previous2.z + 4 * previous.z + 6 * point.z + 4 * next.z + next2.z) / 16
+    };
+  });
+}
+
+export function simplifyLakeRing(ring: HydrologyPointV1[], tolerance: number): HydrologyPointV1[] {
+  if (ring.length < 5 || tolerance <= 0) return ring.map((point) => ({ ...point }));
+  const open = ring.slice(0, -1);
+  if (open.length < 4) return ring.map((point) => ({ ...point }));
+  const anchor = open[0];
+  let split = 1;
+  let farthestDistanceSq = 0;
+  for (let index = 1; index < open.length; index += 1) {
+    const distanceSq = (open[index].x - anchor.x) ** 2 + (open[index].z - anchor.z) ** 2;
+    if (distanceSq <= farthestDistanceSq) continue;
+    farthestDistanceSq = distanceSq;
+    split = index;
+  }
+  const firstHalf = simplifyRiverPolyline(open.slice(0, split + 1), tolerance);
+  const secondHalf = simplifyRiverPolyline([...open.slice(split), anchor], tolerance);
+  const simplified = [...firstHalf.slice(0, -1), ...secondHalf.slice(0, -1)];
+  if (simplified.length < 3) return ring.map((point) => ({ ...point }));
+  return [...simplified, { ...simplified[0] }];
 }
 
 function distanceToRiverSegmentSq(point: HydrologyPointV1, start: HydrologyPointV1, end: HydrologyPointV1, worldHeight: number): number {
@@ -366,6 +478,26 @@ class HydrologyMapSampler {
   async height(cell: Cell): Promise<number> {
     const { tile, index } = this.locate(cell);
     return (await this.cached(this.heights, tile, () => this.manager.readTile({ ...tile, d: 0 })))[index];
+  }
+
+  async heightAt(position: TracePosition): Promise<number> {
+    const x = Math.max(0, Math.min(this.side - 1, position.x));
+    const y = Math.max(0, Math.min(this.side - 1, position.y));
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const x1 = Math.min(this.side - 1, x0 + 1);
+    const y1 = Math.min(this.side - 1, y0 + 1);
+    const tx = x - x0;
+    const ty = y - y0;
+    const [topLeft, topRight, bottomLeft, bottomRight] = await Promise.all([
+      this.height({ x: x0, y: y0 }),
+      this.height({ x: x1, y: y0 }),
+      this.height({ x: x0, y: y1 }),
+      this.height({ x: x1, y: y1 })
+    ]);
+    const top = topLeft + (topRight - topLeft) * tx;
+    const bottom = bottomLeft + (bottomRight - bottomLeft) * tx;
+    return top + (bottom - top) * ty;
   }
 
   async fill(cell: Cell): Promise<number> {
@@ -465,14 +597,14 @@ function findBodyForRegion(scene: HydrologySceneV1, region: FillRegion, side: nu
 }
 
 function buildRegionRings(config: WorldConfig, cells: Cell[], ids: Set<number>, side: number): HydrologyPointV1[][] {
-  type Edge = { ax: number; ay: number; bx: number; by: number };
+  type Edge = { ax: number; ay: number; bx: number; by: number; cellX: number; cellY: number };
   const edges: Edge[] = [];
   for (const cell of cells) {
     const has = (x: number, y: number) => x >= 0 && y >= 0 && x < side && y < side && ids.has(y * side + x);
-    if (!has(cell.x, cell.y - 1)) edges.push({ ax: cell.x, ay: cell.y, bx: cell.x + 1, by: cell.y });
-    if (!has(cell.x + 1, cell.y)) edges.push({ ax: cell.x + 1, ay: cell.y, bx: cell.x + 1, by: cell.y + 1 });
-    if (!has(cell.x, cell.y + 1)) edges.push({ ax: cell.x + 1, ay: cell.y + 1, bx: cell.x, by: cell.y + 1 });
-    if (!has(cell.x - 1, cell.y)) edges.push({ ax: cell.x, ay: cell.y + 1, bx: cell.x, by: cell.y });
+    if (!has(cell.x, cell.y - 1)) edges.push({ ax: cell.x, ay: cell.y, bx: cell.x + 1, by: cell.y, cellX: cell.x, cellY: cell.y });
+    if (!has(cell.x + 1, cell.y)) edges.push({ ax: cell.x + 1, ay: cell.y, bx: cell.x + 1, by: cell.y + 1, cellX: cell.x, cellY: cell.y });
+    if (!has(cell.x, cell.y + 1)) edges.push({ ax: cell.x + 1, ay: cell.y + 1, bx: cell.x, by: cell.y + 1, cellX: cell.x, cellY: cell.y });
+    if (!has(cell.x - 1, cell.y)) edges.push({ ax: cell.x, ay: cell.y + 1, bx: cell.x, by: cell.y, cellX: cell.x, cellY: cell.y });
   }
   const byStart = new Map<string, Edge[]>();
   for (const edge of edges) {
@@ -483,16 +615,29 @@ function buildRegionRings(config: WorldConfig, cells: Cell[], ids: Set<number>, 
   const rings: HydrologyPointV1[][] = [];
   for (const first of edges) {
     if (used.has(first)) continue;
-    const corners: Cell[] = [{ x: first.ax, y: first.ay }];
+    const boundaryCells: Cell[] = [];
+    const fallbackCorners: Cell[] = [{ x: first.ax, y: first.ay }];
     let edge: Edge | undefined = first;
     while (edge && !used.has(edge)) {
       used.add(edge);
-      corners.push({ x: edge.bx, y: edge.by });
+      const previousCell = boundaryCells[boundaryCells.length - 1];
+      if (!previousCell || previousCell.x !== edge.cellX || previousCell.y !== edge.cellY) {
+        boundaryCells.push({ x: edge.cellX, y: edge.cellY });
+      }
+      fallbackCorners.push({ x: edge.bx, y: edge.by });
       if (edge.bx === first.ax && edge.by === first.ay) break;
       edge = (byStart.get(`${edge.bx},${edge.by}`) ?? []).find((candidate) => !used.has(candidate));
     }
-    const last = corners[corners.length - 1];
-    if (corners.length >= 4 && last.x === first.ax && last.y === first.ay) rings.push(corners.map((corner) => cornerToWorld(config, corner)));
+    const last = fallbackCorners[fallbackCorners.length - 1];
+    if (fallbackCorners.length >= 4 && last.x === first.ax && last.y === first.ay) {
+      const boundaryRing = boundaryCells.length >= 3
+        ? [...boundaryCells, boundaryCells[0]].map((cell) => cellCenterToWorld(config, cell))
+        : fallbackCorners.map((corner) => cornerToWorld(config, corner));
+      rings.push(simplifyLakeRing(
+        boundaryRing,
+        LAKE_RING_SIMPLIFY_TOLERANCE_CELLS * config.unitSize
+      ));
+    }
   }
   return rings.sort((a, b) => Math.abs(ringArea(b)) - Math.abs(ringArea(a)));
 }
@@ -505,14 +650,33 @@ function worldToCell(config: WorldConfig, x: number, z: number): Cell | null {
   return cellX >= 0 && cellY >= 0 && cellX < side && cellY < side ? { x: cellX, y: cellY } : null;
 }
 
-function cellToWorld(config: WorldConfig, cell: Cell, heightR16: number): HydrologyPointV1 {
+function positionToWorld(config: WorldConfig, position: TracePosition, heightR16: number): HydrologyPointV1 {
   const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
-  return { x: (cell.x + 0.5) * config.unitSize - worldSize / 2, z: (cell.y + 0.5) * config.unitSize - worldSize / 2, heightR16 };
+  return {
+    x: (position.x + 0.5) * config.unitSize - worldSize / 2,
+    z: (position.y + 0.5) * config.unitSize - worldSize / 2,
+    heightR16: Math.max(0, Math.min(65535, Math.round(heightR16)))
+  };
+}
+
+function positionToCell(position: TracePosition, side: number): Cell {
+  return {
+    x: Math.max(0, Math.min(side - 1, Math.round(position.x))),
+    y: Math.max(0, Math.min(side - 1, Math.round(position.y)))
+  };
 }
 
 function cornerToWorld(config: WorldConfig, corner: Cell): HydrologyPointV1 {
   const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
   return { x: corner.x * config.unitSize - worldSize / 2, z: corner.y * config.unitSize - worldSize / 2 };
+}
+
+function cellCenterToWorld(config: WorldConfig, cell: Cell): HydrologyPointV1 {
+  const worldSize = config.tileSize * config.tilesPerSide * config.unitSize;
+  return {
+    x: (cell.x + 0.5) * config.unitSize - worldSize / 2,
+    z: (cell.y + 0.5) * config.unitSize - worldSize / 2
+  };
 }
 
 function orthogonalNeighbors(cell: Cell, side: number): Cell[] {
@@ -530,8 +694,8 @@ function allNeighbors(cell: Cell, side: number): Cell[] {
   return result;
 }
 
-function isEdge(cell: Cell, side: number): boolean {
-  return cell.x === 0 || cell.y === 0 || cell.x === side - 1 || cell.y === side - 1;
+function isPositionEdge(position: TracePosition, side: number): boolean {
+  return position.x <= 0 || position.y <= 0 || position.x >= side - 1 || position.y >= side - 1;
 }
 
 function ringArea(ring: HydrologyPointV1[]): number {

@@ -206,9 +206,12 @@ export class EditorViewport {
 
   setAuthoringVisible(visible: boolean): void {
     this.authoringOverlay.setVisible(visible);
-    this.hydrologyOverlay.setVisible(visible);
     this.updateTileGrid();
     this.updateWorldBounds();
+  }
+
+  setWaterDetailsVisible(visible: boolean): void {
+    this.hydrologyOverlay.setVisible(visible);
   }
 
   getWorldUnitsPerScreenPixelAt(x: number, z: number): number {

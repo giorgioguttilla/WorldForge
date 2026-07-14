@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { AnchorV1, AuthoringDocumentV1, HydrologyPointV1, HydrologySceneV1, PrimitiveV1 } from '../authoring/authoringDocument';
 import { DEFAULT_SPLINE_SMOOTHNESS, sampleSplineAnchors, type SplinePoint2D } from '../authoring/spline';
-import { RIVER_SIMPLIFY_TOLERANCE_CELLS, simplifyRiverPolyline } from '../authoring/hydrologyAuthoring';
+import { LAKE_RING_SIMPLIFY_TOLERANCE_CELLS, simplifyLakeRing } from '../authoring/hydrologyAuthoring';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
 
 export interface AuthoringSelection {
@@ -369,12 +369,14 @@ export class HydrologyOverlay {
     this.group.visible = this.visible;
     if (!this.hydrology || !this.config) return;
     for (const body of this.hydrology.waterBodies) {
-      const y = r16ToElevation(body.waterLevelR16, this.config.worldHeight) + 3;
-      for (const ring of body.rings) this.addWaterBodyRing(ring, y);
+      const y = r16ToElevation(body.waterLevelR16, this.config.worldHeight);
+      for (const ring of body.rings) {
+        this.addWaterBodyRing(simplifyLakeRing(ring, LAKE_RING_SIMPLIFY_TOLERANCE_CELLS * this.config.unitSize), y);
+      }
     }
     for (const river of this.hydrology.rivers) {
       for (const segment of river.segments) {
-        this.addRiver(simplifyRiverPolyline(segment.points, RIVER_SIMPLIFY_TOLERANCE_CELLS * this.config.unitSize, this.config.worldHeight), Math.max(1, river.widthHint));
+        this.addRiver(segment.points, Math.max(1, river.widthHint));
       }
     }
   }
@@ -390,21 +392,27 @@ export class HydrologyOverlay {
       opacity: 0.34,
       side: THREE.DoubleSide,
       depthTest: true,
-      depthWrite: false
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1
     });
     const mesh = new THREE.Mesh(geometry, fill);
     mesh.position.y = y;
     mesh.renderOrder = 18;
     this.track(mesh);
 
-    const linePoints = ring.map((point) => new THREE.Vector3(point.x, y + 1, point.z));
+    const linePoints = ring.map((point) => new THREE.Vector3(point.x, y, point.z));
     const lineGeometry = new THREE.BufferGeometry().setFromPoints(linePoints);
     const lineMaterial = new THREE.LineBasicMaterial({
       color: 0xaee8ff,
       transparent: true,
       opacity: 0.92,
       depthTest: true,
-      depthWrite: false
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2
     });
     const line = new THREE.Line(lineGeometry, lineMaterial);
     line.renderOrder = 19;
@@ -413,45 +421,54 @@ export class HydrologyOverlay {
 
   private addRiver(points: HydrologyPointV1[], widthHint: number): void {
     if (points.length < 2 || !this.config) return;
-    const vertices = points.map((point) => new THREE.Vector3(
-      point.x,
-      r16ToElevation(point.heightR16 ?? 0, this.config?.worldHeight ?? 1) + 5,
-      point.z
-    ));
-    const geometry = new THREE.BufferGeometry().setFromPoints(vertices);
-    const material = new THREE.LineBasicMaterial({
-      color: 0x47d7ff,
-      transparent: true,
-      opacity: 0.96,
-      depthTest: false,
-      depthWrite: false
-    });
-    const line = new THREE.Line(geometry, material);
-    line.renderOrder = 20;
-    this.track(line);
-
-    for (let i = 0; i < vertices.length - 1; i += 1) {
-      const a = vertices[i];
-      const b = vertices[i + 1];
-      const length = a.distanceTo(b);
-      if (length <= 0) continue;
-      const radius = Math.min(10, Math.max(1.5, widthHint * 0.75));
-      const cylinder = new THREE.CylinderGeometry(radius, radius, length, 8, 1);
-      cylinder.rotateZ(Math.PI / 2);
-      const mesh = new THREE.Mesh(cylinder, new THREE.MeshBasicMaterial({
-        color: 0x0aa7ff,
-        transparent: true,
-        opacity: 0.3,
-        depthTest: false,
-        depthWrite: false
-      }));
-      const midpoint = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
-      mesh.position.copy(midpoint);
-      const direction = new THREE.Vector3().subVectors(b, a).normalize();
-      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), direction);
-      mesh.renderOrder = 19;
-      this.track(mesh);
+    const radius = Math.min(10, Math.max(1.5, widthHint * 0.75));
+    const positions = new Float32Array(points.length * 2 * 3);
+    const indices: number[] = [];
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      const previous = points[Math.max(0, index - 1)];
+      const next = points[Math.min(points.length - 1, index + 1)];
+      let tangentX = next.x - previous.x;
+      let tangentZ = next.z - previous.z;
+      const tangentLength = Math.hypot(tangentX, tangentZ);
+      if (tangentLength > 0) {
+        tangentX /= tangentLength;
+        tangentZ /= tangentLength;
+      } else {
+        tangentX = 1;
+        tangentZ = 0;
+      }
+      const normalX = -tangentZ * radius;
+      const normalZ = tangentX * radius;
+      const y = r16ToElevation(point.heightR16 ?? 0, this.config.worldHeight);
+      const offset = index * 6;
+      positions.set([point.x + normalX, y, point.z + normalZ, point.x - normalX, y, point.z - normalZ], offset);
+      if (index < points.length - 1) {
+        const left = index * 2;
+        const right = left + 1;
+        const nextLeft = left + 2;
+        const nextRight = left + 3;
+        indices.push(left, right, nextLeft, right, nextRight, nextLeft);
+      }
     }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x0aa7ff,
+      transparent: true,
+      opacity: 0.42,
+      side: THREE.DoubleSide,
+      depthTest: true,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1
+    });
+    const strip = new THREE.Mesh(geometry, material);
+    strip.renderOrder = 19;
+    this.track(strip);
   }
 
   private clear(): void {

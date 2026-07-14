@@ -72,6 +72,7 @@ button:disabled {
 .toolbar,
 .mode-stack,
 .visual-stack,
+.water-stack,
 .authoring-stack,
 .metrics,
 .render-settings,
@@ -107,6 +108,7 @@ button:disabled {
 .toolbar button,
 .mode-stack button,
 .visual-stack button,
+.water-stack button,
 .authoring-stack button,
 .panel-actions button {
   position: relative;
@@ -142,6 +144,8 @@ button:disabled {
 .mode-stack button:focus-visible .icon-tooltip,
 .visual-stack button:hover .icon-tooltip,
 .visual-stack button:focus-visible .icon-tooltip,
+.water-stack button:hover .icon-tooltip,
+.water-stack button:focus-visible .icon-tooltip,
 .authoring-stack button:hover .icon-tooltip,
 .authoring-stack button:focus-visible .icon-tooltip {
   opacity: 1;
@@ -151,6 +155,7 @@ button:disabled {
 .toolbar button.active,
 .mode-stack button.active,
 .visual-stack button.active,
+.water-stack button.active,
 .authoring-stack button.active {
   border-color: rgba(125, 178, 148, 0.72);
   background: rgba(60, 117, 84, 0.5);
@@ -159,6 +164,7 @@ button:disabled {
 
 .mode-stack,
 .visual-stack,
+.water-stack,
 .authoring-stack {
   position: absolute;
   z-index: 90;
@@ -177,8 +183,12 @@ button:disabled {
   top: 202px;
 }
 
-.authoring-stack {
+.water-stack {
   top: 336px;
+}
+
+.authoring-stack {
+  top: 390px;
 }
 
 .metrics {
