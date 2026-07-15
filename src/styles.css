@@ -782,6 +782,24 @@ button:disabled {
   overflow: hidden;
 }
 
+.hydrology-debug-label {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 20;
+  transform: translateX(-50%);
+  padding: 8px 12px;
+  border: 1px solid rgba(196, 215, 221, 0.18);
+  border-radius: 7px;
+  background: rgba(11, 17, 22, 0.82);
+  color: #dce8eb;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+
 @media (max-width: 720px) {
   .metrics {
     top: auto;

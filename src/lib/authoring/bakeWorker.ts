@@ -51,6 +51,7 @@ self.onmessage = (event: MessageEvent<BakeWorkerRequest>) => {
     if (
       request.type === 'hydrology-analyze-tile' ||
       request.type === 'hydrology-materialize-tile' ||
+      request.type === 'hydrology-materialize-receivers-tile' ||
       request.type === 'hydrology-flow-analyze-tile' ||
       request.type === 'hydrology-flow-max-tile' ||
       request.type === 'hydrology-flow-materialize-tile'

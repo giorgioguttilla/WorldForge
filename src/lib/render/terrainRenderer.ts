@@ -676,7 +676,7 @@ export class TerrainQuadtreeRenderer {
 
 }
 
-export type HydrologyDebugLayer = 'lake-fill' | 'flow-strength';
+export type HydrologyDebugLayer = 'lake-fill' | 'basin-ids' | 'receivers' | 'flow-strength';
 
 interface HydrologyDebugTile {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
@@ -719,6 +719,17 @@ export class HydrologyDebugRenderer {
     }
 
     const concurrency = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+    const layerCache = new Map<string, Promise<Uint16Array | Uint32Array | Uint8Array | null>>();
+    const readCached = (x: number, y: number): Promise<Uint16Array | Uint32Array | Uint8Array | null> => {
+      if (x < 0 || y < 0 || x >= config.tilesPerSide || y >= config.tilesPerSide) return Promise.resolve(null);
+      const id = `${x},${y}`;
+      let pending = layerCache.get(id);
+      if (!pending) {
+        pending = this.readLayerTile(x, y);
+        layerCache.set(id, pending);
+      }
+      return pending;
+    };
     let nextJob = 0;
     try {
       await Promise.all(Array.from({ length: concurrency }, async () => {
@@ -726,9 +737,14 @@ export class HydrologyDebugRenderer {
           const job = jobs[nextJob];
           nextJob += 1;
           if (this.generation !== generation) return;
-          const samples = await this.readLayerTile(job.x, job.y);
+          const samples = await readCached(job.x, job.y);
           if (!samples || this.generation !== generation || this.manager.config?.id !== config.id) continue;
-          this.addTile(config, job.x, job.y, samples);
+          if (this.layer === 'lake-fill' || this.layer === 'flow-strength') {
+            const padded = await padScalarDebugTile(config, job.x, job.y, samples as Uint16Array, readCached);
+            this.addTile(config, job.x, job.y, padded, config.tileSize + 2, true);
+          } else {
+            this.addTile(config, job.x, job.y, samples, config.tileSize, false);
+          }
         }
       }));
     } finally {
@@ -753,17 +769,56 @@ export class HydrologyDebugRenderer {
     this.clear();
   }
 
-  private addTile(config: WorldConfig, tileX: number, tileY: number, samples: Uint16Array): void {
-    const textureSamples = new Uint8Array(samples.length);
-    for (let i = 0; i < samples.length; i += 1) textureSamples[i] = samples[i] >>> 8;
-    const texture = new THREE.DataTexture(textureSamples, config.tileSize, config.tileSize, THREE.RedFormat, THREE.UnsignedByteType);
+  private addTile(
+    config: WorldConfig,
+    tileX: number,
+    tileY: number,
+    samples: Uint16Array | Uint32Array | Uint8Array,
+    textureSize: number,
+    padded: boolean
+  ): void {
+    const textureSamples = new Uint8Array(samples.length * 4);
+    for (let i = 0; i < samples.length; i += 1) {
+        const target = i * 4;
+        if (this.layer === 'receivers') {
+          const code = Math.min(8, samples[i]);
+          textureSamples[target] = 128 + DEBUG_D8_X[code] * 127;
+          textureSamples[target + 1] = 128 + DEBUG_D8_Y[code] * 127;
+          textureSamples[target + 2] = 128;
+        } else if (this.layer === 'basin-ids') {
+          const id = samples[i] >>> 0;
+          if (id !== 0) {
+            const hash = Math.imul(id ^ (id >>> 16), 0x45d9f3b) >>> 0;
+            textureSamples[target] = 55 + (hash & 0x9f);
+            textureSamples[target + 1] = 55 + ((hash >>> 8) & 0x9f);
+            textureSamples[target + 2] = 55 + ((hash >>> 16) & 0x9f);
+          }
+        } else if (this.layer === 'flow-strength') {
+          const normalized = samples[i] / 65535;
+          const value = Math.round(255 * normalized * normalized);
+          textureSamples[target] = Math.round(value * 0.55);
+          textureSamples[target + 1] = Math.round(value * 0.85);
+          textureSamples[target + 2] = value;
+        } else {
+          const value = samples[i] >>> 8;
+          textureSamples[target] = value;
+          textureSamples[target + 1] = value;
+          textureSamples[target + 2] = value;
+        }
+        textureSamples[target + 3] = 255;
+    }
+    const texture = new THREE.DataTexture(textureSamples, textureSize, textureSize, THREE.RGBAFormat, THREE.UnsignedByteType);
     texture.needsUpdate = true;
     texture.colorSpace = THREE.NoColorSpace;
     texture.flipY = true;
-    texture.minFilter = THREE.LinearFilter;
-    texture.magFilter = THREE.LinearFilter;
+    texture.minFilter = this.layer === 'lake-fill' || this.layer === 'flow-strength' ? THREE.LinearFilter : THREE.NearestFilter;
+    texture.magFilter = this.layer === 'lake-fill' || this.layer === 'flow-strength' ? THREE.LinearFilter : THREE.NearestFilter;
     texture.wrapS = THREE.ClampToEdgeWrapping;
     texture.wrapT = THREE.ClampToEdgeWrapping;
+    if (padded) {
+      texture.offset.set(1 / textureSize, 1 / textureSize);
+      texture.repeat.set(config.tileSize / textureSize, config.tileSize / textureSize);
+    }
 
     const geometry = new THREE.PlaneGeometry(config.tileSize * config.unitSize, config.tileSize * config.unitSize, 1, 1);
     geometry.rotateX(-Math.PI / 2);
@@ -784,11 +839,12 @@ export class HydrologyDebugRenderer {
     this.tiles.push({ mesh, texture });
   }
 
-  private readLayerTile(tileX: number, tileY: number): Promise<Uint16Array | null> {
+  private readLayerTile(tileX: number, tileY: number): Promise<Uint16Array | Uint32Array | Uint8Array | null> {
     const key = { x: tileX, y: tileY, d: 0 };
-    return this.layer === 'flow-strength'
-      ? this.manager.readFlowStrengthTile(key)
-      : this.manager.readLakeFillHeightTile(key);
+    if (this.layer === 'flow-strength') return this.manager.readFlowStrengthTile(key);
+    if (this.layer === 'basin-ids') return this.manager.readBasinIdTile(key);
+    if (this.layer === 'receivers') return this.manager.readReceiverDirectionTile(key);
+    return this.manager.readLakeFillHeightTile(key);
   }
 
   private clearTiles(): void {
@@ -800,4 +856,37 @@ export class HydrologyDebugRenderer {
     }
     this.tiles.length = 0;
   }
+}
+
+const DEBUG_D8_X = [0, 1, 0, 1, -1, 0, -1, 1, -1];
+const DEBUG_D8_Y = [0, 0, 1, 1, 0, -1, -1, -1, 1];
+
+async function padScalarDebugTile(
+  config: WorldConfig,
+  tileX: number,
+  tileY: number,
+  center: Uint16Array,
+  read: (x: number, y: number) => Promise<Uint16Array | Uint32Array | Uint8Array | null>
+): Promise<Uint16Array> {
+  const size = config.tileSize;
+  const stride = size + 2;
+  const output = new Uint16Array(stride * stride);
+  for (let y = 0; y < size; y += 1) output.set(center.subarray(y * size, (y + 1) * size), (y + 1) * stride + 1);
+  const neighbors = await Promise.all([
+    read(tileX - 1, tileY - 1), read(tileX, tileY - 1), read(tileX + 1, tileY - 1),
+    read(tileX - 1, tileY), read(tileX + 1, tileY),
+    read(tileX - 1, tileY + 1), read(tileX, tileY + 1), read(tileX + 1, tileY + 1)
+  ]) as Array<Uint16Array | null>;
+  const [nw, north, ne, west, east, sw, south, se] = neighbors;
+  for (let i = 0; i < size; i += 1) {
+    output[i + 1] = north?.[(size - 1) * size + i] ?? center[i];
+    output[(size + 1) * stride + i + 1] = south?.[i] ?? center[(size - 1) * size + i];
+    output[(i + 1) * stride] = west?.[i * size + size - 1] ?? center[i * size];
+    output[(i + 1) * stride + size + 1] = east?.[i * size] ?? center[i * size + size - 1];
+  }
+  output[0] = nw?.[size * size - 1] ?? center[0];
+  output[size + 1] = ne?.[(size - 1) * size] ?? center[size - 1];
+  output[(size + 1) * stride] = sw?.[size - 1] ?? center[(size - 1) * size];
+  output[(size + 2) * stride - 1] = se?.[0] ?? center[size * size - 1];
+  return output;
 }

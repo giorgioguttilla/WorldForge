@@ -213,7 +213,19 @@ export class TileManager {
           readWaterMaskTile: (key) => this.store.readWaterMaskTile(key, config.tileSize),
           writeWaterMaskTile: (key, samples) => this.store.writeWaterMaskTile(key, samples),
           writeLakeFillHeightTile: (key, samples) => this.store.writeLakeFillHeightTile(key, samples),
-          writeFlowStrengthTile: (key, samples) => this.store.writeFlowStrengthTile(key, samples)
+          readLakeFillHeightTile: (key) => this.store.readLakeFillHeightTile(key, config.tileSize),
+          writeDrainageSurfaceTile: (key, samples) => this.store.writeDrainageSurfaceTile(key, samples),
+          readDrainageSurfaceTile: (key) => this.store.readDrainageSurfaceTile(key, config.tileSize),
+          writeBasinIdTile: (key, samples) => this.store.writeBasinIdTile(key, samples),
+          readBasinIdTile: (key) => this.store.readBasinIdTile(key, config.tileSize),
+          writeFlatDistanceTile: (key, samples) => this.store.writeFlatDistanceTile(key, samples),
+          readFlatDistanceTile: (key) => this.store.readFlatDistanceTile(key, config.tileSize),
+          writeReceiverDirectionTile: (key, samples) => this.store.writeReceiverDirectionTile(key, samples),
+          readReceiverDirectionTile: (key) => this.store.readReceiverDirectionTile(key, config.tileSize),
+          writeFlowStrengthTile: (key, samples) => this.store.writeFlowStrengthTile(key, samples),
+          writeFlowAccumulationTile: (key, samples) => this.store.writeFlowAccumulationTile(key, samples),
+          readFlowAccumulationTile: (key) => this.store.readFlowAccumulationTile(key, config.tileSize),
+          writeHydrologyTopology: (topology) => this.store.writeHydrologyTopology(topology)
         },
         onProgress,
         options
@@ -306,6 +318,28 @@ export class TileManager {
     const samples = await this.store.readFlowStrengthTile(key, config.tileSize);
     this.refreshStoreMetrics();
     return samples;
+  }
+
+  async readBasinIdTile(key: TileKey): Promise<Uint32Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    return this.store.readBasinIdTile(key, config.tileSize);
+  }
+
+  async readReceiverDirectionTile(key: TileKey): Promise<Uint8Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    return this.store.readReceiverDirectionTile(key, config.tileSize);
+  }
+
+  async readFlowAccumulationTile(key: TileKey): Promise<Uint32Array | null> {
+    const config = this.requireConfig();
+    assertTileKey(key, config.tilesPerSide);
+    return this.store.readFlowAccumulationTile(key, config.tileSize);
+  }
+
+  async readHydrologyTopology() {
+    return this.store.readHydrologyTopology();
   }
 
   async sampleHeightAtWorld(worldX: number, worldZ: number): Promise<number | null> {

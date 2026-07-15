@@ -42,6 +42,7 @@ export class EditorViewport {
   readonly authoringOverlay = new AuthoringOverlay();
   readonly hydrologyOverlay = new HydrologyOverlay();
   readonly stats = new Stats();
+  private readonly hydrologyDebugLabel = document.createElement('div');
   backend: 'webgpu' | 'webgl' = 'webgl';
 
   private readonly scene = new THREE.Scene();
@@ -107,6 +108,9 @@ export class EditorViewport {
     this.stats.showPanel(0);
     this.stats.dom.classList.add('stats-panel');
     this.container.appendChild(this.stats.dom);
+    this.hydrologyDebugLabel.className = 'hydrology-debug-label';
+    this.hydrologyDebugLabel.hidden = true;
+    this.container.appendChild(this.hydrologyDebugLabel);
     if (ENABLE_TERRAIN_RAYCAST) {
       this.canvas.addEventListener('pointermove', this.onPointerMove);
       this.canvas.addEventListener('pointerleave', this.onPointerLeave);
@@ -153,6 +157,7 @@ export class EditorViewport {
       this.animationFrame = null;
     }
     this.stats.dom.remove();
+    this.hydrologyDebugLabel.remove();
     this.controller.dispose();
     this.terrain.dispose();
     this.hydrologyDebug.dispose();
@@ -280,8 +285,12 @@ export class EditorViewport {
     const next: HydrologyDebugMode = this.hydrologyDebugMode === 'terrain'
       ? 'lake-fill'
       : this.hydrologyDebugMode === 'lake-fill'
-        ? 'flow-strength'
-        : 'terrain';
+        ? 'basin-ids'
+        : this.hydrologyDebugMode === 'basin-ids'
+          ? 'receivers'
+          : this.hydrologyDebugMode === 'receivers'
+            ? 'flow-strength'
+            : 'terrain';
     this.setHydrologyDebugMode(next);
   }
 
@@ -292,6 +301,14 @@ export class EditorViewport {
     if (debugVisible) this.hydrologyDebug.setLayer(mode);
     this.hydrologyDebug.setVisible(debugVisible);
     this.water.visible = debugVisible ? false : this.waterSettings.visible && Boolean(this.manager.config);
+    const labels: Record<HydrologyDebugLayer, string> = {
+      'lake-fill': 'Hydrology · lake fill height',
+      'basin-ids': 'Hydrology · physical filled basins',
+      receivers: 'Hydrology · receiver vector (R = +X, G = +Z, 0.5 = neutral)',
+      'flow-strength': 'Hydrology · flow strength (brighter = more upstream area)'
+    };
+    this.hydrologyDebugLabel.hidden = !debugVisible;
+    this.hydrologyDebugLabel.textContent = mode === 'terrain' ? '' : labels[mode];
     if (!debugVisible) {
       void this.terrain.update(this.controller.activeCamera);
     }

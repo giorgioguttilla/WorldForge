@@ -5,7 +5,33 @@ import type { WorldConfig } from '../heightmap/worldConfig';
 export interface HydrologyTileIO {
   readTile(key: TileKey): Promise<Uint16Array>;
   writeLakeFillHeightTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readLakeFillHeightTile?(key: TileKey): Promise<Uint16Array | null>;
+  writeDrainageSurfaceTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readDrainageSurfaceTile?(key: TileKey): Promise<Uint16Array | null>;
+  writeBasinIdTile?(key: TileKey, samples: Uint32Array): Promise<void>;
+  readBasinIdTile?(key: TileKey): Promise<Uint32Array | null>;
+  writeFlatDistanceTile?(key: TileKey, samples: Uint32Array): Promise<void>;
+  readFlatDistanceTile?(key: TileKey): Promise<Uint32Array | null>;
+  writeReceiverDirectionTile?(key: TileKey, samples: Uint8Array): Promise<void>;
+  readReceiverDirectionTile?(key: TileKey): Promise<Uint8Array | null>;
   writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  writeFlowAccumulationTile?(key: TileKey, samples: Uint32Array): Promise<void>;
+  readFlowAccumulationTile?(key: TileKey): Promise<Uint32Array | null>;
+  writeHydrologyTopology?(topology: HydrologyTopologyV1): Promise<void>;
+}
+
+export interface HydrologyTopologyV1 {
+  version: 1;
+  width: number;
+  height: number;
+  nodeCount: number;
+  receiverEncoding: 'd8-clockwise-from-east-u8';
+  /** Compact parallel arrays; basinIds maps each array slot to its durable physical basin ID. */
+  basinIds: Uint32Array;
+  fillHeights: Uint16Array;
+  downstreamIds: Uint32Array;
+  spillCells: Uint32Array;
+  downstreamCells: Uint32Array;
 }
 
 export interface HydrologyProgress {
@@ -25,6 +51,8 @@ export interface LocalBasinSolveResult {
   labelCount: number;
   edges: Uint32Array;
   edgeWeights: Uint16Array;
+  edgeCellsA: Uint32Array;
+  edgeCellsB: Uint32Array;
   northLabels: Uint32Array;
   northHeights: Uint16Array;
   southLabels: Uint32Array;
@@ -39,6 +67,7 @@ export interface MaterializeBasinResult {
   tileX: number;
   tileY: number;
   lakeFillHeights: ArrayBuffer;
+  drainageSurface: ArrayBuffer;
   basinIds: Uint32Array;
   areaCells: Uint32Array;
   minTerrain: Uint16Array;
@@ -66,6 +95,7 @@ export interface FlowTileMaxResult {
   tileX: number;
   tileY: number;
   maxFlowAccumulation: number;
+  flowAccumulation: ArrayBuffer;
 }
 
 export interface MaterializeFlowResult {
@@ -85,6 +115,8 @@ interface TileAnalysis {
   labelCount: number;
   edges: Uint32Array;
   edgeWeights: Uint16Array;
+  edgeCellsA: Uint32Array;
+  edgeCellsB: Uint32Array;
   northLabels: Uint32Array;
   northHeights: Uint16Array;
   southLabels: Uint32Array;
@@ -145,6 +177,8 @@ export async function runHydrologyBasinBake(
         labelCount: result.labelCount,
         edges: new Uint32Array(result.edges),
         edgeWeights: new Uint16Array(result.edgeWeights),
+        edgeCellsA: new Uint32Array(result.edgeCellsA),
+        edgeCellsB: new Uint32Array(result.edgeCellsB),
         northLabels: new Uint32Array(result.northLabels),
         northHeights: new Uint16Array(result.northHeights),
         southLabels: new Uint32Array(result.southLabels),
@@ -167,11 +201,28 @@ export async function runHydrologyBasinBake(
   }
 
   const graph = buildGlobalGraph(config, analyses, nextLabelOffset);
-  const globalFillHeights = solveGraphFillHeights(graph.nodeCount, graph.from, graph.to, graph.weight);
+  const graphSolution = solveGraphFillHeights(graph.nodeCount, graph.from, graph.to, graph.weight);
+  const globalFillHeights = graphSolution.fills;
+  const outletCells = new Uint32Array(graph.nodeCount);
+  const downstreamCells = new Uint32Array(graph.nodeCount);
+  outletCells.fill(NO_FLOW_TARGET);
+  downstreamCells.fill(NO_FLOW_TARGET);
+  for (let node = 1; node < graph.nodeCount; node += 1) {
+    const edge = graphSolution.parentEdge[node];
+    if (edge === NO_FLOW_TARGET) continue;
+    if (graph.from[edge] === node) {
+      outletCells[node] = graph.cellFrom[edge];
+      downstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellTo[edge];
+    } else {
+      outletCells[node] = graph.cellTo[edge];
+      downstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellFrom[edge];
+    }
+  }
   completed += 1;
   onProgress?.({ phase: 'hydrology', current: completed, total, label: 'Resolving global basin spill heights' });
 
   const basinStats = new Map<number, BasinAccumulator>();
+  const collectFallbackBasinStats = !(io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile);
   let lakeCellCount = 0;
   let maxDepth = 0;
   let volumeCellHeight = 0;
@@ -196,40 +247,39 @@ export async function runHydrologyBasinBake(
     async (response) => {
       const result = response as HydrologyMaterializeResponse;
       const key = { x: result.tileX, y: result.tileY, d: 0 };
-      if (io.writeLakeFillHeightTile) await io.writeLakeFillHeightTile(key, new Uint16Array(result.lakeFillHeights));
-      const basinIds = new Uint32Array(result.basinIds);
-      const areaCells = new Uint32Array(result.areaCells);
-      const minTerrain = new Uint16Array(result.minTerrain);
-      const maxDepths = new Uint16Array(result.maxDepth);
-      const volumes = new Float64Array(result.volumeCellHeight);
-      const minGlobalX = new Uint32Array(result.minGlobalX);
-      const minGlobalY = new Uint32Array(result.minGlobalY);
-      const maxGlobalX = new Uint32Array(result.maxGlobalX);
-      const maxGlobalY = new Uint32Array(result.maxGlobalY);
-      for (let i = 0; i < basinIds.length; i += 1) {
-        const id = basinIds[i];
-        let accumulator = basinStats.get(id);
-        if (!accumulator) {
-          accumulator = {
-            areaCells: 0,
-            minTerrain: UINT16_MAX,
-            maxDepth: 0,
-            volumeCellHeight: 0,
-            minGlobalX: Number.POSITIVE_INFINITY,
-            minGlobalY: Number.POSITIVE_INFINITY,
-            maxGlobalX: 0,
-            maxGlobalY: 0
-          };
-          basinStats.set(id, accumulator);
+      await Promise.all([
+        io.writeLakeFillHeightTile?.(key, new Uint16Array(result.lakeFillHeights)),
+        io.writeDrainageSurfaceTile?.(key, new Uint16Array(result.drainageSurface))
+      ]);
+      if (collectFallbackBasinStats) {
+        const basinIds = new Uint32Array(result.basinIds);
+        const areaCells = new Uint32Array(result.areaCells);
+        const minTerrain = new Uint16Array(result.minTerrain);
+        const maxDepths = new Uint16Array(result.maxDepth);
+        const volumes = new Float64Array(result.volumeCellHeight);
+        const minGlobalX = new Uint32Array(result.minGlobalX);
+        const minGlobalY = new Uint32Array(result.minGlobalY);
+        const maxGlobalX = new Uint32Array(result.maxGlobalX);
+        const maxGlobalY = new Uint32Array(result.maxGlobalY);
+        for (let i = 0; i < basinIds.length; i += 1) {
+          const id = basinIds[i];
+          let accumulator = basinStats.get(id);
+          if (!accumulator) {
+            accumulator = {
+              areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0,
+              minGlobalX: Number.POSITIVE_INFINITY, minGlobalY: Number.POSITIVE_INFINITY, maxGlobalX: 0, maxGlobalY: 0
+            };
+            basinStats.set(id, accumulator);
+          }
+          accumulator.areaCells += areaCells[i];
+          accumulator.minTerrain = Math.min(accumulator.minTerrain, minTerrain[i]);
+          accumulator.maxDepth = Math.max(accumulator.maxDepth, maxDepths[i]);
+          accumulator.volumeCellHeight += volumes[i];
+          accumulator.minGlobalX = Math.min(accumulator.minGlobalX, minGlobalX[i]);
+          accumulator.minGlobalY = Math.min(accumulator.minGlobalY, minGlobalY[i]);
+          accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, maxGlobalX[i]);
+          accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, maxGlobalY[i]);
         }
-        accumulator.areaCells += areaCells[i];
-        accumulator.minTerrain = Math.min(accumulator.minTerrain, minTerrain[i]);
-        accumulator.maxDepth = Math.max(accumulator.maxDepth, maxDepths[i]);
-        accumulator.volumeCellHeight += volumes[i];
-        accumulator.minGlobalX = Math.min(accumulator.minGlobalX, minGlobalX[i]);
-        accumulator.minGlobalY = Math.min(accumulator.minGlobalY, minGlobalY[i]);
-        accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, maxGlobalX[i]);
-        accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, maxGlobalY[i]);
       }
       lakeCellCount += result.lakeCellCount;
       maxDepth = Math.max(maxDepth, result.maxTileDepth);
@@ -240,20 +290,46 @@ export async function runHydrologyBasinBake(
     useWorkers
   );
 
+  const downstreamIds = new Uint32Array(graph.nodeCount);
+  downstreamIds.fill(NO_FLOW_TARGET);
+  for (let id = 1; id < graph.nodeCount; id += 1) downstreamIds[id] = graphSolution.parentNode[id];
+  const solverTopology: HydrologyTopologyV1 = {
+    version: 1,
+    width: config.tileSize * config.tilesPerSide,
+    height: config.tileSize * config.tilesPerSide,
+    nodeCount: graph.nodeCount,
+    receiverEncoding: 'd8-clockwise-from-east-u8',
+    basinIds: Uint32Array.from({ length: graph.nodeCount }, (_, id) => id),
+    fillHeights: globalFillHeights,
+    downstreamIds,
+    spillCells: outletCells,
+    downstreamCells
+  };
   analyses.length = 0;
+
+  const physicalBasinStats = io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile
+    ? await buildPhysicalBasinIds(config, io, jobs, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }))
+    : new Map([...basinStats].map(([id, stats]) => [id, { ...stats, fillHeight: globalFillHeights[id] }]));
+  if (io.readDrainageSurfaceTile && io.writeFlatDistanceTile && io.readFlatDistanceTile && io.writeReceiverDirectionTile) {
+    await buildGlobalConditionedReceivers(config, io, jobs, useWorkers, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }));
+  }
+  const topology = io.readBasinIdTile && io.readReceiverDirectionTile
+    ? await buildPhysicalHydrologyTopology(config, io, jobs, physicalBasinStats)
+    : solverTopology;
+  await io.writeHydrologyTopology?.(topology);
 
   const flowResult = await runFlowStrengthBake(config, io, jobs, useWorkers, completed, total, onProgress);
   completed = flowResult.completed;
 
-  const basins = [...basinStats.entries()]
+  const basins = [...physicalBasinStats.entries()]
     .map(([id, stats]): HydrologyBasinSummaryV1 => ({
       id,
-      fillHeight: globalFillHeights[id],
+      fillHeight: stats.fillHeight,
       minTerrainHeight: stats.minTerrain,
       maxDepth: stats.maxDepth,
       areaCells: stats.areaCells,
       volumeCellHeight: stats.volumeCellHeight,
-      touchesOcean: graph.oceanLabels.has(id)
+      touchesOcean: false
     }))
     .sort((a, b) => b.areaCells - a.areaCells)
     .slice(0, 256);
@@ -262,12 +338,16 @@ export async function runHydrologyBasinBake(
       enabled: true,
       epsilonR16: 1,
       tileCount: jobs.length,
-      basinCount: basinStats.size,
+      basinCount: physicalBasinStats.size,
       lakeCellCount,
       maxDepth,
       volumeCellHeight,
       lakeFillHeight: 'closed-basin-fill-height-r16',
+      basinIds: 'physical-filled-basin-id-u32',
+      receiverDirections: 'conditioned-flat-resolved-d8-u8',
+      topology: 'physical-basin-topology-v1',
       flowStrength: flowResult.enabled ? 'log1p-upstream-cell-count-r16' : undefined,
+      flowAccumulation: flowResult.enabled ? 'upstream-cell-count-u32' : undefined,
       maxFlowAccumulation: flowResult.enabled ? flowResult.maxFlowAccumulation : undefined,
       flowTileCount: flowResult.enabled ? jobs.length : undefined,
       basins,
@@ -278,15 +358,19 @@ export async function runHydrologyBasinBake(
 
 export function analyzeHydrologyTile(tileX: number, tileY: number, tileSize: number, heights: Uint16Array): LocalBasinSolveResult {
   const solved = solveLocalTile(tileSize, heights);
-  const edgeMap = new Map<number, number>();
+  const edgeMap = new Map<number, { weight: number; cellA: number; cellB: number }>();
   const edgeScale = solved.labelCount + 1;
-  const addEdge = (a: number, b: number, weight: number): void => {
+  const addEdge = (a: number, b: number, weight: number, cellA: number, cellB: number): void => {
     if (a === b) return;
     const lo = Math.min(a, b);
     const hi = Math.max(a, b);
     const key = lo * edgeScale + hi;
     const previous = edgeMap.get(key);
-    if (previous === undefined || weight < previous) edgeMap.set(key, weight);
+    const orderedA = a === lo ? cellA : cellB;
+    const orderedB = a === lo ? cellB : cellA;
+    if (!previous || weight < previous.weight || (weight === previous.weight && orderedA < previous.cellA)) {
+      edgeMap.set(key, { weight, cellA: orderedA, cellB: orderedB });
+    }
   };
 
   for (let y = 0; y < tileSize; y += 1) {
@@ -300,7 +384,7 @@ export function analyzeHydrologyTile(tileX: number, tileY: number, tileSize: num
           if (nx < 0 || ny < 0 || nx >= tileSize || ny >= tileSize) continue;
           const neighborIndex = ny * tileSize + nx;
           if (neighborIndex <= index) continue;
-          addEdge(solved.labels[index], solved.labels[neighborIndex], Math.max(solved.filled[index], solved.filled[neighborIndex]));
+          addEdge(solved.labels[index], solved.labels[neighborIndex], Math.max(solved.filled[index], solved.filled[neighborIndex]), index, neighborIndex);
         }
       }
     }
@@ -308,11 +392,15 @@ export function analyzeHydrologyTile(tileX: number, tileY: number, tileSize: num
 
   const edges = new Uint32Array(edgeMap.size * 2);
   const edgeWeights = new Uint16Array(edgeMap.size);
+  const edgeCellsA = new Uint32Array(edgeMap.size);
+  const edgeCellsB = new Uint32Array(edgeMap.size);
   let edgeIndex = 0;
-  for (const [key, weight] of edgeMap) {
+  for (const [key, edge] of edgeMap) {
     edges[edgeIndex * 2] = Math.floor(key / edgeScale);
     edges[edgeIndex * 2 + 1] = key % edgeScale;
-    edgeWeights[edgeIndex] = weight;
+    edgeWeights[edgeIndex] = edge.weight;
+    edgeCellsA[edgeIndex] = edge.cellA;
+    edgeCellsB[edgeIndex] = edge.cellB;
     edgeIndex += 1;
   }
 
@@ -322,6 +410,8 @@ export function analyzeHydrologyTile(tileX: number, tileY: number, tileSize: num
     labelCount: solved.labelCount,
     edges,
     edgeWeights,
+    edgeCellsA,
+    edgeCellsB,
     northLabels: copyLabels(solved.labels, tileSize, 0, 1),
     northHeights: copyHeights(solved.filled, tileSize, 0, 1),
     southLabels: copyLabels(solved.labels, tileSize, (tileSize - 1) * tileSize, 1),
@@ -343,6 +433,7 @@ export function materializeHydrologyTile(
 ): MaterializeBasinResult {
   const solved = solveLocalTile(tileSize, heights);
   const lakeFillHeights = new Uint16Array(heights.length);
+  const drainageSurface = new Uint16Array(heights.length);
   const stats = new Map<number, BasinAccumulator>();
   let lakeCellCount = 0;
   let maxTileDepth = 0;
@@ -352,6 +443,7 @@ export function materializeHydrologyTile(
     const localLabel = solved.labels[i];
     const globalFill = globalFillHeights[localLabel - 1] ?? 0;
     const fill = Math.max(solved.filled[i], globalFill);
+    drainageSurface[i] = fill;
     const depth = fill - heights[i];
     if (depth >= 1) {
       lakeFillHeights[i] = fill;
@@ -413,6 +505,7 @@ export function materializeHydrologyTile(
     tileX,
     tileY,
     lakeFillHeights: lakeFillHeights.buffer,
+    drainageSurface: drainageSurface.buffer,
     basinIds,
     areaCells,
     minTerrain,
@@ -428,6 +521,734 @@ export function materializeHydrologyTile(
   };
 }
 
+const D8_DX = new Int8Array([0, 1, 0, 1, -1, 0, -1, 1, -1]);
+const D8_DY = new Int8Array([0, 0, 1, 1, 0, -1, -1, -1, 1]);
+
+interface PhysicalBasinAccumulator extends BasinAccumulator {
+  fillHeight: number;
+}
+
+async function buildPhysicalBasinIds(
+  config: WorldConfig,
+  io: HydrologyTileIO,
+  jobs: TileJob[],
+  onStatus?: (label: string) => void
+): Promise<Map<number, PhysicalBasinAccumulator>> {
+  if (!io.readLakeFillHeightTile || !io.writeBasinIdTile || !io.readBasinIdTile) {
+    throw new Error('Physical basin labeling requires lake-fill and basin-id tile storage.');
+  }
+  const fillCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => requireHydrologyTile(io.readLakeFillHeightTile?.({ x, y, d: 0 }), 'lake fill', x, y));
+  const labelCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
+  const components = new NumericDisjointSet();
+
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex];
+    onStatus?.(`Labeling physical basins ${jobIndex + 1} / ${jobs.length}`);
+    const fills = await fillCache.read(job.x, job.y);
+    const labels = labelLocalLakeComponents(config, job.x, job.y, fills);
+    for (const id of new Set(labels)) if (id !== 0) components.add(id);
+    await io.writeBasinIdTile({ x: job.x, y: job.y, d: 0 }, labels);
+    labelCache.set(job.x, job.y, labels);
+  }
+
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex];
+    onStatus?.(`Joining basin boundaries ${jobIndex + 1} / ${jobs.length}`);
+    const [fills, labels] = await Promise.all([fillCache.read(job.x, job.y), labelCache.read(job.x, job.y)]);
+    if (job.x + 1 < config.tilesPerSide) {
+      const [eastFills, eastLabels] = await Promise.all([fillCache.read(job.x + 1, job.y), labelCache.read(job.x + 1, job.y)]);
+      for (let y = 0; y < config.tileSize; y += 1) {
+        const cell = y * config.tileSize + config.tileSize - 1;
+        for (let offset = -1; offset <= 1; offset += 1) {
+          const ey = y + offset;
+          if (ey < 0 || ey >= config.tileSize) continue;
+          unionMatchingLakeCells(fills, labels, cell, eastFills, eastLabels, ey * config.tileSize, components);
+        }
+      }
+    }
+    if (job.y + 1 < config.tilesPerSide) {
+      const [southFills, southLabels] = await Promise.all([fillCache.read(job.x, job.y + 1), labelCache.read(job.x, job.y + 1)]);
+      for (let x = 0; x < config.tileSize; x += 1) {
+        const cell = (config.tileSize - 1) * config.tileSize + x;
+        for (let offset = -1; offset <= 1; offset += 1) {
+          const sx = x + offset;
+          if (sx < 0 || sx >= config.tileSize) continue;
+          unionMatchingLakeCells(fills, labels, cell, southFills, southLabels, sx, components);
+        }
+      }
+    }
+    if (job.x + 1 < config.tilesPerSide && job.y + 1 < config.tilesPerSide) {
+      const [diagonalFills, diagonalLabels] = await Promise.all([fillCache.read(job.x + 1, job.y + 1), labelCache.read(job.x + 1, job.y + 1)]);
+      unionMatchingLakeCells(
+        fills, labels, config.tileSize * config.tileSize - 1,
+        diagonalFills, diagonalLabels, 0,
+        components
+      );
+    }
+    if (job.x > 0 && job.y + 1 < config.tilesPerSide) {
+      const [diagonalFills, diagonalLabels] = await Promise.all([fillCache.read(job.x - 1, job.y + 1), labelCache.read(job.x - 1, job.y + 1)]);
+      unionMatchingLakeCells(
+        fills, labels, (config.tileSize - 1) * config.tileSize,
+        diagonalFills, diagonalLabels, config.tileSize - 1,
+        components
+      );
+    }
+  }
+
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex];
+    onStatus?.(`Writing physical basin IDs ${jobIndex + 1} / ${jobs.length}`);
+    const labels = await labelCache.read(job.x, job.y);
+    const merged = new Uint32Array(labels.length);
+    let changed = false;
+    for (let i = 0; i < labels.length; i += 1) {
+      merged[i] = labels[i] === 0 ? 0 : components.find(labels[i]);
+      changed ||= merged[i] !== labels[i];
+    }
+    if (changed) {
+      await io.writeBasinIdTile({ x: job.x, y: job.y, d: 0 }, merged);
+      labelCache.set(job.x, job.y, merged);
+    }
+  }
+
+  const stats = new Map<number, PhysicalBasinAccumulator>();
+  for (const job of jobs) {
+    const [fills, labels, terrain] = await Promise.all([
+      fillCache.read(job.x, job.y),
+      labelCache.read(job.x, job.y),
+      io.readTile({ x: job.x, y: job.y, d: 0 })
+    ]);
+    for (let i = 0; i < labels.length; i += 1) {
+      const id = labels[i];
+      if (id === 0) continue;
+      let accumulator = stats.get(id);
+      if (!accumulator) {
+        accumulator = {
+          fillHeight: fills[i], areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0,
+          minGlobalX: Number.POSITIVE_INFINITY, minGlobalY: Number.POSITIVE_INFINITY, maxGlobalX: 0, maxGlobalY: 0
+        };
+        stats.set(id, accumulator);
+      }
+      const x = job.x * config.tileSize + i % config.tileSize;
+      const y = job.y * config.tileSize + Math.floor(i / config.tileSize);
+      const depth = Math.max(0, fills[i] - terrain[i]);
+      accumulator.areaCells += 1;
+      accumulator.minTerrain = Math.min(accumulator.minTerrain, terrain[i]);
+      accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
+      accumulator.volumeCellHeight += depth;
+      accumulator.minGlobalX = Math.min(accumulator.minGlobalX, x);
+      accumulator.minGlobalY = Math.min(accumulator.minGlobalY, y);
+      accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, x);
+      accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, y);
+    }
+  }
+  return stats;
+}
+
+function unionMatchingLakeCells(
+  fillsA: Uint16Array,
+  labelsA: Uint32Array,
+  cellA: number,
+  fillsB: Uint16Array,
+  labelsB: Uint32Array,
+  cellB: number,
+  components: NumericDisjointSet
+): void {
+  if (fillsA[cellA] !== 0 && fillsA[cellA] === fillsB[cellB]) components.union(labelsA[cellA], labelsB[cellB]);
+}
+
+function labelLocalLakeComponents(config: WorldConfig, tileX: number, tileY: number, fills: Uint16Array): Uint32Array {
+  const size = config.tileSize;
+  const fullSide = size * config.tilesPerSide;
+  const labels = new Uint32Array(fills.length);
+  const queue = new Uint32Array(fills.length);
+  for (let seed = 0; seed < fills.length; seed += 1) {
+    if (fills[seed] === 0 || labels[seed] !== 0) continue;
+    let head = 0;
+    let tail = 1;
+    queue[0] = seed;
+    labels[seed] = NO_FLOW_TARGET;
+    let minimum = (tileY * size + Math.floor(seed / size)) * fullSide + tileX * size + seed % size + 1;
+    while (head < tail) {
+      const current = queue[head++];
+      const x = current % size;
+      const y = Math.floor(current / size);
+      minimum = Math.min(minimum, (tileY * size + y) * fullSide + tileX * size + x + 1);
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+          const neighbor = ny * size + nx;
+          if (labels[neighbor] === 0 && fills[neighbor] === fills[seed]) {
+            labels[neighbor] = NO_FLOW_TARGET;
+            queue[tail++] = neighbor;
+          }
+        }
+      }
+    }
+    for (let i = 0; i < tail; i += 1) labels[queue[i]] = minimum;
+  }
+  return labels;
+}
+
+async function buildGlobalConditionedReceivers(
+  config: WorldConfig,
+  io: HydrologyTileIO,
+  jobs: TileJob[],
+  useWorkers: boolean,
+  onStatus?: (label: string) => void
+): Promise<void> {
+  if (!io.readDrainageSurfaceTile || !io.writeFlatDistanceTile || !io.readFlatDistanceTile || !io.writeReceiverDirectionTile) {
+    throw new Error('Global flat routing requires drainage-surface, flat-distance, and receiver tile storage.');
+  }
+  const surfaceBoundaries = new HydrologyTileBoundaryIndex(Uint16Array, config.tileSize);
+  const distanceBoundaries = new HydrologyTileBoundaryIndex(Uint32Array, config.tileSize);
+  const surfaceCache = new HydrologyTileCache<Uint16Array>(12, async (x, y) => {
+    const surface = await requireHydrologyTile(io.readDrainageSurfaceTile?.({ x, y, d: 0 }), 'drainage surface', x, y);
+    surfaceBoundaries.set(x, y, surface);
+    return surface;
+  });
+  const distanceCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readFlatDistanceTile?.({ x, y, d: 0 }), 'flat distance', x, y));
+
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex];
+    onStatus?.(`Indexing drainage boundaries ${jobIndex + 1} / ${jobs.length}`);
+    await surfaceCache.read(job.x, job.y);
+  }
+
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex];
+    onStatus?.(`Finding flat outlets ${jobIndex + 1} / ${jobs.length}`);
+    const surface = await surfaceCache.read(job.x, job.y);
+    const distances = initializeFlatDistances(config, job.x, job.y, surface, surfaceBoundaries);
+    await io.writeFlatDistanceTile({ x: job.x, y: job.y, d: 0 }, distances);
+    distanceCache.set(job.x, job.y, distances);
+    distanceBoundaries.set(job.x, job.y, distances);
+  }
+
+  await convergeTileQueue(config, jobs, async (job) => {
+    const surface = await surfaceCache.read(job.x, job.y);
+    const distances = await distanceCache.read(job.x, job.y);
+    const result = relaxFlatDistances(config, job.x, job.y, surface, distances, surfaceBoundaries, distanceBoundaries);
+    if (!result) return 0;
+    await io.writeFlatDistanceTile?.({ x: job.x, y: job.y, d: 0 }, result.distances);
+    distanceCache.set(job.x, job.y, result.distances);
+    distanceBoundaries.set(job.x, job.y, result.distances);
+    return result.changedNeighborMask;
+  }, (current, queued) => onStatus?.(`Resolving flats across tiles ${current} / ${queued}`));
+
+  let receiversWritten = 0;
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => {
+      const [surface, distances] = await Promise.all([
+        surfaceCache.read(job.x, job.y),
+        distanceCache.read(job.x, job.y)
+      ]);
+      return {
+        id,
+        type: 'hydrology-materialize-receivers-tile',
+        tileX: job.x,
+        tileY: job.y,
+        tileSize: config.tileSize,
+        tilesPerSide: config.tilesPerSide,
+        surfaceHalo: surfaceBoundaries.createHalo(job.x, job.y, surface).buffer,
+        distanceHalo: distanceBoundaries.createHalo(job.x, job.y, distances).buffer
+      } satisfies HydrologyWorkerRequest;
+    },
+    async (response) => {
+      if (response.type !== 'hydrology-materialize-receivers-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      await io.writeReceiverDirectionTile?.(
+        { x: response.tileX, y: response.tileY, d: 0 },
+        new Uint8Array(response.receiverDirections)
+      );
+      receiversWritten += 1;
+      onStatus?.(`Writing seamless receivers ${receiversWritten} / ${jobs.length}`);
+    },
+    useWorkers
+  );
+}
+
+async function buildPhysicalHydrologyTopology(
+  config: WorldConfig,
+  io: HydrologyTileIO,
+  jobs: TileJob[],
+  stats: Map<number, PhysicalBasinAccumulator>
+): Promise<HydrologyTopologyV1> {
+  const ids = Uint32Array.from([...stats.keys()].sort((a, b) => a - b));
+  const idToIndex = new Map<number, number>();
+  for (let i = 0; i < ids.length; i += 1) idToIndex.set(ids[i], i);
+  const fillHeights = new Uint16Array(ids.length);
+  const downstreamIds = new Uint32Array(ids.length);
+  const spillCells = new Uint32Array(ids.length);
+  const downstreamCells = new Uint32Array(ids.length);
+  spillCells.fill(NO_FLOW_TARGET);
+  downstreamCells.fill(NO_FLOW_TARGET);
+  for (let i = 0; i < ids.length; i += 1) fillHeights[i] = stats.get(ids[i])?.fillHeight ?? 0;
+  if (!io.readBasinIdTile || !io.readReceiverDirectionTile) {
+    return {
+      version: 1,
+      width: config.tileSize * config.tilesPerSide,
+      height: config.tileSize * config.tilesPerSide,
+      nodeCount: ids.length,
+      receiverEncoding: 'd8-clockwise-from-east-u8',
+      basinIds: ids,
+      fillHeights,
+      downstreamIds,
+      spillCells,
+      downstreamCells
+    };
+  }
+  const basinCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
+  const receiverCache = new HydrologyTileCache<Uint8Array>(12, (x, y) => requireHydrologyTile(io.readReceiverDirectionTile?.({ x, y, d: 0 }), 'receiver', x, y));
+  const fullSide = config.tileSize * config.tilesPerSide;
+  for (const job of jobs) {
+    const [basins, receivers, basinHalo] = await Promise.all([
+      basinCache.read(job.x, job.y),
+      receiverCache.read(job.x, job.y),
+      readCachedHalo(config, job.x, job.y, basinCache, Uint32Array)
+    ]);
+    const size = config.tileSize;
+    const stride = size + 2;
+    for (let cell = 0; cell < basins.length; cell += 1) {
+      const basinId = basins[cell];
+      if (basinId === 0) continue;
+      const code = receivers[cell];
+      if (code < 1 || code > 8) continue;
+      const x = cell % size;
+      const y = Math.floor(cell / size);
+      const downstreamId = basinHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
+      if (downstreamId === basinId) continue;
+      const index = idToIndex.get(basinId);
+      if (index === undefined) continue;
+      const globalX = job.x * size + x;
+      const globalY = job.y * size + y;
+      const spillCell = globalY * fullSide + globalX;
+      if (spillCell >= spillCells[index]) continue;
+      spillCells[index] = spillCell;
+      downstreamIds[index] = downstreamId;
+      downstreamCells[index] = (globalY + D8_DY[code]) * fullSide + globalX + D8_DX[code];
+    }
+  }
+  return {
+    version: 1,
+    width: fullSide,
+    height: fullSide,
+    nodeCount: ids.length,
+    receiverEncoding: 'd8-clockwise-from-east-u8',
+    basinIds: ids,
+    fillHeights,
+    downstreamIds,
+    spillCells,
+    downstreamCells
+  };
+}
+
+function initializeFlatDistances(
+  config: WorldConfig,
+  tileX: number,
+  tileY: number,
+  surface: Uint16Array,
+  surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>
+): Uint32Array {
+  const size = config.tileSize;
+  const fullSide = size * config.tilesPerSide;
+  const distances = new Uint32Array(size * size);
+  distances.fill(NO_FLOW_TARGET);
+  const queue = new Uint32Array(distances.length);
+  let tail = 0;
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const gx = tileX * size + x;
+      const gy = tileY * size + y;
+      if (gx === 0 || gy === 0 || gx === fullSide - 1 || gy === fullSide - 1) {
+        distances[y * size + x] = 0;
+        queue[tail++] = y * size + x;
+        continue;
+      }
+      const current = surface[y * size + x];
+      for (let code = 1; code <= 8; code += 1) {
+        const nx = x + D8_DX[code];
+        const ny = y + D8_DY[code];
+        const neighbor = nx >= 0 && ny >= 0 && nx < size && ny < size
+          ? surface[ny * size + nx]
+          : surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
+        if (neighbor < current) {
+          distances[y * size + x] = 0;
+          queue[tail++] = y * size + x;
+          break;
+        }
+      }
+    }
+  }
+  for (let head = 0; head < tail; head += 1) {
+    const current = queue[head];
+    const x = current % size;
+    const y = Math.floor(current / size);
+    const candidate = distances[current] + 1;
+    for (let code = 1; code <= 8; code += 1) {
+      const nx = x + D8_DX[code];
+      const ny = y + D8_DY[code];
+      if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+      const neighbor = ny * size + nx;
+      if (surface[neighbor] === surface[current] && distances[neighbor] === NO_FLOW_TARGET) {
+        distances[neighbor] = candidate;
+        queue[tail++] = neighbor;
+      }
+    }
+  }
+  return distances;
+}
+
+function relaxFlatDistances(
+  config: WorldConfig,
+  tileX: number,
+  tileY: number,
+  surface: Uint16Array,
+  distances: Uint32Array,
+  surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>,
+  distanceBoundaries: HydrologyTileBoundaryIndex<Uint32Array>
+): { distances: Uint32Array; changedNeighborMask: number } | null {
+  const size = config.tileSize;
+  const seedCells: number[] = [];
+  const seedDistances: number[] = [];
+  const inspectBoundaryCell = (x: number, y: number): void => {
+      const cell = y * size + x;
+      const currentHeight = surface[cell];
+      let best = distances[cell];
+      for (let code = 1; code <= 8; code += 1) {
+        const nx = x + D8_DX[code];
+        const ny = y + D8_DY[code];
+        if (nx >= 0 && ny >= 0 && nx < size && ny < size) continue;
+        const neighborHeight = surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
+        const neighborDistance = distanceBoundaries.getOffset(tileX, tileY, nx, ny);
+        if (neighborHeight !== currentHeight || neighborDistance === NO_FLOW_TARGET) continue;
+        const candidate = neighborDistance + 1;
+        if (candidate < best) best = candidate;
+      }
+      if (best < distances[cell]) {
+        seedCells.push(cell);
+        seedDistances.push(best);
+      }
+  };
+  for (let x = 0; x < size; x += 1) {
+    inspectBoundaryCell(x, 0);
+    if (size > 1) inspectBoundaryCell(x, size - 1);
+  }
+  for (let y = 1; y + 1 < size; y += 1) {
+    inspectBoundaryCell(0, y);
+    if (size > 1) inspectBoundaryCell(size - 1, y);
+  }
+  if (seedCells.length === 0) return null;
+
+  const next = new Uint32Array(distances);
+  const queue: number[] = [];
+  const queued = new Uint8Array(next.length);
+  const enqueue = (cell: number): void => {
+    if (queued[cell] === 0) {
+      queued[cell] = 1;
+      queue.push(cell);
+    }
+  };
+  let changedNeighborMask = 0;
+  const markChangedBoundary = (cell: number): void => {
+    const x = cell % size;
+    const y = Math.floor(cell / size);
+    if (x === size - 1) changedNeighborMask |= 1 << 1;
+    if (y === size - 1) changedNeighborMask |= 1 << 2;
+    if (x === size - 1 && y === size - 1) changedNeighborMask |= 1 << 3;
+    if (x === 0) changedNeighborMask |= 1 << 4;
+    if (y === 0) changedNeighborMask |= 1 << 5;
+    if (x === 0 && y === 0) changedNeighborMask |= 1 << 6;
+    if (x === size - 1 && y === 0) changedNeighborMask |= 1 << 7;
+    if (x === 0 && y === size - 1) changedNeighborMask |= 1 << 8;
+  };
+  for (let i = 0; i < seedCells.length; i += 1) {
+    const cell = seedCells[i];
+    next[cell] = seedDistances[i];
+    markChangedBoundary(cell);
+    enqueue(cell);
+  }
+  for (let head = 0; head < queue.length; head += 1) {
+    const current = queue[head];
+    queued[current] = 0;
+    const x = current % size;
+    const y = Math.floor(current / size);
+    const candidate = next[current] + 1;
+    for (let code = 1; code <= 8; code += 1) {
+      const nx = x + D8_DX[code];
+      const ny = y + D8_DY[code];
+      if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+      const neighbor = ny * size + nx;
+      if (surface[neighbor] === surface[current] && candidate < next[neighbor]) {
+        next[neighbor] = candidate;
+        markChangedBoundary(neighbor);
+        enqueue(neighbor);
+      }
+    }
+  }
+  return { distances: next, changedNeighborMask };
+}
+
+function materializeGlobalReceivers(
+  tileSize: number,
+  tilesPerSide: number,
+  tileX: number,
+  tileY: number,
+  surfaceHalo: Uint16Array,
+  distanceHalo: Uint32Array
+): Uint8Array {
+  const size = tileSize;
+  const stride = size + 2;
+  const fullSide = size * tilesPerSide;
+  const output = new Uint8Array(size * size);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const gx = tileX * size + x;
+      const gy = tileY * size + y;
+      if (gx === 0 || gy === 0 || gx === fullSide - 1 || gy === fullSide - 1) continue;
+      const currentHeight = surfaceHalo[(y + 1) * stride + x + 1];
+      const currentDistance = distanceHalo[(y + 1) * stride + x + 1];
+      const rotation = hashCell(gx, gy) & 7;
+      let bestCode = 0;
+      let bestScore = -1;
+      for (let offset = 0; offset < 8; offset += 1) {
+        const code = 1 + ((offset + rotation) & 7);
+        const neighborHeight = surfaceHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
+        if (neighborHeight >= currentHeight) continue;
+        const score = (currentHeight - neighborHeight) * (D8_DX[code] !== 0 && D8_DY[code] !== 0 ? 707 : 1000);
+        if (score > bestScore) {
+          bestScore = score;
+          bestCode = code;
+        }
+      }
+      if (bestCode !== 0) {
+        output[y * size + x] = bestCode;
+        continue;
+      }
+      let bestDistance = currentDistance;
+      for (let offset = 0; offset < 8; offset += 1) {
+        const code = 1 + ((offset + rotation) & 7);
+        const hx = x + 1 + D8_DX[code];
+        const hy = y + 1 + D8_DY[code];
+        if (surfaceHalo[hy * stride + hx] !== currentHeight) continue;
+        const neighborDistance = distanceHalo[hy * stride + hx];
+        if (neighborDistance < bestDistance) {
+          bestDistance = neighborDistance;
+          bestCode = code;
+        }
+      }
+      output[y * size + x] = bestCode;
+    }
+  }
+  return output;
+}
+
+function hashCell(x: number, y: number): number {
+  let value = Math.imul(x ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(y ^ 0xc2b2ae35, 0x27d4eb2f);
+  value ^= value >>> 16;
+  return value >>> 0;
+}
+
+async function convergeTileQueue(
+  config: WorldConfig,
+  jobs: TileJob[],
+  relax: (job: TileJob) => Promise<number>,
+  onStatus?: (current: number, queued: number) => void
+): Promise<void> {
+  const queue = jobs.slice();
+  const queued = new Set(queue.map((job) => `${job.x},${job.y}`));
+  for (let head = 0; head < queue.length; head += 1) {
+    onStatus?.(head + 1, queue.length);
+    const job = queue[head];
+    queued.delete(`${job.x},${job.y}`);
+    const changedNeighborMask = await relax(job);
+    for (let code = 1; code <= 8; code += 1) {
+      if ((changedNeighborMask & (1 << code)) === 0) continue;
+      const x = job.x + D8_DX[code];
+      const y = job.y + D8_DY[code];
+      if (x < 0 || y < 0 || x >= config.tilesPerSide || y >= config.tilesPerSide) continue;
+      const key = `${x},${y}`;
+      if (!queued.has(key)) {
+        queued.add(key);
+        queue.push({ x, y });
+      }
+    }
+  }
+}
+
+class NumericDisjointSet {
+  private readonly parent = new Map<number, number>();
+
+  add(value: number): void {
+    if (!this.parent.has(value)) this.parent.set(value, value);
+  }
+
+  find(value: number): number {
+    const parent = this.parent.get(value);
+    if (parent === undefined) {
+      this.parent.set(value, value);
+      return value;
+    }
+    if (parent === value) return value;
+    const root = this.find(parent);
+    this.parent.set(value, root);
+    return root;
+  }
+
+  union(a: number, b: number): void {
+    if (a === 0 || b === 0) return;
+    const rootA = this.find(a);
+    const rootB = this.find(b);
+    if (rootA === rootB) return;
+    const minimum = Math.min(rootA, rootB);
+    this.parent.set(rootA, minimum);
+    this.parent.set(rootB, minimum);
+  }
+}
+
+class HydrologyTileCache<T extends Uint8Array | Uint16Array | Uint32Array> {
+  private readonly values = new Map<string, T>();
+
+  constructor(private readonly capacity: number, private readonly load: (x: number, y: number) => Promise<T>) {}
+
+  async read(x: number, y: number): Promise<T> {
+    const key = `${x},${y}`;
+    const cached = this.values.get(key);
+    if (cached) {
+      this.values.delete(key);
+      this.values.set(key, cached);
+      return cached;
+    }
+    const value = await this.load(x, y);
+    this.set(x, y, value);
+    return value;
+  }
+
+  set(x: number, y: number, value: T): void {
+    const key = `${x},${y}`;
+    this.values.delete(key);
+    this.values.set(key, value);
+    while (this.values.size > this.capacity) this.values.delete(this.values.keys().next().value as string);
+  }
+}
+
+interface HydrologyTileBoundary<T extends Uint8Array | Uint16Array | Uint32Array> {
+  north: T;
+  south: T;
+  west: T;
+  east: T;
+}
+
+class HydrologyTileBoundaryIndex<T extends Uint8Array | Uint16Array | Uint32Array> {
+  private readonly values = new Map<string, HydrologyTileBoundary<T>>();
+
+  constructor(
+    private readonly Constructor: { new(length: number): T },
+    private readonly tileSize: number
+  ) {}
+
+  set(tileX: number, tileY: number, tile: T): void {
+    const north = new this.Constructor(this.tileSize);
+    const south = new this.Constructor(this.tileSize);
+    const west = new this.Constructor(this.tileSize);
+    const east = new this.Constructor(this.tileSize);
+    north.set(tile.subarray(0, this.tileSize));
+    south.set(tile.subarray((this.tileSize - 1) * this.tileSize));
+    for (let i = 0; i < this.tileSize; i += 1) {
+      west[i] = tile[i * this.tileSize];
+      east[i] = tile[i * this.tileSize + this.tileSize - 1];
+    }
+    this.values.set(`${tileX},${tileY}`, { north, south, west, east });
+  }
+
+  getOffset(tileX: number, tileY: number, x: number, y: number): number {
+    let targetTileX = tileX;
+    let targetTileY = tileY;
+    let targetX = x;
+    let targetY = y;
+    if (targetX < 0) {
+      targetTileX -= 1;
+      targetX += this.tileSize;
+    } else if (targetX >= this.tileSize) {
+      targetTileX += 1;
+      targetX -= this.tileSize;
+    }
+    if (targetY < 0) {
+      targetTileY -= 1;
+      targetY += this.tileSize;
+    } else if (targetY >= this.tileSize) {
+      targetTileY += 1;
+      targetY -= this.tileSize;
+    }
+    const boundary = this.values.get(`${targetTileX},${targetTileY}`);
+    if (!boundary) return 0;
+    if (targetY === 0) return boundary.north[targetX];
+    if (targetY === this.tileSize - 1) return boundary.south[targetX];
+    if (targetX === 0) return boundary.west[targetY];
+    if (targetX === this.tileSize - 1) return boundary.east[targetY];
+    throw new Error(`Hydrology boundary lookup addressed an interior cell ${targetTileX},${targetTileY}:${targetX},${targetY}.`);
+  }
+
+  createHalo(tileX: number, tileY: number, center: T): T {
+    const stride = this.tileSize + 2;
+    const halo = new this.Constructor(stride * stride);
+    for (let y = 0; y < this.tileSize; y += 1) {
+      halo.set(center.subarray(y * this.tileSize, (y + 1) * this.tileSize), (y + 1) * stride + 1);
+    }
+    for (let x = -1; x <= this.tileSize; x += 1) {
+      halo[x + 1] = this.getOffset(tileX, tileY, x, -1);
+      halo[(this.tileSize + 1) * stride + x + 1] = this.getOffset(tileX, tileY, x, this.tileSize);
+    }
+    for (let y = 0; y < this.tileSize; y += 1) {
+      halo[(y + 1) * stride] = this.getOffset(tileX, tileY, -1, y);
+      halo[(y + 1) * stride + this.tileSize + 1] = this.getOffset(tileX, tileY, this.tileSize, y);
+    }
+    return halo;
+  }
+}
+
+async function requireHydrologyTile<T>(value: Promise<T | null> | undefined, label: string, x: number, y: number): Promise<T> {
+  const tile = await value;
+  if (!tile) throw new Error(`Missing ${label} tile y${y}/x${x}.`);
+  return tile;
+}
+
+async function readCachedHalo<T extends Uint8Array | Uint16Array | Uint32Array>(
+  config: WorldConfig,
+  tileX: number,
+  tileY: number,
+  cache: HydrologyTileCache<T>,
+  Constructor: { new(length: number): T }
+): Promise<T> {
+  const size = config.tileSize;
+  const stride = size + 2;
+  const halo = new Constructor(stride * stride);
+  const center = await cache.read(tileX, tileY);
+  for (let y = 0; y < size; y += 1) halo.set(center.subarray(y * size, (y + 1) * size), (y + 1) * stride + 1);
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = tileX + dx;
+      const ny = tileY + dy;
+      if (nx < 0 || ny < 0 || nx >= config.tilesPerSide || ny >= config.tilesPerSide) continue;
+      const neighbor = await cache.read(nx, ny);
+      const sourceX = dx < 0 ? size - 1 : dx > 0 ? 0 : 0;
+      const sourceY = dy < 0 ? size - 1 : dy > 0 ? 0 : 0;
+      const width = dx === 0 ? size : 1;
+      const height = dy === 0 ? size : 1;
+      const targetX = dx < 0 ? 0 : dx > 0 ? size + 1 : 1;
+      const targetY = dy < 0 ? 0 : dy > 0 ? size + 1 : 1;
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) halo[(targetY + y) * stride + targetX + x] = neighbor[(sourceY + y) * size + sourceX + x];
+      }
+    }
+  }
+  return halo;
+}
+
 async function runFlowStrengthBake(
   config: WorldConfig,
   io: HydrologyTileIO,
@@ -437,7 +1258,9 @@ async function runFlowStrengthBake(
   total: number,
   onProgress?: (progress: HydrologyProgress) => void
 ): Promise<{ enabled: boolean; maxFlowAccumulation: number; completed: number }> {
-  if (!io.writeFlowStrengthTile) return { enabled: false, maxFlowAccumulation: 0, completed: completedStart };
+  if (!io.writeFlowStrengthTile || !io.readReceiverDirectionTile || !io.writeFlowAccumulationTile || !io.readFlowAccumulationTile) {
+    return { enabled: false, maxFlowAccumulation: 0, completed: completedStart };
+  }
 
   let completed = completedStart;
   const analyses = new Array<FlowTileAnalysisResult>(jobs.length);
@@ -450,7 +1273,7 @@ async function runFlowStrengthBake(
       tileY: job.y,
       tileSize: config.tileSize,
       tilesPerSide: config.tilesPerSide,
-      heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer
+      receiverDirections: (await requireReceiverDirections(io, { x: job.x, y: job.y, d: 0 })).buffer
     }),
     async (response) => {
       if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
@@ -487,7 +1310,7 @@ async function runFlowStrengthBake(
         tileY: job.y,
         tileSize: config.tileSize,
         tilesPerSide: config.tilesPerSide,
-        heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer,
+        receiverDirections: (await requireReceiverDirections(io, { x: job.x, y: job.y, d: 0 })).buffer,
         incomingCells: new Uint32Array(incoming.cells).buffer,
         incomingFlows: new Float64Array(incoming.flows).buffer
       };
@@ -495,6 +1318,10 @@ async function runFlowStrengthBake(
     async (response) => {
       if (response.type !== 'hydrology-flow-max-result') throw new Error(`Unexpected hydrology response ${response.type}`);
       maxFlowAccumulation = Math.max(maxFlowAccumulation, response.maxFlowAccumulation);
+      await io.writeFlowAccumulationTile?.(
+        { x: response.tileX, y: response.tileY, d: 0 },
+        new Uint32Array(response.flowAccumulation)
+      );
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Measuring flow ${completed - config.tilesPerSide * config.tilesPerSide * 3 - 2} / ${jobs.length}` });
     },
@@ -504,17 +1331,12 @@ async function runFlowStrengthBake(
   await runHydrologyWorkerPool(
     jobs,
     async (job, id) => {
-      const incoming = incomingByTile[tileIndex(config, job.x, job.y)];
       return {
         id,
         type: 'hydrology-flow-materialize-tile',
         tileX: job.x,
         tileY: job.y,
-        tileSize: config.tileSize,
-        tilesPerSide: config.tilesPerSide,
-        heightHalo: (await readHeightHalo(config, io, job.x, job.y)).buffer,
-        incomingCells: new Uint32Array(incoming.cells).buffer,
-        incomingFlows: new Float64Array(incoming.flows).buffer,
+        flowAccumulation: (await requireFlowAccumulation(io, { x: job.x, y: job.y, d: 0 })).buffer,
         maxFlowAccumulation
       };
     },
@@ -530,8 +1352,20 @@ async function runFlowStrengthBake(
   return { enabled: true, maxFlowAccumulation, completed };
 }
 
-export function analyzeFlowTile(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, heightHalo: Uint16Array): FlowTileAnalysisResult {
-  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
+async function requireReceiverDirections(io: HydrologyTileIO, key: TileKey): Promise<Uint8Array> {
+  const directions = await io.readReceiverDirectionTile?.(key);
+  if (!directions) throw new Error(`Missing conditioned receiver tile d${key.d}/y${key.y}/x${key.x}.`);
+  return directions;
+}
+
+async function requireFlowAccumulation(io: HydrologyTileIO, key: TileKey): Promise<Uint32Array> {
+  const accumulation = await io.readFlowAccumulationTile?.(key);
+  if (!accumulation) throw new Error(`Missing flow accumulation tile d${key.d}/y${key.y}/x${key.x}.`);
+  return accumulation;
+}
+
+export function analyzeFlowTile(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint8Array): FlowTileAnalysisResult {
+  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, receiverDirections);
   const accumulation = accumulateLocalFlow(routing, undefined);
   const baseMap = new Map<number, number>();
   for (let i = 0; i < routing.outboundTargets.length; i += 1) {
@@ -570,31 +1404,30 @@ export function computeFlowTileMax(
   tileY: number,
   tileSize: number,
   tilesPerSide: number,
-  heightHalo: Uint16Array,
+  receiverDirections: Uint8Array,
   incomingCells: Uint32Array,
   incomingFlows: Float64Array
 ): FlowTileMaxResult {
-  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
+  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, receiverDirections);
   const accumulation = accumulateLocalFlow(routing, incomingFromArrays(tileSize, incomingCells, incomingFlows));
-  return { tileX, tileY, maxFlowAccumulation: accumulation.max };
+  return {
+    tileX,
+    tileY,
+    maxFlowAccumulation: accumulation.max,
+    flowAccumulation: Uint32Array.from(accumulation.values, (value) => Math.min(NO_FLOW_TARGET, Math.round(value))).buffer
+  };
 }
 
 export function materializeFlowTile(
   tileX: number,
   tileY: number,
-  tileSize: number,
-  tilesPerSide: number,
-  heightHalo: Uint16Array,
-  incomingCells: Uint32Array,
-  incomingFlows: Float64Array,
+  accumulation: Uint32Array,
   maxFlowAccumulation: number
 ): MaterializeFlowResult {
-  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, heightHalo);
-  const accumulation = accumulateLocalFlow(routing, incomingFromArrays(tileSize, incomingCells, incomingFlows));
-  const output = new Uint16Array(tileSize * tileSize);
+  const output = new Uint16Array(accumulation.length);
   const denominator = Math.log1p(Math.max(0, maxFlowAccumulation - 1));
   for (let i = 0; i < output.length; i += 1) {
-    const effective = Math.max(0, accumulation.values[i] - 1);
+    const effective = Math.max(0, accumulation[i] - 1);
     const encoded = denominator > 0 && effective > 0 ? Math.min(UINT16_MAX, Math.round(UINT16_MAX * Math.log1p(effective) / denominator)) : 0;
     output[i] = encoded;
   }
@@ -612,6 +1445,8 @@ type HydrologyAnalyzeResponse = {
   labelCount: number;
   edges: ArrayBuffer;
   edgeWeights: ArrayBuffer;
+  edgeCellsA: ArrayBuffer;
+  edgeCellsB: ArrayBuffer;
   northLabels: ArrayBuffer;
   northHeights: ArrayBuffer;
   southLabels: ArrayBuffer;
@@ -628,6 +1463,7 @@ type HydrologyMaterializeResponse = {
   tileX: number;
   tileY: number;
   lakeFillHeights: ArrayBuffer;
+  drainageSurface: ArrayBuffer;
   basinIds: ArrayBuffer;
   areaCells: ArrayBuffer;
   minTerrain: ArrayBuffer;
@@ -659,6 +1495,7 @@ type HydrologyFlowMaxResponse = {
   tileX: number;
   tileY: number;
   maxFlowAccumulation: number;
+  flowAccumulation: ArrayBuffer;
 };
 
 type HydrologyFlowMaterializeResponse = {
@@ -669,7 +1506,15 @@ type HydrologyFlowMaterializeResponse = {
   flowStrength: ArrayBuffer;
 };
 
-export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse | HydrologyFlowAnalyzeResponse | HydrologyFlowMaxResponse | HydrologyFlowMaterializeResponse;
+type HydrologyReceiverMaterializeResponse = {
+  id: number;
+  type: 'hydrology-materialize-receivers-result';
+  tileX: number;
+  tileY: number;
+  receiverDirections: ArrayBuffer;
+};
+
+export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse | HydrologyReceiverMaterializeResponse | HydrologyFlowAnalyzeResponse | HydrologyFlowMaxResponse | HydrologyFlowMaterializeResponse;
 
 export type HydrologyWorkerRequest =
   | {
@@ -697,7 +1542,17 @@ export type HydrologyWorkerRequest =
       tileY: number;
       tileSize: number;
       tilesPerSide: number;
-      heightHalo: ArrayBuffer;
+      receiverDirections: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-materialize-receivers-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      tilesPerSide: number;
+      surfaceHalo: ArrayBuffer;
+      distanceHalo: ArrayBuffer;
     }
   | {
       id: number;
@@ -706,7 +1561,7 @@ export type HydrologyWorkerRequest =
       tileY: number;
       tileSize: number;
       tilesPerSide: number;
-      heightHalo: ArrayBuffer;
+      receiverDirections: ArrayBuffer;
       incomingCells: ArrayBuffer;
       incomingFlows: ArrayBuffer;
     }
@@ -715,11 +1570,7 @@ export type HydrologyWorkerRequest =
       type: 'hydrology-flow-materialize-tile';
       tileX: number;
       tileY: number;
-      tileSize: number;
-      tilesPerSide: number;
-      heightHalo: ArrayBuffer;
-      incomingCells: ArrayBuffer;
-      incomingFlows: ArrayBuffer;
+      flowAccumulation: ArrayBuffer;
       maxFlowAccumulation: number;
     };
 
@@ -734,6 +1585,8 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       labelCount: result.labelCount,
       edges: result.edges.buffer,
       edgeWeights: result.edgeWeights.buffer,
+      edgeCellsA: result.edgeCellsA.buffer,
+      edgeCellsB: result.edgeCellsB.buffer,
       northLabels: result.northLabels.buffer,
       northHeights: result.northHeights.buffer,
       southLabels: result.southLabels.buffer,
@@ -752,7 +1605,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint16Array(request.heightHalo)
+      new Uint8Array(request.receiverDirections)
     );
     const response: HydrologyFlowAnalyzeResponse = {
       id: request.id,
@@ -767,13 +1620,34 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
   }
 
+  if (request.type === 'hydrology-materialize-receivers-tile') {
+    const receivers = materializeGlobalReceivers(
+      request.tileSize,
+      request.tilesPerSide,
+      request.tileX,
+      request.tileY,
+      new Uint16Array(request.surfaceHalo),
+      new Uint32Array(request.distanceHalo)
+    );
+    return {
+      response: {
+        id: request.id,
+        type: 'hydrology-materialize-receivers-result',
+        tileX: request.tileX,
+        tileY: request.tileY,
+        receiverDirections: receivers.buffer
+      },
+      transfers: [receivers.buffer]
+    };
+  }
+
   if (request.type === 'hydrology-flow-max-tile') {
     const result = computeFlowTileMax(
       request.tileX,
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint16Array(request.heightHalo),
+      new Uint8Array(request.receiverDirections),
       new Uint32Array(request.incomingCells),
       new Float64Array(request.incomingFlows)
     );
@@ -783,9 +1657,10 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
         type: 'hydrology-flow-max-result',
         tileX: result.tileX,
         tileY: result.tileY,
-        maxFlowAccumulation: result.maxFlowAccumulation
+        maxFlowAccumulation: result.maxFlowAccumulation,
+        flowAccumulation: result.flowAccumulation
       },
-      transfers: []
+      transfers: [result.flowAccumulation]
     };
   }
 
@@ -793,11 +1668,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     const result = materializeFlowTile(
       request.tileX,
       request.tileY,
-      request.tileSize,
-      request.tilesPerSide,
-      new Uint16Array(request.heightHalo),
-      new Uint32Array(request.incomingCells),
-      new Float64Array(request.incomingFlows),
+      new Uint32Array(request.flowAccumulation),
       request.maxFlowAccumulation
     );
     const response: HydrologyFlowMaterializeResponse = {
@@ -824,6 +1695,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     tileX: result.tileX,
     tileY: result.tileY,
     lakeFillHeights: result.lakeFillHeights,
+    drainageSurface: result.drainageSurface,
     basinIds: result.basinIds.buffer,
     areaCells: result.areaCells.buffer,
     minTerrain: result.minTerrain.buffer,
@@ -895,9 +1767,10 @@ async function runHydrologyWorkerPool(
 function getHydrologyRequestTransfers(request: HydrologyWorkerRequest): Transferable[] {
   if (request.type === 'hydrology-analyze-tile') return [request.heights];
   if (request.type === 'hydrology-materialize-tile') return [request.heights, request.globalFillHeights];
-  if (request.type === 'hydrology-flow-analyze-tile') return [request.heightHalo];
-  if (request.type === 'hydrology-flow-max-tile') return [request.heightHalo, request.incomingCells, request.incomingFlows];
-  return [request.heightHalo, request.incomingCells, request.incomingFlows];
+  if (request.type === 'hydrology-materialize-receivers-tile') return [request.surfaceHalo, request.distanceHalo];
+  if (request.type === 'hydrology-flow-analyze-tile') return [request.receiverDirections];
+  if (request.type === 'hydrology-flow-max-tile') return [request.receiverDirections, request.incomingCells, request.incomingFlows];
+  return [request.flowAccumulation];
 }
 
 interface FlowRouting {
@@ -907,7 +1780,7 @@ interface FlowRouting {
   order: Uint32Array;
 }
 
-function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, heightHalo: Uint16Array): FlowRouting {
+function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint8Array): FlowRouting {
   const sampleCount = tileSize * tileSize;
   const receivers = new Int32Array(sampleCount);
   const outboundTargets = new Uint32Array(sampleCount);
@@ -917,57 +1790,27 @@ function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesP
   const fullSide = tileSize * tilesPerSide;
   const originX = tileX * tileSize;
   const originY = tileY * tileSize;
-  const haloStride = tileSize + 2;
-  const directions = [
-    [1, 0], [0, 1], [1, 1], [-1, 0],
-    [0, -1], [-1, -1], [1, -1], [-1, 1]
-  ];
 
   for (let y = 0; y < tileSize; y += 1) {
     for (let x = 0; x < tileSize; x += 1) {
       const index = y * tileSize + x;
-      const current = heightHalo[(y + 1) * haloStride + x + 1];
       const currentGlobalX = originX + x;
       const currentGlobalY = originY + y;
-      const currentGlobal = currentGlobalY * fullSide + currentGlobalX;
-      let bestDx = 0;
-      let bestDy = 0;
-      let bestScore = -1;
-      let bestEqual = false;
-      for (const [dx, dy] of directions) {
-        const globalX = currentGlobalX + dx;
-        const globalY = currentGlobalY + dy;
-        if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) continue;
-        const neighbor = heightHalo[(y + 1 + dy) * haloStride + x + 1 + dx];
-        if (neighbor < current) {
-          const drop = current - neighbor;
-          const score = drop * (dx !== 0 && dy !== 0 ? 707 : 1000);
-          if (bestEqual || score > bestScore) {
-            bestDx = dx;
-            bestDy = dy;
-            bestScore = score;
-            bestEqual = false;
-          }
-        } else if (neighbor === current && bestScore < 0) {
-          const neighborGlobal = globalY * fullSide + globalX;
-          if (neighborGlobal > currentGlobal) {
-            bestDx = dx;
-            bestDy = dy;
-            bestScore = 0;
-            bestEqual = true;
-          }
-        }
-      }
-
-      if (bestScore < 0) continue;
-      const rx = x + bestDx;
-      const ry = y + bestDy;
+      const code = receiverDirections[index] ?? 0;
+      if (code < 1 || code > 8) continue;
+      const dx = D8_DX[code];
+      const dy = D8_DY[code];
+      const globalX = currentGlobalX + dx;
+      const globalY = currentGlobalY + dy;
+      if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) continue;
+      const rx = x + dx;
+      const ry = y + dy;
       if (rx >= 0 && ry >= 0 && rx < tileSize && ry < tileSize) {
         const receiver = ry * tileSize + rx;
         receivers[index] = receiver;
         indegree[receiver] += 1;
       } else {
-        outboundTargets[index] = (currentGlobalY + bestDy) * fullSide + currentGlobalX + bestDx;
+        outboundTargets[index] = globalY * fullSide + globalX;
       }
     }
   }
@@ -1171,50 +2014,68 @@ function buildGlobalGraph(config: WorldConfig, analyses: TileAnalysis[], nodeCou
   from: Uint32Array;
   to: Uint32Array;
   weight: Uint16Array;
+  cellFrom: Uint32Array;
+  cellTo: Uint32Array;
   oceanLabels: Set<number>;
 } {
-  const edgeMap = new Map<number, number>();
+  const edgeMap = new Map<number, { weight: number; cellLo: number; cellHi: number }>();
   const oceanLabels = new Set<number>();
-  const addEdge = (a: number, b: number, weight: number): void => {
+  const addEdge = (a: number, b: number, weight: number, cellA: number, cellB: number): void => {
     if (a === b) return;
     const lo = Math.min(a, b);
     const hi = Math.max(a, b);
     const key = lo * nodeCount + hi;
     const previous = edgeMap.get(key);
-    if (previous === undefined || weight < previous) edgeMap.set(key, weight);
+    const cellLo = a === lo ? cellA : cellB;
+    const cellHi = a === lo ? cellB : cellA;
+    if (!previous || weight < previous.weight || (weight === previous.weight && (cellLo < previous.cellLo || (cellLo === previous.cellLo && cellHi < previous.cellHi)))) {
+      edgeMap.set(key, { weight, cellLo, cellHi });
+    }
   };
   const globalLabel = (analysis: TileAnalysis, localLabel: number): number => analysis.labelOffset + localLabel - 1;
+  const fullSide = config.tileSize * config.tilesPerSide;
+  const globalCell = (analysis: TileAnalysis, localIndex: number): number => {
+    const x = analysis.key.x * config.tileSize + localIndex % config.tileSize;
+    const y = analysis.key.y * config.tileSize + Math.floor(localIndex / config.tileSize);
+    return y * fullSide + x;
+  };
 
   for (const analysis of analyses) {
     for (let i = 0; i < analysis.edgeWeights.length; i += 1) {
-      addEdge(globalLabel(analysis, analysis.edges[i * 2]), globalLabel(analysis, analysis.edges[i * 2 + 1]), analysis.edgeWeights[i]);
+      addEdge(
+        globalLabel(analysis, analysis.edges[i * 2]),
+        globalLabel(analysis, analysis.edges[i * 2 + 1]),
+        analysis.edgeWeights[i],
+        globalCell(analysis, analysis.edgeCellsA[i]),
+        globalCell(analysis, analysis.edgeCellsB[i])
+      );
     }
     if (analysis.key.y === 0) {
       for (let i = 0; i < analysis.northLabels.length; i += 1) {
         const id = globalLabel(analysis, analysis.northLabels[i]);
         oceanLabels.add(id);
-        addEdge(OCEAN_NODE, id, analysis.northHeights[i]);
+        addEdge(OCEAN_NODE, id, analysis.northHeights[i], NO_FLOW_TARGET, globalCell(analysis, i));
       }
     }
     if (analysis.key.y === config.tilesPerSide - 1) {
       for (let i = 0; i < analysis.southLabels.length; i += 1) {
         const id = globalLabel(analysis, analysis.southLabels[i]);
         oceanLabels.add(id);
-        addEdge(OCEAN_NODE, id, analysis.southHeights[i]);
+        addEdge(OCEAN_NODE, id, analysis.southHeights[i], NO_FLOW_TARGET, globalCell(analysis, (config.tileSize - 1) * config.tileSize + i));
       }
     }
     if (analysis.key.x === 0) {
       for (let i = 0; i < analysis.westLabels.length; i += 1) {
         const id = globalLabel(analysis, analysis.westLabels[i]);
         oceanLabels.add(id);
-        addEdge(OCEAN_NODE, id, analysis.westHeights[i]);
+        addEdge(OCEAN_NODE, id, analysis.westHeights[i], NO_FLOW_TARGET, globalCell(analysis, i * config.tileSize));
       }
     }
     if (analysis.key.x === config.tilesPerSide - 1) {
       for (let i = 0; i < analysis.eastLabels.length; i += 1) {
         const id = globalLabel(analysis, analysis.eastLabels[i]);
         oceanLabels.add(id);
-        addEdge(OCEAN_NODE, id, analysis.eastHeights[i]);
+        addEdge(OCEAN_NODE, id, analysis.eastHeights[i], NO_FLOW_TARGET, globalCell(analysis, i * config.tileSize + config.tileSize - 1));
       }
     }
   }
@@ -1228,7 +2089,9 @@ function buildGlobalGraph(config: WorldConfig, analyses: TileAnalysis[], nodeCou
           addEdge(
             globalLabel(analysis, analysis.eastLabels[i]),
             globalLabel(east, east.westLabels[i]),
-            Math.max(analysis.eastHeights[i], east.westHeights[i])
+            Math.max(analysis.eastHeights[i], east.westHeights[i]),
+            globalCell(analysis, i * config.tileSize + config.tileSize - 1),
+            globalCell(east, i * config.tileSize)
           );
         }
       }
@@ -1238,7 +2101,9 @@ function buildGlobalGraph(config: WorldConfig, analyses: TileAnalysis[], nodeCou
           addEdge(
             globalLabel(analysis, analysis.southLabels[i]),
             globalLabel(south, south.northLabels[i]),
-            Math.max(analysis.southHeights[i], south.northHeights[i])
+            Math.max(analysis.southHeights[i], south.northHeights[i]),
+            globalCell(analysis, (config.tileSize - 1) * config.tileSize + i),
+            globalCell(south, i)
           );
         }
       }
@@ -1248,17 +2113,25 @@ function buildGlobalGraph(config: WorldConfig, analyses: TileAnalysis[], nodeCou
   const from = new Uint32Array(edgeMap.size);
   const to = new Uint32Array(edgeMap.size);
   const weight = new Uint16Array(edgeMap.size);
+  const cellFrom = new Uint32Array(edgeMap.size);
+  const cellTo = new Uint32Array(edgeMap.size);
   let index = 0;
   for (const [key, value] of edgeMap) {
     from[index] = Math.floor(key / nodeCount);
     to[index] = key % nodeCount;
-    weight[index] = value;
+    weight[index] = value.weight;
+    cellFrom[index] = value.cellLo;
+    cellTo[index] = value.cellHi;
     index += 1;
   }
-  return { nodeCount, from, to, weight, oceanLabels };
+  return { nodeCount, from, to, weight, cellFrom, cellTo, oceanLabels };
 }
 
-function solveGraphFillHeights(nodeCount: number, from: Uint32Array, to: Uint32Array, weight: Uint16Array): Uint16Array {
+function solveGraphFillHeights(nodeCount: number, from: Uint32Array, to: Uint32Array, weight: Uint16Array): {
+  fills: Uint16Array;
+  parentNode: Uint32Array;
+  parentEdge: Uint32Array;
+} {
   const degree = new Uint32Array(nodeCount);
   for (let i = 0; i < from.length; i += 1) {
     degree[from[i]] += 1;
@@ -1269,35 +2142,49 @@ function solveGraphFillHeights(nodeCount: number, from: Uint32Array, to: Uint32A
   const cursor = new Uint32Array(offsets);
   const adjacency = new Uint32Array(offsets[nodeCount]);
   const weights = new Uint16Array(offsets[nodeCount]);
+  const edgeIds = new Uint32Array(offsets[nodeCount]);
   for (let i = 0; i < from.length; i += 1) {
     let slot = cursor[from[i]];
     adjacency[slot] = to[i];
     weights[slot] = weight[i];
+    edgeIds[slot] = i;
     cursor[from[i]] += 1;
     slot = cursor[to[i]];
     adjacency[slot] = from[i];
     weights[slot] = weight[i];
+    edgeIds[slot] = i;
     cursor[to[i]] += 1;
   }
 
   const fills = new Uint16Array(nodeCount);
   fills.fill(UINT16_MAX);
   fills[OCEAN_NODE] = 0;
+  const parentNode = new Uint32Array(nodeCount);
+  const parentEdge = new Uint32Array(nodeCount);
+  const settled = new Uint8Array(nodeCount);
+  parentNode.fill(NO_FLOW_TARGET);
+  parentEdge.fill(NO_FLOW_TARGET);
   const heap = new MinHeap();
   heap.push(OCEAN_NODE, 0);
   while (heap.length > 0) {
     const node = heap.pop();
+    if (settled[node]) continue;
+    settled[node] = 1;
     const base = fills[node];
     for (let i = offsets[node]; i < offsets[node + 1]; i += 1) {
       const neighbor = adjacency[i];
+      if (settled[neighbor]) continue;
       const candidate = Math.max(base, weights[i]);
-      if (candidate < fills[neighbor]) {
+      const edgeId = edgeIds[i];
+      if (candidate < fills[neighbor] || (candidate === fills[neighbor] && (node < parentNode[neighbor] || (node === parentNode[neighbor] && edgeId < parentEdge[neighbor])))) {
         fills[neighbor] = candidate;
+        parentNode[neighbor] = node;
+        parentEdge[neighbor] = edgeId;
         heap.push(neighbor, candidate);
       }
     }
   }
-  return fills;
+  return { fills, parentNode, parentEdge };
 }
 
 function copyLabels(labels: Uint32Array, tileSize: number, start: number, stride: number): Uint32Array {

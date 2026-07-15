@@ -111,7 +111,11 @@ export interface HydrologyBakeSummaryV1 {
   maxDepth: number;
   volumeCellHeight: number;
   lakeFillHeight: 'closed-basin-fill-height-r16';
+  basinIds?: 'physical-filled-basin-id-u32';
+  receiverDirections?: 'conditioned-flat-resolved-d8-u8';
+  topology?: 'physical-basin-topology-v1';
   flowStrength?: 'log1p-upstream-cell-count-r16';
+  flowAccumulation?: 'upstream-cell-count-u32';
   maxFlowAccumulation?: number;
   flowTileCount?: number;
   basins: HydrologyBasinSummaryV1[];
@@ -506,7 +510,11 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
     maxDepth: Math.max(0, finiteNumber(value.maxDepth, 0)),
     volumeCellHeight: Math.max(0, finiteNumber(value.volumeCellHeight, 0)),
     lakeFillHeight: 'closed-basin-fill-height-r16',
+    basinIds: value.basinIds === 'physical-filled-basin-id-u32' ? value.basinIds : undefined,
+    receiverDirections: value.receiverDirections === 'conditioned-flat-resolved-d8-u8' ? value.receiverDirections : undefined,
+    topology: value.topology === 'physical-basin-topology-v1' ? value.topology : undefined,
     flowStrength: value.flowStrength === 'log1p-upstream-cell-count-r16' ? 'log1p-upstream-cell-count-r16' : undefined,
+    flowAccumulation: value.flowAccumulation === 'upstream-cell-count-u32' ? value.flowAccumulation : undefined,
     maxFlowAccumulation: Number.isFinite(value.maxFlowAccumulation) ? Math.max(0, Number(value.maxFlowAccumulation)) : undefined,
     flowTileCount: Number.isFinite(value.flowTileCount) ? Math.max(0, Math.trunc(Number(value.flowTileCount))) : undefined,
     basins,
