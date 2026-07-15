@@ -328,7 +328,7 @@ export async function runHydrologyBasinBake(
   analyses.length = 0;
 
   const physicalBasinStats = io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile
-    ? await buildPhysicalBasinIds(config, io, jobs, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }))
+    ? await buildPhysicalBasinIds(config, io, jobs, useWorkers, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }))
     : new Map([...basinStats].map(([id, stats]) => [id, { ...stats, fillHeight: globalFillHeights[id] }]));
   if (io.readDrainageSurfaceTile && io.writeFlatDistanceTile && io.readFlatDistanceTile && io.writeReceiverDirectionTile) {
     await buildGlobalConditionedReceivers(
@@ -569,6 +569,7 @@ async function buildPhysicalBasinIds(
   config: WorldConfig,
   io: HydrologyTileIO,
   jobs: TileJob[],
+  useWorkers: boolean,
   onStatus?: (label: string) => void
 ): Promise<Map<number, PhysicalBasinAccumulator>> {
   if (!io.readLakeFillHeightTile || !io.writeBasinIdTile || !io.readBasinIdTile) {
@@ -578,15 +579,32 @@ async function buildPhysicalBasinIds(
   const labelCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
   const components = new NumericDisjointSet();
 
-  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
-    const job = jobs[jobIndex];
-    onStatus?.(`Labeling physical basins ${jobIndex + 1} / ${jobs.length}`);
-    const fills = await fillCache.read(job.x, job.y);
-    const labels = labelLocalLakeComponents(config, job.x, job.y, fills);
-    for (const id of new Set(labels)) if (id !== 0) components.add(id);
-    await io.writeBasinIdTile({ x: job.x, y: job.y, d: 0 }, labels);
-    labelCache.set(job.x, job.y, labels);
-  }
+  let labeled = 0;
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => {
+      const fills = await requireHydrologyTile(io.readLakeFillHeightTile?.({ x: job.x, y: job.y, d: 0 }), 'lake fill', job.x, job.y);
+      return {
+        id,
+        type: 'hydrology-label-lake-components-tile',
+        tileX: job.x,
+        tileY: job.y,
+        tileSize: config.tileSize,
+        tilesPerSide: config.tilesPerSide,
+        lakeFillHeights: fills.buffer.slice(fills.byteOffset, fills.byteOffset + fills.byteLength)
+      } satisfies HydrologyWorkerRequest;
+    },
+    async (response) => {
+      if (response.type !== 'hydrology-label-lake-components-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      const labels = new Uint32Array(response.labels);
+      for (const id of new Uint32Array(response.componentIds)) components.add(id);
+      await io.writeBasinIdTile?.({ x: response.tileX, y: response.tileY, d: 0 }, labels);
+      labelCache.set(response.tileX, response.tileY, labels);
+      labeled += 1;
+      onStatus?.(`Labeling physical basins ${labeled} / ${jobs.length}`);
+    },
+    useWorkers
+  );
 
   for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
     const job = jobs[jobIndex];
@@ -649,37 +667,132 @@ async function buildPhysicalBasinIds(
   }
 
   const stats = new Map<number, PhysicalBasinAccumulator>();
-  for (const job of jobs) {
-    const [fills, labels, terrain] = await Promise.all([
-      fillCache.read(job.x, job.y),
-      labelCache.read(job.x, job.y),
-      io.readTile({ x: job.x, y: job.y, d: 0 })
-    ]);
-    for (let i = 0; i < labels.length; i += 1) {
-      const id = labels[i];
-      if (id === 0) continue;
-      let accumulator = stats.get(id);
-      if (!accumulator) {
-        accumulator = {
-          fillHeight: fills[i], areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0,
-          minGlobalX: Number.POSITIVE_INFINITY, minGlobalY: Number.POSITIVE_INFINITY, maxGlobalX: 0, maxGlobalY: 0
-        };
-        stats.set(id, accumulator);
+  let measured = 0;
+  await runHydrologyWorkerPool(
+    jobs,
+    async (job, id) => {
+      const [fills, labels, terrain] = await Promise.all([
+        requireHydrologyTile(io.readLakeFillHeightTile?.({ x: job.x, y: job.y, d: 0 }), 'lake fill', job.x, job.y),
+        requireHydrologyTile(io.readBasinIdTile?.({ x: job.x, y: job.y, d: 0 }), 'basin id', job.x, job.y),
+        io.readTile({ x: job.x, y: job.y, d: 0 })
+      ]);
+      return {
+        id,
+        type: 'hydrology-measure-physical-basins-tile',
+        tileX: job.x,
+        tileY: job.y,
+        tileSize: config.tileSize,
+        lakeFillHeights: fills.buffer.slice(fills.byteOffset, fills.byteOffset + fills.byteLength),
+        basinIds: labels.buffer.slice(labels.byteOffset, labels.byteOffset + labels.byteLength),
+        terrain: terrain.buffer.slice(terrain.byteOffset, terrain.byteOffset + terrain.byteLength)
+      } satisfies HydrologyWorkerRequest;
+    },
+    async (response) => {
+      if (response.type !== 'hydrology-measure-physical-basins-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+      const basinIds = new Uint32Array(response.basinIds);
+      const fillHeights = new Uint16Array(response.fillHeights);
+      const areaCells = new Uint32Array(response.areaCells);
+      const minTerrain = new Uint16Array(response.minTerrain);
+      const maxDepth = new Uint16Array(response.maxDepth);
+      const volumeCellHeight = new Float64Array(response.volumeCellHeight);
+      const minGlobalX = new Uint32Array(response.minGlobalX);
+      const minGlobalY = new Uint32Array(response.minGlobalY);
+      const maxGlobalX = new Uint32Array(response.maxGlobalX);
+      const maxGlobalY = new Uint32Array(response.maxGlobalY);
+      for (let i = 0; i < basinIds.length; i += 1) {
+        const basinId = basinIds[i];
+        let accumulator = stats.get(basinId);
+        if (!accumulator) {
+          accumulator = {
+            fillHeight: fillHeights[i], areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0,
+            minGlobalX: Number.POSITIVE_INFINITY, minGlobalY: Number.POSITIVE_INFINITY, maxGlobalX: 0, maxGlobalY: 0
+          };
+          stats.set(basinId, accumulator);
+        }
+        accumulator.areaCells += areaCells[i];
+        accumulator.minTerrain = Math.min(accumulator.minTerrain, minTerrain[i]);
+        accumulator.maxDepth = Math.max(accumulator.maxDepth, maxDepth[i]);
+        accumulator.volumeCellHeight += volumeCellHeight[i];
+        accumulator.minGlobalX = Math.min(accumulator.minGlobalX, minGlobalX[i]);
+        accumulator.minGlobalY = Math.min(accumulator.minGlobalY, minGlobalY[i]);
+        accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, maxGlobalX[i]);
+        accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, maxGlobalY[i]);
       }
-      const x = job.x * config.tileSize + i % config.tileSize;
-      const y = job.y * config.tileSize + Math.floor(i / config.tileSize);
-      const depth = Math.max(0, fills[i] - terrain[i]);
-      accumulator.areaCells += 1;
-      accumulator.minTerrain = Math.min(accumulator.minTerrain, terrain[i]);
-      accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
-      accumulator.volumeCellHeight += depth;
-      accumulator.minGlobalX = Math.min(accumulator.minGlobalX, x);
-      accumulator.minGlobalY = Math.min(accumulator.minGlobalY, y);
-      accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, x);
-      accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, y);
-    }
-  }
+      measured += 1;
+      onStatus?.(`Measuring physical basins ${measured} / ${jobs.length}`);
+    },
+    useWorkers
+  );
   return stats;
+}
+
+function measurePhysicalBasinsTile(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  fills: Uint16Array,
+  labels: Uint32Array,
+  terrain: Uint16Array
+): {
+  basinIds: Uint32Array;
+  fillHeights: Uint16Array;
+  areaCells: Uint32Array;
+  minTerrain: Uint16Array;
+  maxDepth: Uint16Array;
+  volumeCellHeight: Float64Array;
+  minGlobalX: Uint32Array;
+  minGlobalY: Uint32Array;
+  maxGlobalX: Uint32Array;
+  maxGlobalY: Uint32Array;
+} {
+  const stats = new Map<number, PhysicalBasinAccumulator>();
+  for (let i = 0; i < labels.length; i += 1) {
+    const id = labels[i];
+    if (id === 0) continue;
+    let accumulator = stats.get(id);
+    if (!accumulator) {
+      accumulator = {
+        fillHeight: fills[i], areaCells: 0, minTerrain: UINT16_MAX, maxDepth: 0, volumeCellHeight: 0,
+        minGlobalX: Number.POSITIVE_INFINITY, minGlobalY: Number.POSITIVE_INFINITY, maxGlobalX: 0, maxGlobalY: 0
+      };
+      stats.set(id, accumulator);
+    }
+    const x = tileX * tileSize + i % tileSize;
+    const y = tileY * tileSize + Math.floor(i / tileSize);
+    const depth = Math.max(0, fills[i] - terrain[i]);
+    accumulator.areaCells += 1;
+    accumulator.minTerrain = Math.min(accumulator.minTerrain, terrain[i]);
+    accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
+    accumulator.volumeCellHeight += depth;
+    accumulator.minGlobalX = Math.min(accumulator.minGlobalX, x);
+    accumulator.minGlobalY = Math.min(accumulator.minGlobalY, y);
+    accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, x);
+    accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, y);
+  }
+  const basinIds = Uint32Array.from(stats.keys());
+  const fillHeights = new Uint16Array(stats.size);
+  const areaCells = new Uint32Array(stats.size);
+  const minTerrain = new Uint16Array(stats.size);
+  const maxDepth = new Uint16Array(stats.size);
+  const volumeCellHeight = new Float64Array(stats.size);
+  const minGlobalX = new Uint32Array(stats.size);
+  const minGlobalY = new Uint32Array(stats.size);
+  const maxGlobalX = new Uint32Array(stats.size);
+  const maxGlobalY = new Uint32Array(stats.size);
+  let index = 0;
+  for (const accumulator of stats.values()) {
+    fillHeights[index] = accumulator.fillHeight;
+    areaCells[index] = accumulator.areaCells;
+    minTerrain[index] = accumulator.minTerrain;
+    maxDepth[index] = accumulator.maxDepth;
+    volumeCellHeight[index] = accumulator.volumeCellHeight;
+    minGlobalX[index] = accumulator.minGlobalX;
+    minGlobalY[index] = accumulator.minGlobalY;
+    maxGlobalX[index] = accumulator.maxGlobalX;
+    maxGlobalY[index] = accumulator.maxGlobalY;
+    index += 1;
+  }
+  return { basinIds, fillHeights, areaCells, minTerrain, maxDepth, volumeCellHeight, minGlobalX, minGlobalY, maxGlobalX, maxGlobalY };
 }
 
 function unionMatchingLakeCells(
@@ -694,11 +807,12 @@ function unionMatchingLakeCells(
   if (fillsA[cellA] !== 0 && fillsA[cellA] === fillsB[cellB]) components.union(labelsA[cellA], labelsB[cellB]);
 }
 
-function labelLocalLakeComponents(config: WorldConfig, tileX: number, tileY: number, fills: Uint16Array): Uint32Array {
-  const size = config.tileSize;
-  const fullSide = size * config.tilesPerSide;
+function labelLocalLakeComponents(tileSize: number, tilesPerSide: number, tileX: number, tileY: number, fills: Uint16Array): { labels: Uint32Array; componentIds: Uint32Array } {
+  const size = tileSize;
+  const fullSide = size * tilesPerSide;
   const labels = new Uint32Array(fills.length);
   const queue = new Uint32Array(fills.length);
+  const componentIds: number[] = [];
   for (let seed = 0; seed < fills.length; seed += 1) {
     if (fills[seed] === 0 || labels[seed] !== 0) continue;
     let head = 0;
@@ -726,8 +840,9 @@ function labelLocalLakeComponents(config: WorldConfig, tileX: number, tileY: num
       }
     }
     for (let i = 0; i < tail; i += 1) labels[queue[i]] = minimum;
+    componentIds.push(minimum);
   }
-  return labels;
+  return { labels, componentIds: Uint32Array.from(componentIds) };
 }
 
 async function buildGlobalConditionedReceivers(
@@ -1684,7 +1799,33 @@ type HydrologyReceiverMaterializeResponse = {
   receiverDirections: ArrayBuffer;
 };
 
-export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse | HydrologyReceiverMaterializeResponse | HydrologyFlowAnalyzeResponse | HydrologyFlowMaxResponse | HydrologyFlowMaterializeResponse;
+type HydrologyLakeComponentResponse = {
+  id: number;
+  type: 'hydrology-label-lake-components-result';
+  tileX: number;
+  tileY: number;
+  labels: ArrayBuffer;
+  componentIds: ArrayBuffer;
+};
+
+type HydrologyPhysicalBasinMeasurementResponse = {
+  id: number;
+  type: 'hydrology-measure-physical-basins-result';
+  tileX: number;
+  tileY: number;
+  basinIds: ArrayBuffer;
+  fillHeights: ArrayBuffer;
+  areaCells: ArrayBuffer;
+  minTerrain: ArrayBuffer;
+  maxDepth: ArrayBuffer;
+  volumeCellHeight: ArrayBuffer;
+  minGlobalX: ArrayBuffer;
+  minGlobalY: ArrayBuffer;
+  maxGlobalX: ArrayBuffer;
+  maxGlobalY: ArrayBuffer;
+};
+
+export type HydrologyWorkerResponse = HydrologyAnalyzeResponse | HydrologyMaterializeResponse | HydrologyReceiverMaterializeResponse | HydrologyLakeComponentResponse | HydrologyPhysicalBasinMeasurementResponse | HydrologyFlowAnalyzeResponse | HydrologyFlowMaxResponse | HydrologyFlowMaterializeResponse;
 
 export type HydrologyWorkerRequest =
   | {
@@ -1716,6 +1857,25 @@ export type HydrologyWorkerRequest =
       tileSize: number;
       tilesPerSide: number;
       receiverDirections: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-label-lake-components-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      tilesPerSide: number;
+      lakeFillHeights: ArrayBuffer;
+    }
+  | {
+      id: number;
+      type: 'hydrology-measure-physical-basins-tile';
+      tileX: number;
+      tileY: number;
+      tileSize: number;
+      lakeFillHeights: ArrayBuffer;
+      basinIds: ArrayBuffer;
+      terrain: ArrayBuffer;
     }
   | {
       id: number;
@@ -1789,6 +1949,55 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       baseFlows: result.baseFlows.buffer,
       transferFromCells: result.transferFromCells.buffer,
       transferToCells: result.transferToCells.buffer
+    };
+    return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
+  }
+
+  if (request.type === 'hydrology-label-lake-components-tile') {
+    const result = labelLocalLakeComponents(
+      request.tileSize,
+      request.tilesPerSide,
+      request.tileX,
+      request.tileY,
+      new Uint16Array(request.lakeFillHeights)
+    );
+    return {
+      response: {
+        id: request.id,
+        type: 'hydrology-label-lake-components-result',
+        tileX: request.tileX,
+        tileY: request.tileY,
+        labels: result.labels.buffer,
+        componentIds: result.componentIds.buffer
+      },
+      transfers: [result.labels.buffer, result.componentIds.buffer]
+    };
+  }
+
+  if (request.type === 'hydrology-measure-physical-basins-tile') {
+    const result = measurePhysicalBasinsTile(
+      request.tileX,
+      request.tileY,
+      request.tileSize,
+      new Uint16Array(request.lakeFillHeights),
+      new Uint32Array(request.basinIds),
+      new Uint16Array(request.terrain)
+    );
+    const response: HydrologyPhysicalBasinMeasurementResponse = {
+      id: request.id,
+      type: 'hydrology-measure-physical-basins-result',
+      tileX: request.tileX,
+      tileY: request.tileY,
+      basinIds: result.basinIds.buffer,
+      fillHeights: result.fillHeights.buffer,
+      areaCells: result.areaCells.buffer,
+      minTerrain: result.minTerrain.buffer,
+      maxDepth: result.maxDepth.buffer,
+      volumeCellHeight: result.volumeCellHeight.buffer,
+      minGlobalX: result.minGlobalX.buffer,
+      minGlobalY: result.minGlobalY.buffer,
+      maxGlobalX: result.maxGlobalX.buffer,
+      maxGlobalY: result.maxGlobalY.buffer
     };
     return { response, transfers: Object.values(response).filter((value): value is ArrayBuffer => value instanceof ArrayBuffer) };
   }
@@ -1944,6 +2153,8 @@ async function runHydrologyWorkerPool(
 function getHydrologyRequestTransfers(request: HydrologyWorkerRequest): Transferable[] {
   if (request.type === 'hydrology-analyze-tile') return [request.heights];
   if (request.type === 'hydrology-materialize-tile') return [request.heights, request.globalFillHeights];
+  if (request.type === 'hydrology-label-lake-components-tile') return [request.lakeFillHeights];
+  if (request.type === 'hydrology-measure-physical-basins-tile') return [request.lakeFillHeights, request.basinIds, request.terrain];
   if (request.type === 'hydrology-materialize-receivers-tile') return [request.surfaceHalo, request.distanceHalo];
   if (request.type === 'hydrology-flow-analyze-tile') return [request.receiverDirections];
   if (request.type === 'hydrology-flow-max-tile') return [request.receiverDirections, request.incomingCells, request.incomingFlows];
