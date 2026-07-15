@@ -147,6 +147,14 @@ describe('authoring document', () => {
       initialMomentum: { x: 0, z: 0 },
       finalMomentum: { x: 0, z: 0 }
     })]);
-    expect(document.hydrology.riverTrace).toEqual({ maxMomentum: 6 });
+    expect(document.hydrology.riverTrace).toEqual({ maxMomentum: 64 });
+  });
+
+  it('migrates only the legacy default river momentum', () => {
+    const legacy = normalizeAuthoringDocument({ hydrology: { version: 1, riverTrace: { maxMomentum: 6 } } }, 'world-a');
+    const customized = normalizeAuthoringDocument({ hydrology: { version: 1, riverTrace: { maxMomentum: 24 } } }, 'world-a');
+
+    expect(legacy.hydrology.riverTrace.maxMomentum).toBe(64);
+    expect(customized.hydrology.riverTrace.maxMomentum).toBe(24);
   });
 });

@@ -4,7 +4,7 @@ import type { WorldConfig } from '../heightmap/worldConfig';
 import type { HydrologySceneV1 } from './authoringDocument';
 import { LAKE_RING_SIMPLIFY_TOLERANCE_CELLS, RIVER_SIMPLIFY_TOLERANCE_CELLS, addRiverSourceAtWorld, addWaterFillAtWorld, simplifyLakeRing, simplifyRiverPolyline, smoothRiverLateralJitter } from './hydrologyAuthoring';
 
-const EMPTY: HydrologySceneV1 = { version: 1, riverTrace: { maxMomentum: 6 }, waterBodies: [], rivers: [] };
+const EMPTY: HydrologySceneV1 = { version: 1, riverTrace: { maxMomentum: 64 }, waterBodies: [], rivers: [] };
 
 describe('authored hydrology tools', () => {
   it('materializes only the connected clicked fill region and avoids duplicates', async () => {
@@ -57,7 +57,7 @@ describe('authored hydrology tools', () => {
     expect(result.river.segments[0]).toMatchObject({ termination: 'water-body', targetWaterBodyId: result.hydrology.waterBodies[0].id });
     expect(result.river.segments[0].points.at(-1)).toMatchObject({ heightR16: 7 });
     expect(result.river.segments[1]).toMatchObject({ termination: 'edge', sourceWaterBodyId: result.hydrology.waterBodies[0].id });
-    expect(Math.hypot(result.river.segments[1].initialMomentum.x, result.river.segments[1].initialMomentum.z)).toBeGreaterThan(0);
+    expect(Math.hypot(result.river.segments[1].initialMomentum.x, result.river.segments[1].initialMomentum.z)).toBeCloseTo(EMPTY.riverTrace.maxMomentum * 0.95);
     expect(result.river.segments[1].points.at(-1)).toMatchObject({ x: 2, z: 2, heightR16: 0 });
     for (const segment of result.river.segments) expect(Math.hypot(segment.finalMomentum.x, segment.finalMomentum.z)).toBeLessThanOrEqual(EMPTY.riverTrace.maxMomentum + 1e-9);
     expect(Math.hypot(result.river.segments[0].finalMomentum.x, result.river.segments[0].finalMomentum.z)).toBeGreaterThan(0);

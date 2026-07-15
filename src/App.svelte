@@ -1311,18 +1311,18 @@
       </div>
 
       <div class="authoring-inspector-scroll">
-        <label title="Maximum carried river momentum in map cells. Downhill acceleration approaches this value asymptotically.">
+        <label title="Maximum carried river momentum in map-cell units. Downhill acceleration approaches this value asymptotically.">
           <span>River max momentum</span>
           <NumericInput
             min="0.25"
-            max="32"
-            step="0.25"
+            max="256"
+            step="1"
             value={authoringDocument.hydrology.riverTrace.maxMomentum}
             onCommit={(value) => commitAuthoring({
               ...authoringDocument,
               hydrology: {
                 ...authoringDocument.hydrology,
-                riverTrace: { maxMomentum: Math.max(0.25, Math.min(32, value)) }
+                riverTrace: { maxMomentum: Math.max(0.25, Math.min(256, value)) }
               }
             }, { stale: false })}
           />

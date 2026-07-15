@@ -184,8 +184,9 @@ export interface AuthoringDocumentV1 {
 }
 
 export const DEFAULT_RIVER_TRACE_SETTINGS: RiverTraceSettingsV1 = {
-  maxMomentum: 6
+  maxMomentum: 64
 };
+const LEGACY_DEFAULT_RIVER_MAX_MOMENTUM = 6;
 
 const LAND_MODES = new Set<LandformModeV1>(['land', 'water', 'plateau']);
 
@@ -516,10 +517,13 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
 function normalizeHydrologyScene(value: unknown): HydrologySceneV1 {
   if (!isRecord(value) || value.version !== 1) return { version: 1, riverTrace: { ...DEFAULT_RIVER_TRACE_SETTINGS }, waterBodies: [], rivers: [] };
   const riverTrace = isRecord(value.riverTrace) ? value.riverTrace : {};
+  const storedMaxMomentum = finiteNumber(riverTrace.maxMomentum, DEFAULT_RIVER_TRACE_SETTINGS.maxMomentum);
   return {
     version: 1,
     riverTrace: {
-      maxMomentum: clamp(finiteNumber(riverTrace.maxMomentum, DEFAULT_RIVER_TRACE_SETTINGS.maxMomentum), 0.25, 32)
+      maxMomentum: storedMaxMomentum === LEGACY_DEFAULT_RIVER_MAX_MOMENTUM
+        ? DEFAULT_RIVER_TRACE_SETTINGS.maxMomentum
+        : clamp(storedMaxMomentum, 0.25, 256)
     },
     waterBodies: Array.isArray(value.waterBodies)
       ? value.waterBodies.map(normalizeWaterBody).filter((body): body is WaterBodyV1 => Boolean(body))

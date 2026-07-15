@@ -37,7 +37,7 @@ const MIN_TRACE_MOMENTUM = 0.01;
 const TRACE_VISIT_RESOLUTION_CELLS = RIVER_TRACE_STEP_CELLS / 4;
 const MAX_TRACE_TURN_RADIANS = Math.PI / 18;
 const SLOPE_RESPONSE_R16 = 256;
-const OUTLET_MOMENTUM_FRACTION = 0.6;
+const OUTLET_MOMENTUM_FRACTION = 0.95;
 // Remove sub-cell raster jitter while preserving bends that move the channel by a cell or more.
 export const RIVER_SIMPLIFY_TOLERANCE_CELLS = 0.6;
 export const LAKE_RING_SIMPLIFY_TOLERANCE_CELLS = 0.75;
