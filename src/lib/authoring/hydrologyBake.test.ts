@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { TileKey } from '../heightmap/tileKey';
 import type { WorldConfig } from '../heightmap/worldConfig';
-import { runHydrologyBasinBake } from './hydrologyBake';
+import { decodeDInfinityRecipients, runHydrologyBasinBake } from './hydrologyBake';
 
 function config(tileSize: number, tilesPerSide: number): WorldConfig {
   return {
@@ -86,12 +86,28 @@ describe('hydrology basin bake', () => {
     expectReceiverGraphIsAcyclic(4, result.receivers);
     expectAccumulationMatchesReceivers(4, result.receivers, result.flowAccumulation);
     expect([...result.flowStrength]).toEqual(encodeFlowStrength(result.flowAccumulation));
-    expect(result.summary.flowStrength).toBe('log1p-upstream-cell-count-r16');
-    expect(result.summary.flowAccumulation).toBe('upstream-cell-count-u32');
-    expect(result.summary.receiverDirections).toBe('conditioned-flat-resolved-d8-u8');
+    expect(result.summary.flowStrength).toBe('log1p-contributing-area-r16');
+    expect(result.summary.flowAccumulation).toBe('contributing-area-f32');
+    expect(result.summary.receiverDirections).toBe('conditioned-flat-resolved-d-infinity-u16');
     expect(result.summary.flowTileCount).toBe(4);
     expect(result.summary.maxFlowAccumulation).toBeGreaterThan(1);
     expect(result).not.toHaveProperty('generatedHydrology');
+  });
+
+  it('splits flow continuously between D-infinity neighbors', async () => {
+    const side = 5;
+    const samples = Array.from({ length: side * side }, (_, index) => {
+      const x = index % side;
+      const y = Math.floor(index / side);
+      return 100 - x * 2 - y;
+    });
+    const result = await bakeSmallMap(config(side, 1), samples);
+    const split = decodeDInfinityRecipients(result.receivers[2 * side + 2]);
+
+    expect(split).not.toBeNull();
+    expect(split?.weightA).toBeGreaterThan(0);
+    expect(split?.weightB).toBeGreaterThan(0);
+    expectAccumulationMatchesReceivers(side, result.receivers, result.flowAccumulation);
   });
 
   it('routes filled basins through persisted cross-tile spill topology', async () => {
@@ -164,9 +180,9 @@ describe('hydrology basin bake', () => {
 async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{
   lakeFill: Uint16Array;
   basinIds: Uint32Array;
-  receivers: Uint8Array;
+  receivers: Uint16Array;
   flowStrength: Uint16Array;
-  flowAccumulation: Uint32Array;
+  flowAccumulation: Float32Array;
   topology: { nodeCount: number; basinIds: Uint32Array; downstreamIds: Uint32Array; spillCells: Uint32Array; downstreamCells: Uint32Array };
   summary: Awaited<ReturnType<typeof runHydrologyBasinBake>>['summary'];
 }> {
@@ -175,9 +191,9 @@ async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{
   const drainageSurfaceTiles = new Map<string, Uint16Array>();
   const basinIdTiles = new Map<string, Uint32Array>();
   const flatDistanceTiles = new Map<string, Uint32Array>();
-  const receiverTiles = new Map<string, Uint8Array>();
+  const receiverTiles = new Map<string, Uint16Array>();
   const flowStrengthTiles = new Map<string, Uint16Array>();
-  const flowAccumulationTiles = new Map<string, Uint32Array>();
+  const flowAccumulationTiles = new Map<string, Float32Array>();
   let topology: { nodeCount: number; basinIds: Uint32Array; downstreamIds: Uint32Array; spillCells: Uint32Array; downstreamCells: Uint32Array } | undefined;
   const fullSide = config.tileSize * config.tilesPerSide;
   for (let ty = 0; ty < config.tilesPerSide; ty += 1) {
@@ -247,7 +263,7 @@ async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{
   return {
     lakeFill: stitch(config, lakeFillTiles),
     basinIds: stitchU32(config, basinIdTiles),
-    receivers: stitchU8(config, receiverTiles),
+    receivers: stitchU16(config, receiverTiles),
     flowStrength: stitch(config, flowStrengthTiles),
     flowAccumulation: stitchF32(config, flowAccumulationTiles),
     topology: topology ?? { nodeCount: 0, basinIds: new Uint32Array(), downstreamIds: new Uint32Array(), spillCells: new Uint32Array(), downstreamCells: new Uint32Array() },
@@ -255,19 +271,19 @@ async function bakeSmallMap(config: WorldConfig, samples: number[]): Promise<{
   };
 }
 
-function stitchU8(config: WorldConfig, tiles: Map<string, Uint8Array>): Uint8Array {
-  return stitchTyped(config, tiles, Uint8Array);
+function stitchU16(config: WorldConfig, tiles: Map<string, Uint16Array>): Uint16Array {
+  return stitchTyped(config, tiles, Uint16Array);
 }
 
 function stitchU32(config: WorldConfig, tiles: Map<string, Uint32Array>): Uint32Array {
   return stitchTyped(config, tiles, Uint32Array);
 }
 
-function stitchF32(config: WorldConfig, tiles: Map<string, Uint32Array>): Uint32Array {
-  return stitchTyped(config, tiles, Uint32Array);
+function stitchF32(config: WorldConfig, tiles: Map<string, Float32Array>): Float32Array {
+  return stitchTyped(config, tiles, Float32Array);
 }
 
-function stitchTyped<T extends Uint8Array | Uint32Array>(
+function stitchTyped<T extends Uint16Array | Uint32Array | Float32Array>(
   config: WorldConfig,
   tiles: Map<string, T>,
   Constructor: new (length: number) => T
@@ -356,45 +372,55 @@ function referenceLakeFill(width: number, height: number, input: number[]): numb
 const RECEIVER_DX = [0, 1, 0, 1, -1, 0, -1, 1, -1];
 const RECEIVER_DY = [0, 0, 1, 1, 0, -1, -1, -1, 1];
 
-function expectReceiverGraphIsAcyclic(width: number, receivers: Uint8Array): void {
-  for (let start = 0; start < receivers.length; start += 1) {
-    const seen = new Set<number>();
-    let cell = start;
-    for (let step = 0; step <= receivers.length; step += 1) {
-      expect(seen.has(cell), `receiver cycle starting at ${start}`).toBe(false);
-      seen.add(cell);
-      const code = receivers[cell];
-      expect(code).toBeLessThanOrEqual(8);
-      if (code === 0) break;
-      const x = cell % width;
-      const y = Math.floor(cell / width);
+function expectReceiverGraphIsAcyclic(width: number, receivers: Uint16Array): void {
+  const indegree = new Uint32Array(receivers.length);
+  const edges = Array.from({ length: receivers.length }, () => [] as number[]);
+  for (let source = 0; source < receivers.length; source += 1) {
+    const split = decodeDInfinityRecipients(receivers[source]);
+    if (!split) continue;
+    const x = source % width;
+    const y = Math.floor(source / width);
+    for (const [code, weight] of [[split.codeA, split.weightA], [split.codeB, split.weightB]] as const) {
+      if (weight <= 0) continue;
       const nx = x + RECEIVER_DX[code];
       const ny = y + RECEIVER_DY[code];
       expect(nx).toBeGreaterThanOrEqual(0);
       expect(ny).toBeGreaterThanOrEqual(0);
       expect(nx).toBeLessThan(width);
       expect(ny).toBeLessThan(width);
-      cell = ny * width + nx;
+      const target = ny * width + nx;
+      edges[source].push(target);
+      indegree[target] += 1;
     }
   }
+  const queue = [...indegree.keys()].filter((cell) => indegree[cell] === 0);
+  let visited = 0;
+  for (let head = 0; head < queue.length; head += 1) {
+    visited += 1;
+    for (const target of edges[queue[head]]) if (--indegree[target] === 0) queue.push(target);
+  }
+  expect(visited, 'D-infinity receiver graph must be acyclic').toBe(receivers.length);
 }
 
-function expectAccumulationMatchesReceivers(width: number, receivers: Uint8Array, accumulation: Uint32Array): void {
+function expectAccumulationMatchesReceivers(width: number, receivers: Uint16Array, accumulation: Float32Array): void {
   const expected = new Float64Array(receivers.length);
   expected.fill(1);
   for (let source = 0; source < receivers.length; source += 1) {
     const contribution = accumulation[source];
-    const code = receivers[source];
-    if (code === 0) continue;
+    const split = decodeDInfinityRecipients(receivers[source]);
+    if (!split) continue;
     const x = source % width;
     const y = Math.floor(source / width);
-    const target = (y + RECEIVER_DY[code]) * width + x + RECEIVER_DX[code];
-    expected[target] += contribution;
+    for (const [code, weight] of [[split.codeA, split.weightA], [split.codeB, split.weightB]] as const) {
+      if (weight <= 0) continue;
+      const target = (y + RECEIVER_DY[code]) * width + x + RECEIVER_DX[code];
+      expected[target] += contribution * weight;
+    }
   }
   for (let i = 0; i < expected.length; i += 1) expect(accumulation[i]).toBeCloseTo(expected[i], 5);
 }
 
-function encodeFlowStrength(accumulation: Uint32Array): number[] {
+function encodeFlowStrength(accumulation: Float32Array): number[] {
   const max = Math.max(...accumulation);
   const denominator = Math.log1p(Math.max(0, max - 1));
   return [...accumulation].map((flow) => {

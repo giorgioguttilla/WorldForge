@@ -2,7 +2,7 @@ import { R16HeightmapCodec } from './r16Codec';
 import { tilePath, type TileKey } from './tileKey';
 import { normalizeWorldConfig, type WorldConfig } from './worldConfig';
 import { normalizeAuthoringDocument, type AuthoringDocumentV1 } from '../authoring/authoringDocument';
-import type { HydrologyTopologyV1 } from '../authoring/hydrologyBake';
+import type { HydrologyTopologyV2 } from '../authoring/hydrologyBake';
 
 export interface TileMetricsSnapshot {
   cachedTiles: number;
@@ -118,7 +118,7 @@ export class HeightmapTileStore {
     await this.writeTypedTile(basinIdTilePath(key), samples, 'basin id');
   }
 
-  async writeReceiverDirectionTile(key: TileKey, samples: Uint8Array): Promise<void> {
+  async writeReceiverDirectionTile(key: TileKey, samples: Uint16Array): Promise<void> {
     await this.writeTypedTile(receiverDirectionTilePath(key), samples, 'receiver direction');
   }
 
@@ -126,11 +126,11 @@ export class HeightmapTileStore {
     await this.writeTypedTile(flatDistanceTilePath(key), samples, 'flat distance');
   }
 
-  async writeFlowAccumulationTile(key: TileKey, samples: Uint32Array): Promise<void> {
+  async writeFlowAccumulationTile(key: TileKey, samples: Float32Array): Promise<void> {
     await this.writeTypedTile(flowAccumulationTilePath(key), samples, 'flow accumulation');
   }
 
-  async writeHydrologyTopology(topology: HydrologyTopologyV1): Promise<void> {
+  async writeHydrologyTopology(topology: HydrologyTopologyV2): Promise<void> {
     await Promise.all([
       this.writeTypedTile('hydrology/basin-ids.u32', topology.basinIds, 'hydrology basin ids'),
       this.writeTypedTile('hydrology/fill-heights.u16', topology.fillHeights, 'hydrology fill heights'),
@@ -158,13 +158,13 @@ export class HeightmapTileStore {
     await writable.close();
   }
 
-  async readHydrologyTopology(): Promise<HydrologyTopologyV1 | null> {
+  async readHydrologyTopology(): Promise<HydrologyTopologyV2 | null> {
     const root = this.requireRoot();
     try {
       const file = await (await this.getFile(root, 'hydrology/topology.json')).getFile();
       const metadata = JSON.parse(await file.text()) as Record<string, unknown>;
       const length = Math.max(0, Math.trunc(Number(metadata.arrayLength)));
-      if (metadata.version !== 1 || length < 1) throw new Error('Invalid hydrology topology manifest.');
+      if (metadata.version !== 2 || metadata.receiverEncoding !== 'd-infinity-angle-u16-turn65528' || length < 1) return null;
       const [basinIds, fillHeights, downstreamIds, spillCells, downstreamCells] = await Promise.all([
         this.readOptionalBinaryTile('hydrology/basin-ids.u32', length * Uint32Array.BYTES_PER_ELEMENT),
         this.readOptionalBinaryTile('hydrology/fill-heights.u16', length * Uint16Array.BYTES_PER_ELEMENT),
@@ -174,11 +174,11 @@ export class HeightmapTileStore {
       ]);
       if (!basinIds || !fillHeights || !downstreamIds || !spillCells || !downstreamCells) throw new Error('Hydrology topology arrays are incomplete.');
       return {
-        version: 1,
+        version: 2,
         width: Number(metadata.width),
         height: Number(metadata.height),
         nodeCount: Number(metadata.nodeCount),
-        receiverEncoding: 'd8-clockwise-from-east-u8',
+        receiverEncoding: 'd-infinity-angle-u16-turn65528',
         basinIds: new Uint32Array(basinIds),
         fillHeights: new Uint16Array(fillHeights),
         downstreamIds: new Uint32Array(downstreamIds),
@@ -208,9 +208,9 @@ export class HeightmapTileStore {
     return buffer ? new Uint32Array(buffer) : null;
   }
 
-  async readReceiverDirectionTile(key: TileKey, tileSize: number): Promise<Uint8Array | null> {
-    const buffer = await this.readOptionalBinaryTile(receiverDirectionTilePath(key), tileSize * tileSize);
-    return buffer ? new Uint8Array(buffer) : null;
+  async readReceiverDirectionTile(key: TileKey, tileSize: number): Promise<Uint16Array | null> {
+    const buffer = await this.readOptionalBinaryTile(receiverDirectionTilePath(key), tileSize * tileSize * Uint16Array.BYTES_PER_ELEMENT);
+    return buffer ? new Uint16Array(buffer) : null;
   }
 
   async readFlatDistanceTile(key: TileKey, tileSize: number): Promise<Uint32Array | null> {
@@ -218,9 +218,9 @@ export class HeightmapTileStore {
     return buffer ? new Uint32Array(buffer) : null;
   }
 
-  async readFlowAccumulationTile(key: TileKey, tileSize: number): Promise<Uint32Array | null> {
-    const buffer = await this.readOptionalBinaryTile(flowAccumulationTilePath(key), tileSize * tileSize * Uint32Array.BYTES_PER_ELEMENT);
-    return buffer ? new Uint32Array(buffer) : null;
+  async readFlowAccumulationTile(key: TileKey, tileSize: number): Promise<Float32Array | null> {
+    const buffer = await this.readOptionalBinaryTile(flowAccumulationTilePath(key), tileSize * tileSize * Float32Array.BYTES_PER_ELEMENT);
+    return buffer ? new Float32Array(buffer) : null;
   }
 
   private async writeTypedTile(path: string, samples: ArrayBufferView, label: string): Promise<void> {
@@ -379,7 +379,7 @@ export function basinIdTilePath(key: TileKey, extension = 'u32'): string {
   return `masks/basin-ids/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }
 
-export function receiverDirectionTilePath(key: TileKey, extension = 'u8'): string {
+export function receiverDirectionTilePath(key: TileKey, extension = 'u16'): string {
   return `masks/receivers/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }
 
@@ -387,6 +387,6 @@ export function flatDistanceTilePath(key: TileKey, extension = 'u32'): string {
   return `hydrology/flat-distance/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }
 
-export function flowAccumulationTilePath(key: TileKey, extension = 'u32'): string {
+export function flowAccumulationTilePath(key: TileKey, extension = 'f32'): string {
   return `masks/flow-accumulation/d${key.d}/y${key.y}/x${key.x}.${extension}`;
 }

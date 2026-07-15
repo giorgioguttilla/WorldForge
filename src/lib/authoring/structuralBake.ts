@@ -16,7 +16,7 @@ import {
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
-import { runHydrologyBasinBake, type HydrologyProgress, type HydrologyTopologyV1 } from './hydrologyBake';
+import { runHydrologyBasinBake, type HydrologyProgress, type HydrologyTopologyV2 } from './hydrologyBake';
 
 export interface BakeProgress {
   phase: 'baking' | 'eroding' | 'hydrology' | 'building-lod';
@@ -38,12 +38,12 @@ export interface BakeTileIO {
   readBasinIdTile?(key: TileKey): Promise<Uint32Array | null>;
   writeFlatDistanceTile?(key: TileKey, samples: Uint32Array): Promise<void>;
   readFlatDistanceTile?(key: TileKey): Promise<Uint32Array | null>;
-  writeReceiverDirectionTile?(key: TileKey, samples: Uint8Array): Promise<void>;
-  readReceiverDirectionTile?(key: TileKey): Promise<Uint8Array | null>;
+  writeReceiverDirectionTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readReceiverDirectionTile?(key: TileKey): Promise<Uint16Array | null>;
   writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
-  writeFlowAccumulationTile?(key: TileKey, samples: Uint32Array): Promise<void>;
-  readFlowAccumulationTile?(key: TileKey): Promise<Uint32Array | null>;
-  writeHydrologyTopology?(topology: HydrologyTopologyV1): Promise<void>;
+  writeFlowAccumulationTile?(key: TileKey, samples: Float32Array): Promise<void>;
+  readFlowAccumulationTile?(key: TileKey): Promise<Float32Array | null>;
+  writeHydrologyTopology?(topology: HydrologyTopologyV2): Promise<void>;
 }
 
 export interface BakePassResult {

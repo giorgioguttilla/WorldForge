@@ -12,20 +12,20 @@ export interface HydrologyTileIO {
   readBasinIdTile?(key: TileKey): Promise<Uint32Array | null>;
   writeFlatDistanceTile?(key: TileKey, samples: Uint32Array): Promise<void>;
   readFlatDistanceTile?(key: TileKey): Promise<Uint32Array | null>;
-  writeReceiverDirectionTile?(key: TileKey, samples: Uint8Array): Promise<void>;
-  readReceiverDirectionTile?(key: TileKey): Promise<Uint8Array | null>;
+  writeReceiverDirectionTile?(key: TileKey, samples: Uint16Array): Promise<void>;
+  readReceiverDirectionTile?(key: TileKey): Promise<Uint16Array | null>;
   writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
-  writeFlowAccumulationTile?(key: TileKey, samples: Uint32Array): Promise<void>;
-  readFlowAccumulationTile?(key: TileKey): Promise<Uint32Array | null>;
-  writeHydrologyTopology?(topology: HydrologyTopologyV1): Promise<void>;
+  writeFlowAccumulationTile?(key: TileKey, samples: Float32Array): Promise<void>;
+  readFlowAccumulationTile?(key: TileKey): Promise<Float32Array | null>;
+  writeHydrologyTopology?(topology: HydrologyTopologyV2): Promise<void>;
 }
 
-export interface HydrologyTopologyV1 {
-  version: 1;
+export interface HydrologyTopologyV2 {
+  version: 2;
   width: number;
   height: number;
   nodeCount: number;
-  receiverEncoding: 'd8-clockwise-from-east-u8';
+  receiverEncoding: 'd-infinity-angle-u16-turn65528';
   /** Compact parallel arrays; basinIds maps each array slot to its durable physical basin ID. */
   basinIds: Uint32Array;
   fillHeights: Uint16Array;
@@ -307,17 +307,17 @@ export async function runHydrologyBasinBake(
     useWorkers
   );
 
-  let solverTopology: HydrologyTopologyV1 | null = null;
+  let solverTopology: HydrologyTopologyV2 | null = null;
   if (!usePhysicalTopology && outletCells && solverDownstreamCells) {
     const downstreamIds = new Uint32Array(graph.nodeCount);
     downstreamIds.fill(NO_FLOW_TARGET);
     for (let id = 1; id < graph.nodeCount; id += 1) downstreamIds[id] = graphSolution.parentNode[id];
     solverTopology = {
-      version: 1,
+      version: 2,
       width: config.tileSize * config.tilesPerSide,
       height: config.tileSize * config.tilesPerSide,
       nodeCount: graph.nodeCount,
-      receiverEncoding: 'd8-clockwise-from-east-u8',
+      receiverEncoding: 'd-infinity-angle-u16-turn65528',
       basinIds: Uint32Array.from({ length: graph.nodeCount }, (_, id) => id),
       fillHeights: globalFillHeights,
       downstreamIds,
@@ -343,7 +343,7 @@ export async function runHydrologyBasinBake(
   }
   const topology = usePhysicalTopology
     ? await buildPhysicalHydrologyTopology(config, io, jobs, physicalBasinStats)
-    : solverTopology as HydrologyTopologyV1;
+    : solverTopology as HydrologyTopologyV2;
   await io.writeHydrologyTopology?.(topology);
 
   const flowResult = await runFlowStrengthBake(config, io, jobs, useWorkers, completed, total, onProgress);
@@ -372,10 +372,10 @@ export async function runHydrologyBasinBake(
       volumeCellHeight,
       lakeFillHeight: 'closed-basin-fill-height-r16',
       basinIds: 'physical-filled-basin-id-u32',
-      receiverDirections: 'conditioned-flat-resolved-d8-u8',
-      topology: 'physical-basin-topology-v1',
-      flowStrength: flowResult.enabled ? 'log1p-upstream-cell-count-r16' : undefined,
-      flowAccumulation: flowResult.enabled ? 'upstream-cell-count-u32' : undefined,
+      receiverDirections: 'conditioned-flat-resolved-d-infinity-u16',
+      topology: 'physical-basin-topology-v2',
+      flowStrength: flowResult.enabled ? 'log1p-contributing-area-r16' : undefined,
+      flowAccumulation: flowResult.enabled ? 'contributing-area-f32' : undefined,
       maxFlowAccumulation: flowResult.enabled ? flowResult.maxFlowAccumulation : undefined,
       flowTileCount: flowResult.enabled ? jobs.length : undefined,
       basins,
@@ -560,6 +560,11 @@ export function materializeHydrologyTile(
 
 const D8_DX = new Int8Array([0, 1, 0, 1, -1, 0, -1, 1, -1]);
 const D8_DY = new Int8Array([0, 0, 1, 1, 0, -1, -1, -1, 1]);
+const DINF_NO_FLOW = 0xffff;
+const DINF_TURN_STEPS = 65528;
+const DINF_SECTOR_STEPS = DINF_TURN_STEPS / 8;
+const DINF_CODES = new Uint8Array([1, 3, 2, 8, 4, 6, 5, 7]);
+const TWO_PI = Math.PI * 2;
 
 interface PhysicalBasinAccumulator extends BasinAccumulator {
   fillHeight: number;
@@ -902,7 +907,7 @@ async function buildGlobalConditionedReceivers(
       if (response.type !== 'hydrology-materialize-receivers-result') throw new Error(`Unexpected hydrology response ${response.type}`);
       await io.writeReceiverDirectionTile?.(
         { x: response.tileX, y: response.tileY, d: 0 },
-        new Uint8Array(response.receiverDirections)
+        new Uint16Array(response.receiverDirections)
       );
       receiversWritten += 1;
       onStatus?.(`Writing seamless receivers ${receiversWritten} / ${jobs.length}`);
@@ -916,7 +921,7 @@ async function buildPhysicalHydrologyTopology(
   io: HydrologyTileIO,
   jobs: TileJob[],
   stats: Map<number, PhysicalBasinAccumulator>
-): Promise<HydrologyTopologyV1> {
+): Promise<HydrologyTopologyV2> {
   const ids = Uint32Array.from([...stats.keys()].sort((a, b) => a - b));
   const idToIndex = new Map<number, number>();
   for (let i = 0; i < ids.length; i += 1) idToIndex.set(ids[i], i);
@@ -929,11 +934,11 @@ async function buildPhysicalHydrologyTopology(
   for (let i = 0; i < ids.length; i += 1) fillHeights[i] = stats.get(ids[i])?.fillHeight ?? 0;
   if (!io.readBasinIdTile || !io.readReceiverDirectionTile) {
     return {
-      version: 1,
+      version: 2,
       width: config.tileSize * config.tilesPerSide,
       height: config.tileSize * config.tilesPerSide,
       nodeCount: ids.length,
-      receiverEncoding: 'd8-clockwise-from-east-u8',
+      receiverEncoding: 'd-infinity-angle-u16-turn65528',
       basinIds: ids,
       fillHeights,
       downstreamIds,
@@ -942,7 +947,7 @@ async function buildPhysicalHydrologyTopology(
     };
   }
   const basinCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
-  const receiverCache = new HydrologyTileCache<Uint8Array>(12, (x, y) => requireHydrologyTile(io.readReceiverDirectionTile?.({ x, y, d: 0 }), 'receiver', x, y));
+  const receiverCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => requireHydrologyTile(io.readReceiverDirectionTile?.({ x, y, d: 0 }), 'receiver', x, y));
   const fullSide = config.tileSize * config.tilesPerSide;
   for (const job of jobs) {
     const [basins, receivers, basinHalo] = await Promise.all([
@@ -955,8 +960,8 @@ async function buildPhysicalHydrologyTopology(
     for (let cell = 0; cell < basins.length; cell += 1) {
       const basinId = basins[cell];
       if (basinId === 0) continue;
-      const code = receivers[cell];
-      if (code < 1 || code > 8) continue;
+      const code = dominantDInfinityCode(receivers[cell]);
+      if (code === 0) continue;
       const x = cell % size;
       const y = Math.floor(cell / size);
       const downstreamId = basinHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
@@ -973,11 +978,11 @@ async function buildPhysicalHydrologyTopology(
     }
   }
   return {
-    version: 1,
+    version: 2,
     width: fullSide,
     height: fullSide,
     nodeCount: ids.length,
-    receiverEncoding: 'd8-clockwise-from-east-u8',
+    receiverEncoding: 'd-infinity-angle-u16-turn65528',
     basinIds: ids,
     fillHeights,
     downstreamIds,
@@ -1164,57 +1169,106 @@ function materializeGlobalReceivers(
   tileY: number,
   surfaceHalo: Uint16Array,
   distanceHalo: Uint32Array
-): Uint8Array {
+): Uint16Array {
   const size = tileSize;
   const stride = size + 2;
   const fullSide = size * tilesPerSide;
-  const output = new Uint8Array(size * size);
+  const output = new Uint16Array(size * size);
+  output.fill(DINF_NO_FLOW);
+  const worldCellCount = fullSide * fullSide;
+  const flatEpsilon = 0.25 / (worldCellCount + 1);
+  const potentialAt = (hx: number, hy: number): number => {
+    const index = hy * stride + hx;
+    const distance = distanceHalo[index];
+    return surfaceHalo[index] + (distance === NO_FLOW_TARGET ? 0 : distance * flatEpsilon);
+  };
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       const gx = tileX * size + x;
       const gy = tileY * size + y;
       if (gx === 0 || gy === 0 || gx === fullSide - 1 || gy === fullSide - 1) continue;
-      const currentHeight = surfaceHalo[(y + 1) * stride + x + 1];
-      const currentDistance = distanceHalo[(y + 1) * stride + x + 1];
-      const rotation = hashCell(gx, gy) & 7;
-      let bestCode = 0;
-      let bestScore = -1;
-      for (let offset = 0; offset < 8; offset += 1) {
-        const code = 1 + ((offset + rotation) & 7);
-        const neighborHeight = surfaceHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
-        if (neighborHeight >= currentHeight) continue;
-        const score = (currentHeight - neighborHeight) * (D8_DX[code] !== 0 && D8_DY[code] !== 0 ? 707 : 1000);
-        if (score > bestScore) {
-          bestScore = score;
-          bestCode = code;
+      const hx = x + 1;
+      const hy = y + 1;
+      const current = potentialAt(hx, hy);
+      let bestSlope = 0;
+      let bestAngle = -1;
+      for (let facet = 0; facet < 8; facet += 1) {
+        const codeA = DINF_CODES[facet];
+        const codeB = DINF_CODES[(facet + 1) & 7];
+        const ax = D8_DX[codeA];
+        const ay = D8_DY[codeA];
+        const bx = D8_DX[codeB];
+        const by = D8_DY[codeB];
+        const za = potentialAt(hx + ax, hy + ay);
+        const zb = potentialAt(hx + bx, hy + by);
+        const determinant = ax * by - bx * ay;
+        const da = za - current;
+        const db = zb - current;
+        const gradientX = (da * by - db * ay) / determinant;
+        const gradientY = (ax * db - bx * da) / determinant;
+        const downX = -gradientX;
+        const downY = -gradientY;
+        const planeSlope = Math.hypot(downX, downY);
+        const startAngle = facet * Math.PI / 4;
+        const planeAngle = normalizeAngle(Math.atan2(downY, downX));
+        const relative = normalizeAngle(planeAngle - startAngle);
+        const insideFacet = planeSlope > 0 && relative <= Math.PI / 4 + 1e-12;
+        if (insideFacet) {
+          const fractionB = Math.min(1, Math.max(0, relative / (Math.PI / 4)));
+          const usesA = fractionB < 1 - 1e-12;
+          const usesB = fractionB > 1e-12;
+          if ((!usesA || za < current) && (!usesB || zb < current) && planeSlope > bestSlope) {
+            bestSlope = planeSlope;
+            bestAngle = planeAngle;
+          }
+        }
+        const slopeA = (current - za) / Math.hypot(ax, ay);
+        if (slopeA > bestSlope) {
+          bestSlope = slopeA;
+          bestAngle = startAngle;
+        }
+        const slopeB = (current - zb) / Math.hypot(bx, by);
+        if (slopeB > bestSlope) {
+          bestSlope = slopeB;
+          bestAngle = normalizeAngle(startAngle + Math.PI / 4);
         }
       }
-      if (bestCode !== 0) {
-        output[y * size + x] = bestCode;
-        continue;
-      }
-      let bestDistance = currentDistance;
-      for (let offset = 0; offset < 8; offset += 1) {
-        const code = 1 + ((offset + rotation) & 7);
-        const hx = x + 1 + D8_DX[code];
-        const hy = y + 1 + D8_DY[code];
-        if (surfaceHalo[hy * stride + hx] !== currentHeight) continue;
-        const neighborDistance = distanceHalo[hy * stride + hx];
-        if (neighborDistance < bestDistance) {
-          bestDistance = neighborDistance;
-          bestCode = code;
-        }
-      }
-      output[y * size + x] = bestCode;
+      if (bestAngle >= 0) output[y * size + x] = encodeDInfinityAngle(bestAngle);
     }
   }
   return output;
 }
 
-function hashCell(x: number, y: number): number {
-  let value = Math.imul(x ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(y ^ 0xc2b2ae35, 0x27d4eb2f);
-  value ^= value >>> 16;
-  return value >>> 0;
+function normalizeAngle(angle: number): number {
+  const normalized = angle % TWO_PI;
+  return normalized < 0 ? normalized + TWO_PI : normalized;
+}
+
+export function encodeDInfinityAngle(angle: number): number {
+  return Math.round(normalizeAngle(angle) / TWO_PI * DINF_TURN_STEPS) % DINF_TURN_STEPS;
+}
+
+export function decodeDInfinityAngle(encoded: number): number | null {
+  return encoded >= DINF_TURN_STEPS ? null : encoded / DINF_TURN_STEPS * TWO_PI;
+}
+
+export function decodeDInfinityRecipients(encoded: number): { codeA: number; codeB: number; weightA: number; weightB: number } | null {
+  if (encoded >= DINF_TURN_STEPS) return null;
+  const sector = Math.floor(encoded / DINF_SECTOR_STEPS) & 7;
+  const remainder = encoded - sector * DINF_SECTOR_STEPS;
+  const weightB = remainder / DINF_SECTOR_STEPS;
+  return {
+    codeA: DINF_CODES[sector],
+    codeB: DINF_CODES[(sector + 1) & 7],
+    weightA: 1 - weightB,
+    weightB
+  };
+}
+
+function dominantDInfinityCode(encoded: number): number {
+  const recipients = decodeDInfinityRecipients(encoded);
+  if (!recipients) return 0;
+  return recipients.weightB > recipients.weightA ? recipients.codeB : recipients.codeA;
 }
 
 async function convergeFlatTileQueue(
@@ -1547,7 +1601,21 @@ async function runFlowStrengthBake(
   }
 
   let completed = completedStart;
-  const analyses = new Array<FlowTileAnalysisResult>(jobs.length);
+  const borderCellCount = Math.max(1, config.tileSize * 4 - 4);
+  const incomingTotals = Array.from({ length: jobs.length }, () => new Float64Array(borderCellCount));
+  const pending = Array.from({ length: jobs.length }, () => new Float64Array(borderCellCount));
+  const receiverCache = new HydrologyTileCache<Uint16Array>(Math.min(16, jobs.length), (x, y) => (
+    requireReceiverDirections(io, { x, y, d: 0 })
+  ));
+  let activeTiles = new Set<number>();
+  const deliver = (targetCell: number, flow: number): void => {
+    if (!(flow > 0) || !Number.isFinite(flow)) return;
+    const target = locateBoundaryCell(config, targetCell);
+    const index = tileIndex(config, target.tileX, target.tileY);
+    incomingTotals[index][target.borderOffset] += flow;
+    pending[index][target.borderOffset] += flow;
+    activeTiles.add(index);
+  };
   await runHydrologyWorkerPool(
     jobs,
     async (job, id) => ({
@@ -1557,28 +1625,60 @@ async function runFlowStrengthBake(
       tileY: job.y,
       tileSize: config.tileSize,
       tilesPerSide: config.tilesPerSide,
-      receiverDirections: (await requireReceiverDirections(io, { x: job.x, y: job.y, d: 0 })).buffer
+      receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
+      incomingCells: new Uint32Array(0).buffer,
+      incomingFlows: new Float64Array(0).buffer,
+      includeBase: true
     }),
     async (response) => {
       if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
-      analyses[tileIndex(config, response.tileX, response.tileY)] = {
-        tileX: response.tileX,
-        tileY: response.tileY,
-        baseTargetCells: new Uint32Array(response.baseTargetCells),
-        baseFlows: new Float64Array(response.baseFlows),
-        transferFromCells: new Uint32Array(response.transferFromCells),
-        transferToCells: new Uint32Array(response.transferToCells)
-      };
+      const targets = new Uint32Array(response.baseTargetCells);
+      const flows = new Float64Array(response.baseFlows);
+      for (let i = 0; i < targets.length; i += 1) deliver(targets[i], flows[i]);
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Analyzing flow ${completed - config.tilesPerSide * config.tilesPerSide * 2 - 1} / ${jobs.length}` });
     },
     useWorkers
   );
 
-  const incomingByCell = solveFlowPortGraph(analyses);
-  analyses.length = 0;
-  const incomingByTile = groupIncomingByTile(config, incomingByCell);
-  incomingByCell.clear();
+  let propagationRound = 0;
+  const fullSide = config.tileSize * config.tilesPerSide;
+  const maxPropagationRounds = fullSide * fullSide;
+  while (activeTiles.size > 0) {
+    propagationRound += 1;
+    if (propagationRound > maxPropagationRounds) throw new Error('Cross-tile D-infinity flow propagation did not converge.');
+    const roundTiles = [...activeTiles].sort((a, b) => a - b);
+    activeTiles = new Set<number>();
+    const roundInputs = new Map<number, { cells: Uint32Array; flows: Float64Array }>();
+    for (const index of roundTiles) roundInputs.set(index, consumeBoundaryFlows(config.tileSize, pending[index]));
+    onProgress?.({ phase: 'hydrology', current: completed, total, label: `Resolving cross-tile flow (wave ${propagationRound}, ${roundTiles.length} tiles)` });
+    await runHydrologyWorkerPool(
+      roundTiles.map((index) => ({ x: index % config.tilesPerSide, y: Math.floor(index / config.tilesPerSide) })),
+      async (job, id) => {
+        const input = roundInputs.get(tileIndex(config, job.x, job.y));
+        if (!input) throw new Error('Missing cross-tile flow wave input.');
+        return {
+          id,
+          type: 'hydrology-flow-analyze-tile',
+          tileX: job.x,
+          tileY: job.y,
+          tileSize: config.tileSize,
+          tilesPerSide: config.tilesPerSide,
+          receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
+          incomingCells: input.cells.buffer,
+          incomingFlows: input.flows.buffer,
+          includeBase: false
+        };
+      },
+      async (response) => {
+        if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+        const targets = new Uint32Array(response.baseTargetCells);
+        const flows = new Float64Array(response.baseFlows);
+        for (let i = 0; i < targets.length; i += 1) deliver(targets[i], flows[i]);
+      },
+      useWorkers
+    );
+  }
   completed += 1;
   onProgress?.({ phase: 'hydrology', current: completed, total, label: 'Resolving cross-tile flow' });
 
@@ -1586,7 +1686,7 @@ async function runFlowStrengthBake(
   await runHydrologyWorkerPool(
     jobs,
     async (job, id) => {
-      const incoming = incomingByTile[tileIndex(config, job.x, job.y)];
+      const incoming = boundaryFlowsToArrays(config.tileSize, incomingTotals[tileIndex(config, job.x, job.y)]);
       return {
         id,
         type: 'hydrology-flow-max-tile',
@@ -1594,9 +1694,9 @@ async function runFlowStrengthBake(
         tileY: job.y,
         tileSize: config.tileSize,
         tilesPerSide: config.tilesPerSide,
-        receiverDirections: (await requireReceiverDirections(io, { x: job.x, y: job.y, d: 0 })).buffer,
-        incomingCells: new Uint32Array(incoming.cells).buffer,
-        incomingFlows: new Float64Array(incoming.flows).buffer
+        receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
+        incomingCells: incoming.cells.buffer,
+        incomingFlows: incoming.flows.buffer
       };
     },
     async (response) => {
@@ -1604,7 +1704,7 @@ async function runFlowStrengthBake(
       maxFlowAccumulation = Math.max(maxFlowAccumulation, response.maxFlowAccumulation);
       await io.writeFlowAccumulationTile?.(
         { x: response.tileX, y: response.tileY, d: 0 },
-        new Uint32Array(response.flowAccumulation)
+        new Float32Array(response.flowAccumulation)
       );
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Measuring flow ${completed - config.tilesPerSide * config.tilesPerSide * 3 - 2} / ${jobs.length}` });
@@ -1636,41 +1736,86 @@ async function runFlowStrengthBake(
   return { enabled: true, maxFlowAccumulation, completed };
 }
 
-async function requireReceiverDirections(io: HydrologyTileIO, key: TileKey): Promise<Uint8Array> {
+function locateBoundaryCell(config: WorldConfig, globalCell: number): { tileX: number; tileY: number; borderOffset: number } {
+  const fullSide = config.tileSize * config.tilesPerSide;
+  const globalX = globalCell % fullSide;
+  const globalY = Math.floor(globalCell / fullSide);
+  const tileX = Math.floor(globalX / config.tileSize);
+  const tileY = Math.floor(globalY / config.tileSize);
+  const localX = globalX - tileX * config.tileSize;
+  const localY = globalY - tileY * config.tileSize;
+  const size = config.tileSize;
+  if (size === 1) return { tileX, tileY, borderOffset: 0 };
+  let borderOffset: number;
+  if (localY === 0) borderOffset = localX;
+  else if (localX === size - 1) borderOffset = size + localY - 1;
+  else if (localY === size - 1) borderOffset = 3 * size - 3 - localX;
+  else if (localX === 0) borderOffset = 4 * size - 4 - localY;
+  else throw new Error(`Cross-tile flow targeted non-boundary cell ${globalCell}.`);
+  return { tileX, tileY, borderOffset };
+}
+
+function localCellForBorderOffset(tileSize: number, offset: number): number {
+  if (tileSize === 1) return 0;
+  if (offset < tileSize) return offset;
+  if (offset < 2 * tileSize - 1) return (offset - tileSize + 1) * tileSize + tileSize - 1;
+  if (offset < 3 * tileSize - 2) return (tileSize - 1) * tileSize + (3 * tileSize - 3 - offset);
+  return (4 * tileSize - 4 - offset) * tileSize;
+}
+
+function boundaryFlowsToArrays(tileSize: number, boundary: Float64Array): { cells: Uint32Array; flows: Float64Array } {
+  let count = 0;
+  for (let i = 0; i < boundary.length; i += 1) if (boundary[i] !== 0) count += 1;
+  const cells = new Uint32Array(count);
+  const flows = new Float64Array(count);
+  let cursor = 0;
+  for (let i = 0; i < boundary.length; i += 1) {
+    if (boundary[i] === 0) continue;
+    cells[cursor] = localCellForBorderOffset(tileSize, i);
+    flows[cursor] = boundary[i];
+    cursor += 1;
+  }
+  return { cells, flows };
+}
+
+function consumeBoundaryFlows(tileSize: number, boundary: Float64Array): { cells: Uint32Array; flows: Float64Array } {
+  const result = boundaryFlowsToArrays(tileSize, boundary);
+  boundary.fill(0);
+  return result;
+}
+
+async function requireReceiverDirections(io: HydrologyTileIO, key: TileKey): Promise<Uint16Array> {
   const directions = await io.readReceiverDirectionTile?.(key);
   if (!directions) throw new Error(`Missing conditioned receiver tile d${key.d}/y${key.y}/x${key.x}.`);
   return directions;
 }
 
-async function requireFlowAccumulation(io: HydrologyTileIO, key: TileKey): Promise<Uint32Array> {
+async function requireFlowAccumulation(io: HydrologyTileIO, key: TileKey): Promise<Float32Array> {
   const accumulation = await io.readFlowAccumulationTile?.(key);
   if (!accumulation) throw new Error(`Missing flow accumulation tile d${key.d}/y${key.y}/x${key.x}.`);
   return accumulation;
 }
 
-export function analyzeFlowTile(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint8Array): FlowTileAnalysisResult {
+export function analyzeFlowTile(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  tilesPerSide: number,
+  receiverDirections: Uint16Array,
+  incomingCells?: Uint32Array,
+  incomingFlows?: Float64Array,
+  includeBase = true
+): FlowTileAnalysisResult {
   const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, receiverDirections);
-  const accumulation = accumulateLocalFlow(routing, undefined);
+  const incoming = incomingCells && incomingFlows ? incomingFromArrays(tileSize, incomingCells, incomingFlows) : undefined;
+  const accumulation = accumulateLocalFlow(routing, incoming, includeBase);
   const baseMap = new Map<number, number>();
-  for (let i = 0; i < routing.outboundTargets.length; i += 1) {
-    const target = routing.outboundTargets[i];
-    if (target !== NO_FLOW_TARGET) baseMap.set(target, (baseMap.get(target) ?? 0) + accumulation.values[i]);
-  }
-
-  const destination = computeLocalFlowDestinations(routing);
-  const borderCells = collectTileBorderCells(tileSize);
-  const transferFrom: number[] = [];
-  const transferTo: number[] = [];
-  const fullSide = tileSize * tilesPerSide;
-  const originX = tileX * tileSize;
-  const originY = tileY * tileSize;
-  for (const localIndex of borderCells) {
-    const to = destination[localIndex];
-    if (to === NO_FLOW_TARGET) continue;
-    const x = localIndex % tileSize;
-    const y = Math.floor(localIndex / tileSize);
-    transferFrom.push((originY + y) * fullSide + originX + x);
-    transferTo.push(to);
+  for (let i = 0; i < routing.outboundTargetsA.length; i += 1) {
+    const flow = accumulation.values[i];
+    const targetA = routing.outboundTargetsA[i];
+    const targetB = routing.outboundTargetsB[i];
+    if (targetA !== NO_FLOW_TARGET) baseMap.set(targetA, (baseMap.get(targetA) ?? 0) + flow * routing.weightsA[i]);
+    if (targetB !== NO_FLOW_TARGET) baseMap.set(targetB, (baseMap.get(targetB) ?? 0) + flow * routing.weightsB[i]);
   }
 
   return {
@@ -1678,8 +1823,8 @@ export function analyzeFlowTile(tileX: number, tileY: number, tileSize: number, 
     tileY,
     baseTargetCells: Uint32Array.from(baseMap.keys()),
     baseFlows: Float64Array.from(baseMap.values()),
-    transferFromCells: Uint32Array.from(transferFrom),
-    transferToCells: Uint32Array.from(transferTo)
+    transferFromCells: new Uint32Array(0),
+    transferToCells: new Uint32Array(0)
   };
 }
 
@@ -1688,7 +1833,7 @@ export function computeFlowTileMax(
   tileY: number,
   tileSize: number,
   tilesPerSide: number,
-  receiverDirections: Uint8Array,
+  receiverDirections: Uint16Array,
   incomingCells: Uint32Array,
   incomingFlows: Float64Array
 ): FlowTileMaxResult {
@@ -1698,14 +1843,14 @@ export function computeFlowTileMax(
     tileX,
     tileY,
     maxFlowAccumulation: accumulation.max,
-    flowAccumulation: Uint32Array.from(accumulation.values, (value) => Math.min(NO_FLOW_TARGET, Math.round(value))).buffer
+    flowAccumulation: Float32Array.from(accumulation.values).buffer
   };
 }
 
 export function materializeFlowTile(
   tileX: number,
   tileY: number,
-  accumulation: Uint32Array,
+  accumulation: Float32Array,
   maxFlowAccumulation: number
 ): MaterializeFlowResult {
   const output = new Uint16Array(accumulation.length);
@@ -1857,6 +2002,9 @@ export type HydrologyWorkerRequest =
       tileSize: number;
       tilesPerSide: number;
       receiverDirections: ArrayBuffer;
+      incomingCells: ArrayBuffer;
+      incomingFlows: ArrayBuffer;
+      includeBase: boolean;
     }
   | {
       id: number;
@@ -1938,7 +2086,10 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint8Array(request.receiverDirections)
+      new Uint16Array(request.receiverDirections),
+      new Uint32Array(request.incomingCells),
+      new Float64Array(request.incomingFlows),
+      request.includeBase
     );
     const response: HydrologyFlowAnalyzeResponse = {
       id: request.id,
@@ -2029,7 +2180,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint8Array(request.receiverDirections),
+      new Uint16Array(request.receiverDirections),
       new Uint32Array(request.incomingCells),
       new Float64Array(request.incomingFlows)
     );
@@ -2050,7 +2201,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     const result = materializeFlowTile(
       request.tileX,
       request.tileY,
-      new Uint32Array(request.flowAccumulation),
+      new Float32Array(request.flowAccumulation),
       request.maxFlowAccumulation
     );
     const response: HydrologyFlowMaterializeResponse = {
@@ -2156,25 +2307,35 @@ function getHydrologyRequestTransfers(request: HydrologyWorkerRequest): Transfer
   if (request.type === 'hydrology-label-lake-components-tile') return [request.lakeFillHeights];
   if (request.type === 'hydrology-measure-physical-basins-tile') return [request.lakeFillHeights, request.basinIds, request.terrain];
   if (request.type === 'hydrology-materialize-receivers-tile') return [request.surfaceHalo, request.distanceHalo];
-  if (request.type === 'hydrology-flow-analyze-tile') return [request.receiverDirections];
+  if (request.type === 'hydrology-flow-analyze-tile') return [request.receiverDirections, request.incomingCells, request.incomingFlows];
   if (request.type === 'hydrology-flow-max-tile') return [request.receiverDirections, request.incomingCells, request.incomingFlows];
   return [request.flowAccumulation];
 }
 
 interface FlowRouting {
-  receivers: Int32Array;
-  outboundTargets: Uint32Array;
+  receiversA: Int32Array;
+  receiversB: Int32Array;
+  weightsA: Float64Array;
+  weightsB: Float64Array;
+  outboundTargetsA: Uint32Array;
+  outboundTargetsB: Uint32Array;
   indegree: Uint32Array;
   order: Uint32Array;
 }
 
-function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint8Array): FlowRouting {
+function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint16Array): FlowRouting {
   const sampleCount = tileSize * tileSize;
-  const receivers = new Int32Array(sampleCount);
-  const outboundTargets = new Uint32Array(sampleCount);
+  const receiversA = new Int32Array(sampleCount);
+  const receiversB = new Int32Array(sampleCount);
+  const weightsA = new Float64Array(sampleCount);
+  const weightsB = new Float64Array(sampleCount);
+  const outboundTargetsA = new Uint32Array(sampleCount);
+  const outboundTargetsB = new Uint32Array(sampleCount);
   const indegree = new Uint32Array(sampleCount);
-  receivers.fill(-1);
-  outboundTargets.fill(NO_FLOW_TARGET);
+  receiversA.fill(-1);
+  receiversB.fill(-1);
+  outboundTargetsA.fill(NO_FLOW_TARGET);
+  outboundTargetsB.fill(NO_FLOW_TARGET);
   const fullSide = tileSize * tilesPerSide;
   const originX = tileX * tileSize;
   const originY = tileY * tileSize;
@@ -2184,33 +2345,42 @@ function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesP
       const index = y * tileSize + x;
       const currentGlobalX = originX + x;
       const currentGlobalY = originY + y;
-      const code = receiverDirections[index] ?? 0;
-      if (code < 1 || code > 8) continue;
-      const dx = D8_DX[code];
-      const dy = D8_DY[code];
-      const globalX = currentGlobalX + dx;
-      const globalY = currentGlobalY + dy;
-      if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) continue;
-      const rx = x + dx;
-      const ry = y + dy;
-      if (rx >= 0 && ry >= 0 && rx < tileSize && ry < tileSize) {
-        const receiver = ry * tileSize + rx;
-        receivers[index] = receiver;
-        indegree[receiver] += 1;
-      } else {
-        outboundTargets[index] = globalY * fullSide + globalX;
-      }
+      const split = decodeDInfinityRecipients(receiverDirections[index]);
+      if (!split) continue;
+      const assign = (slot: 0 | 1, code: number, weight: number): void => {
+        if (weight <= 0) return;
+        const dx = D8_DX[code];
+        const dy = D8_DY[code];
+        const globalX = currentGlobalX + dx;
+        const globalY = currentGlobalY + dy;
+        if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) return;
+        const rx = x + dx;
+        const ry = y + dy;
+        const receiver = rx >= 0 && ry >= 0 && rx < tileSize && ry < tileSize ? ry * tileSize + rx : -1;
+        if (slot === 0) {
+          receiversA[index] = receiver;
+          weightsA[index] = weight;
+          if (receiver < 0) outboundTargetsA[index] = globalY * fullSide + globalX;
+        } else {
+          receiversB[index] = receiver;
+          weightsB[index] = weight;
+          if (receiver < 0) outboundTargetsB[index] = globalY * fullSide + globalX;
+        }
+        if (receiver >= 0) indegree[receiver] += 1;
+      };
+      assign(0, split.codeA, split.weightA);
+      assign(1, split.codeB, split.weightB);
     }
   }
 
-  const order = buildFlowTopologicalOrder(receivers, indegree);
-  return { receivers, outboundTargets, indegree, order };
+  const order = buildFlowTopologicalOrder(receiversA, receiversB, indegree);
+  return { receiversA, receiversB, weightsA, weightsB, outboundTargetsA, outboundTargetsB, indegree, order };
 }
 
-function buildFlowTopologicalOrder(receivers: Int32Array, indegree: Uint32Array): Uint32Array {
+function buildFlowTopologicalOrder(receiversA: Int32Array, receiversB: Int32Array, indegree: Uint32Array): Uint32Array {
   const degree = new Uint32Array(indegree);
-  const queue = new Uint32Array(receivers.length);
-  const order = new Uint32Array(receivers.length);
+  const queue = new Uint32Array(receiversA.length);
+  const order = new Uint32Array(receiversA.length);
   let head = 0;
   let tail = 0;
   let orderLength = 0;
@@ -2225,16 +2395,15 @@ function buildFlowTopologicalOrder(receivers: Int32Array, indegree: Uint32Array)
     head += 1;
     order[orderLength] = current;
     orderLength += 1;
-    const receiver = receivers[current];
-    if (receiver >= 0) {
+    const visit = (receiver: number): void => {
+      if (receiver < 0) return;
       degree[receiver] -= 1;
-      if (degree[receiver] === 0) {
-        queue[tail] = receiver;
-        tail += 1;
-      }
-    }
+      if (degree[receiver] === 0) queue[tail++] = receiver;
+    };
+    visit(receiversA[current]);
+    visit(receiversB[current]);
   }
-  for (let i = 0; i < receivers.length; i += 1) {
+  for (let i = 0; i < receiversA.length; i += 1) {
     if (degree[i] > 0) {
       order[orderLength] = i;
       orderLength += 1;
@@ -2243,9 +2412,9 @@ function buildFlowTopologicalOrder(receivers: Int32Array, indegree: Uint32Array)
   return order;
 }
 
-function accumulateLocalFlow(routing: FlowRouting, incoming?: Float64Array): { values: Float64Array; max: number } {
-  const values = new Float64Array(routing.receivers.length);
-  values.fill(1);
+function accumulateLocalFlow(routing: FlowRouting, incoming?: Float64Array, includeBase = true): { values: Float64Array; max: number } {
+  const values = new Float64Array(routing.receiversA.length);
+  if (includeBase) values.fill(1);
   if (incoming) {
     for (let i = 0; i < incoming.length; i += 1) values[i] += incoming[i];
   }
@@ -2254,26 +2423,12 @@ function accumulateLocalFlow(routing: FlowRouting, incoming?: Float64Array): { v
     const current = routing.order[i];
     const flow = values[current];
     if (flow > max) max = flow;
-    const receiver = routing.receivers[current];
-    if (receiver >= 0) values[receiver] += flow;
+    const receiverA = routing.receiversA[current];
+    const receiverB = routing.receiversB[current];
+    if (receiverA >= 0) values[receiverA] += flow * routing.weightsA[current];
+    if (receiverB >= 0) values[receiverB] += flow * routing.weightsB[current];
   }
   return { values, max };
-}
-
-function computeLocalFlowDestinations(routing: FlowRouting): Uint32Array {
-  const destination = new Uint32Array(routing.receivers.length);
-  destination.fill(NO_FLOW_TARGET);
-  for (let i = routing.order.length - 1; i >= 0; i -= 1) {
-    const current = routing.order[i];
-    const outbound = routing.outboundTargets[current];
-    if (outbound !== NO_FLOW_TARGET) {
-      destination[current] = outbound;
-      continue;
-    }
-    const receiver = routing.receivers[current];
-    destination[current] = receiver >= 0 ? destination[receiver] : NO_FLOW_TARGET;
-  }
-  return destination;
 }
 
 function collectTileBorderCells(tileSize: number): Uint32Array {
@@ -2629,81 +2784,6 @@ async function readHeightHalo(config: WorldConfig, io: HydrologyTileIO, tileX: n
     }
   }
   return halo;
-}
-
-function solveFlowPortGraph(analyses: FlowTileAnalysisResult[]): Map<number, number> {
-  const nodeMap = new Map<number, number>();
-  const nodeCells: number[] = [];
-  const nodeFor = (cell: number): number => {
-    let node = nodeMap.get(cell);
-    if (node !== undefined) return node;
-    node = nodeCells.length;
-    nodeMap.set(cell, node);
-    nodeCells.push(cell);
-    return node;
-  };
-
-  const edgeFrom: number[] = [];
-  const edgeTo: number[] = [];
-  const base = new Map<number, number>();
-  for (const analysis of analyses) {
-    for (let i = 0; i < analysis.baseTargetCells.length; i += 1) {
-      const node = nodeFor(analysis.baseTargetCells[i]);
-      base.set(node, (base.get(node) ?? 0) + analysis.baseFlows[i]);
-    }
-    for (let i = 0; i < analysis.transferFromCells.length; i += 1) {
-      const from = nodeFor(analysis.transferFromCells[i]);
-      const to = nodeFor(analysis.transferToCells[i]);
-      if (from === to) continue;
-      edgeFrom.push(from);
-      edgeTo.push(to);
-    }
-  }
-
-  const indegree = new Uint32Array(nodeCells.length);
-  const receiver = new Int32Array(nodeCells.length);
-  receiver.fill(-1);
-  for (let i = 0; i < edgeFrom.length; i += 1) {
-    receiver[edgeFrom[i]] = edgeTo[i];
-    indegree[edgeTo[i]] += 1;
-  }
-  const routing: FlowRouting = {
-    receivers: receiver,
-    outboundTargets: new Uint32Array(nodeCells.length),
-    indegree,
-    order: buildFlowTopologicalOrder(receiver, indegree)
-  };
-  routing.outboundTargets.fill(NO_FLOW_TARGET);
-  const accumulation = new Float64Array(nodeCells.length);
-  for (const [node, flow] of base) accumulation[node] += flow;
-  for (let i = 0; i < routing.order.length; i += 1) {
-    const current = routing.order[i];
-    const next = routing.receivers[current];
-    if (next >= 0) accumulation[next] += accumulation[current];
-  }
-
-  const incoming = new Map<number, number>();
-  for (let node = 0; node < nodeCells.length; node += 1) {
-    if (accumulation[node] > 0) incoming.set(nodeCells[node], accumulation[node]);
-  }
-  return incoming;
-}
-
-function groupIncomingByTile(config: WorldConfig, incomingByCell: Map<number, number>): Array<{ cells: Uint32Array; flows: Float64Array }> {
-  const grouped = Array.from({ length: config.tilesPerSide * config.tilesPerSide }, () => ({ cells: [] as number[], flows: [] as number[] }));
-  const fullSide = config.tileSize * config.tilesPerSide;
-  for (const [cell, flow] of incomingByCell) {
-    const x = cell % fullSide;
-    const y = Math.floor(cell / fullSide);
-    const tileX = Math.floor(x / config.tileSize);
-    const tileY = Math.floor(y / config.tileSize);
-    const localX = x - tileX * config.tileSize;
-    const localY = y - tileY * config.tileSize;
-    const group = grouped[tileIndex(config, tileX, tileY)];
-    group.cells.push(localY * config.tileSize + localX);
-    group.flows.push(flow);
-  }
-  return grouped.map((group) => ({ cells: Uint32Array.from(group.cells), flows: Float64Array.from(group.flows) }));
 }
 
 function canUseHydrologyWorkers(): boolean {

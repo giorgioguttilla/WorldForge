@@ -781,9 +781,10 @@ export class HydrologyDebugRenderer {
     for (let i = 0; i < samples.length; i += 1) {
         const target = i * 4;
         if (this.layer === 'receivers') {
-          const code = Math.min(8, samples[i]);
-          textureSamples[target] = 128 + DEBUG_D8_X[code] * 127;
-          textureSamples[target + 1] = 128 + DEBUG_D8_Y[code] * 127;
+          const encoded = samples[i];
+          const angle = encoded < DEBUG_DINF_TURN_STEPS ? encoded / DEBUG_DINF_TURN_STEPS * Math.PI * 2 : null;
+          textureSamples[target] = angle === null ? 128 : Math.round(128 + Math.cos(angle) * 127);
+          textureSamples[target + 1] = angle === null ? 128 : Math.round(128 + Math.sin(angle) * 127);
           textureSamples[target + 2] = 128;
         } else if (this.layer === 'basin-ids') {
           const id = samples[i] >>> 0;
@@ -858,8 +859,7 @@ export class HydrologyDebugRenderer {
   }
 }
 
-const DEBUG_D8_X = [0, 1, 0, 1, -1, 0, -1, 1, -1];
-const DEBUG_D8_Y = [0, 0, 1, 1, 0, -1, -1, -1, 1];
+const DEBUG_DINF_TURN_STEPS = 65528;
 
 async function padScalarDebugTile(
   config: WorldConfig,

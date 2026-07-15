@@ -326,13 +326,13 @@ export class TileManager {
     return this.store.readBasinIdTile(key, config.tileSize);
   }
 
-  async readReceiverDirectionTile(key: TileKey): Promise<Uint8Array | null> {
+  async readReceiverDirectionTile(key: TileKey): Promise<Uint16Array | null> {
     const config = this.requireConfig();
     assertTileKey(key, config.tilesPerSide);
     return this.store.readReceiverDirectionTile(key, config.tileSize);
   }
 
-  async readFlowAccumulationTile(key: TileKey): Promise<Uint32Array | null> {
+  async readFlowAccumulationTile(key: TileKey): Promise<Float32Array | null> {
     const config = this.requireConfig();
     assertTileKey(key, config.tilesPerSide);
     return this.store.readFlowAccumulationTile(key, config.tileSize);
