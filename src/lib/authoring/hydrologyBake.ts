@@ -222,6 +222,7 @@ export async function runHydrologyBasinBake(
   onProgress?.({ phase: 'hydrology', current: completed, total, label: 'Resolving global basin spill heights' });
 
   const basinStats = new Map<number, BasinAccumulator>();
+  const drainageSurfaceBoundaries = new HydrologyTileBoundaryIndex(Uint16Array, config.tileSize);
   const collectFallbackBasinStats = !(io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile);
   let lakeCellCount = 0;
   let maxDepth = 0;
@@ -247,9 +248,11 @@ export async function runHydrologyBasinBake(
     async (response) => {
       const result = response as HydrologyMaterializeResponse;
       const key = { x: result.tileX, y: result.tileY, d: 0 };
+      const drainageSurface = new Uint16Array(result.drainageSurface);
+      drainageSurfaceBoundaries.set(result.tileX, result.tileY, drainageSurface);
       await Promise.all([
         io.writeLakeFillHeightTile?.(key, new Uint16Array(result.lakeFillHeights)),
-        io.writeDrainageSurfaceTile?.(key, new Uint16Array(result.drainageSurface))
+        io.writeDrainageSurfaceTile?.(key, drainageSurface)
       ]);
       if (collectFallbackBasinStats) {
         const basinIds = new Uint32Array(result.basinIds);
@@ -311,7 +314,7 @@ export async function runHydrologyBasinBake(
     ? await buildPhysicalBasinIds(config, io, jobs, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }))
     : new Map([...basinStats].map(([id, stats]) => [id, { ...stats, fillHeight: globalFillHeights[id] }]));
   if (io.readDrainageSurfaceTile && io.writeFlatDistanceTile && io.readFlatDistanceTile && io.writeReceiverDirectionTile) {
-    await buildGlobalConditionedReceivers(config, io, jobs, useWorkers, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }));
+    await buildGlobalConditionedReceivers(config, io, jobs, useWorkers, drainageSurfaceBoundaries, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }));
   }
   const topology = io.readBasinIdTile && io.readReceiverDirectionTile
     ? await buildPhysicalHydrologyTopology(config, io, jobs, physicalBasinStats)
@@ -698,46 +701,51 @@ async function buildGlobalConditionedReceivers(
   io: HydrologyTileIO,
   jobs: TileJob[],
   useWorkers: boolean,
+  surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>,
   onStatus?: (label: string) => void
 ): Promise<void> {
   if (!io.readDrainageSurfaceTile || !io.writeFlatDistanceTile || !io.readFlatDistanceTile || !io.writeReceiverDirectionTile) {
     throw new Error('Global flat routing requires drainage-surface, flat-distance, and receiver tile storage.');
   }
-  const surfaceBoundaries = new HydrologyTileBoundaryIndex(Uint16Array, config.tileSize);
   const distanceBoundaries = new HydrologyTileBoundaryIndex(Uint32Array, config.tileSize);
-  const surfaceCache = new HydrologyTileCache<Uint16Array>(12, async (x, y) => {
-    const surface = await requireHydrologyTile(io.readDrainageSurfaceTile?.({ x, y, d: 0 }), 'drainage surface', x, y);
-    surfaceBoundaries.set(x, y, surface);
-    return surface;
-  });
-  const distanceCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readFlatDistanceTile?.({ x, y, d: 0 }), 'flat distance', x, y));
+  const surfaceCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => (
+    requireHydrologyTile(io.readDrainageSurfaceTile?.({ x, y, d: 0 }), 'drainage surface', x, y)
+  ));
+  const distanceCache = new HydrologyWriteBackTileCache<Uint32Array>(
+    12,
+    (x, y) => requireHydrologyTile(io.readFlatDistanceTile?.({ x, y, d: 0 }), 'flat distance', x, y),
+    (x, y, distances) => io.writeFlatDistanceTile?.({ x, y, d: 0 }, distances) ?? Promise.resolve()
+  );
 
-  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
-    const job = jobs[jobIndex];
-    onStatus?.(`Indexing drainage boundaries ${jobIndex + 1} / ${jobs.length}`);
-    await surfaceCache.read(job.x, job.y);
-  }
-
+  const initialDistanceWrites: Promise<void>[] = [];
+  const initialWriteConcurrency = Math.min(4, jobs.length);
   for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
     const job = jobs[jobIndex];
     onStatus?.(`Finding flat outlets ${jobIndex + 1} / ${jobs.length}`);
     const surface = await surfaceCache.read(job.x, job.y);
     const distances = initializeFlatDistances(config, job.x, job.y, surface, surfaceBoundaries);
-    await io.writeFlatDistanceTile({ x: job.x, y: job.y, d: 0 }, distances);
-    distanceCache.set(job.x, job.y, distances);
+    initialDistanceWrites.push(io.writeFlatDistanceTile({ x: job.x, y: job.y, d: 0 }, distances));
+    await distanceCache.setClean(job.x, job.y, distances);
     distanceBoundaries.set(job.x, job.y, distances);
+    if (initialDistanceWrites.length >= initialWriteConcurrency) {
+      await Promise.all(initialDistanceWrites);
+      initialDistanceWrites.length = 0;
+    }
   }
+  await Promise.all(initialDistanceWrites);
 
-  await convergeTileQueue(config, jobs, async (job) => {
+  await convergeFlatTileQueue(config, jobs, (tileX, tileY) => (
+    getFlatRelaxationPriority(config, tileX, tileY, surfaceBoundaries, distanceBoundaries)
+  ), async (job) => {
     const surface = await surfaceCache.read(job.x, job.y);
     const distances = await distanceCache.read(job.x, job.y);
     const result = relaxFlatDistances(config, job.x, job.y, surface, distances, surfaceBoundaries, distanceBoundaries);
     if (!result) return 0;
-    await io.writeFlatDistanceTile?.({ x: job.x, y: job.y, d: 0 }, result.distances);
-    distanceCache.set(job.x, job.y, result.distances);
+    await distanceCache.setDirty(job.x, job.y, result.distances);
     distanceBoundaries.set(job.x, job.y, result.distances);
     return result.changedNeighborMask;
   }, (current, queued) => onStatus?.(`Resolving flats across tiles ${current} / ${queued}`));
+  await distanceCache.flush();
 
   let receiversWritten = 0;
   await runHydrologyWorkerPool(
@@ -858,14 +866,12 @@ function initializeFlatDistances(
   const distances = new Uint32Array(size * size);
   distances.fill(NO_FLOW_TARGET);
   const queue = new Uint32Array(distances.length);
-  let tail = 0;
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       const gx = tileX * size + x;
       const gy = tileY * size + y;
       if (gx === 0 || gy === 0 || gx === fullSide - 1 || gy === fullSide - 1) {
         distances[y * size + x] = 0;
-        queue[tail++] = y * size + x;
         continue;
       }
       const current = surface[y * size + x];
@@ -877,7 +883,24 @@ function initializeFlatDistances(
           : surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
         if (neighbor < current) {
           distances[y * size + x] = 0;
-          queue[tail++] = y * size + x;
+          break;
+        }
+      }
+    }
+  }
+  let tail = 0;
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const cell = y * size + x;
+      if (distances[cell] !== NO_FLOW_TARGET) continue;
+      for (let code = 1; code <= 8; code += 1) {
+        const nx = x + D8_DX[code];
+        const ny = y + D8_DY[code];
+        if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+        const neighbor = ny * size + nx;
+        if (surface[neighbor] === surface[cell] && distances[neighbor] === 0) {
+          distances[cell] = 1;
+          queue[tail++] = cell;
           break;
         }
       }
@@ -912,8 +935,10 @@ function relaxFlatDistances(
   distanceBoundaries: HydrologyTileBoundaryIndex<Uint32Array>
 ): { distances: Uint32Array; changedNeighborMask: number } | null {
   const size = config.tileSize;
-  const seedCells: number[] = [];
-  const seedDistances: number[] = [];
+  const maxBoundaryCells = Math.max(1, size * 4 - 4);
+  const seedCells = new Uint32Array(maxBoundaryCells);
+  const seedDistances = new Uint32Array(maxBoundaryCells);
+  let seedCount = 0;
   const inspectBoundaryCell = (x: number, y: number): void => {
       const cell = y * size + x;
       const currentHeight = surface[cell];
@@ -929,8 +954,9 @@ function relaxFlatDistances(
         if (candidate < best) best = candidate;
       }
       if (best < distances[cell]) {
-        seedCells.push(cell);
-        seedDistances.push(best);
+        seedCells[seedCount] = cell;
+        seedDistances[seedCount] = best;
+        seedCount += 1;
       }
   };
   for (let x = 0; x < size; x += 1) {
@@ -941,15 +967,19 @@ function relaxFlatDistances(
     inspectBoundaryCell(0, y);
     if (size > 1) inspectBoundaryCell(size - 1, y);
   }
-  if (seedCells.length === 0) return null;
+  if (seedCount === 0) return null;
 
-  const next = new Uint32Array(distances);
-  const queue: number[] = [];
-  const queued = new Uint8Array(next.length);
+  const queue = new Uint32Array(distances.length);
+  const queued = new Uint8Array(distances.length);
+  let queueHead = 0;
+  let queueTail = 0;
+  let queueLength = 0;
   const enqueue = (cell: number): void => {
     if (queued[cell] === 0) {
       queued[cell] = 1;
-      queue.push(cell);
+      queue[queueTail] = cell;
+      queueTail = (queueTail + 1) % queue.length;
+      queueLength += 1;
     }
   };
   let changedNeighborMask = 0;
@@ -965,31 +995,33 @@ function relaxFlatDistances(
     if (x === size - 1 && y === 0) changedNeighborMask |= 1 << 7;
     if (x === 0 && y === size - 1) changedNeighborMask |= 1 << 8;
   };
-  for (let i = 0; i < seedCells.length; i += 1) {
+  for (let i = 0; i < seedCount; i += 1) {
     const cell = seedCells[i];
-    next[cell] = seedDistances[i];
+    distances[cell] = seedDistances[i];
     markChangedBoundary(cell);
     enqueue(cell);
   }
-  for (let head = 0; head < queue.length; head += 1) {
-    const current = queue[head];
+  while (queueLength > 0) {
+    const current = queue[queueHead];
+    queueHead = (queueHead + 1) % queue.length;
+    queueLength -= 1;
     queued[current] = 0;
     const x = current % size;
     const y = Math.floor(current / size);
-    const candidate = next[current] + 1;
+    const candidate = distances[current] + 1;
     for (let code = 1; code <= 8; code += 1) {
       const nx = x + D8_DX[code];
       const ny = y + D8_DY[code];
       if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
       const neighbor = ny * size + nx;
-      if (surface[neighbor] === surface[current] && candidate < next[neighbor]) {
-        next[neighbor] = candidate;
+      if (surface[neighbor] === surface[current] && candidate < distances[neighbor]) {
+        distances[neighbor] = candidate;
         markChangedBoundary(neighbor);
         enqueue(neighbor);
       }
     }
   }
-  return { distances: next, changedNeighborMask };
+  return { distances, changedNeighborMask };
 }
 
 function materializeGlobalReceivers(
@@ -1052,31 +1084,85 @@ function hashCell(x: number, y: number): number {
   return value >>> 0;
 }
 
-async function convergeTileQueue(
+async function convergeFlatTileQueue(
   config: WorldConfig,
   jobs: TileJob[],
+  getPriority: (tileX: number, tileY: number) => number,
   relax: (job: TileJob) => Promise<number>,
   onStatus?: (current: number, queued: number) => void
 ): Promise<void> {
-  const queue = jobs.slice();
-  const queued = new Set(queue.map((job) => `${job.x},${job.y}`));
-  for (let head = 0; head < queue.length; head += 1) {
-    onStatus?.(head + 1, queue.length);
-    const job = queue[head];
-    queued.delete(`${job.x},${job.y}`);
+  const priorities = new Float64Array(jobs.length);
+  priorities.fill(Number.POSITIVE_INFINITY);
+  let queued = 0;
+  for (const job of jobs) {
+    const priority = getPriority(job.x, job.y);
+    if (!Number.isFinite(priority)) continue;
+    priorities[tileIndex(config, job.x, job.y)] = priority;
+    queued += 1;
+  }
+  let current = 0;
+  while (queued > 0) {
+    let nextIndex = -1;
+    let nextPriority = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < priorities.length; i += 1) {
+      if (priorities[i] < nextPriority) {
+        nextPriority = priorities[i];
+        nextIndex = i;
+      }
+    }
+    if (nextIndex < 0) break;
+    priorities[nextIndex] = Number.POSITIVE_INFINITY;
+    queued -= 1;
+    current += 1;
+    onStatus?.(current, current + queued);
+    const job = jobs[nextIndex];
     const changedNeighborMask = await relax(job);
     for (let code = 1; code <= 8; code += 1) {
       if ((changedNeighborMask & (1 << code)) === 0) continue;
       const x = job.x + D8_DX[code];
       const y = job.y + D8_DY[code];
       if (x < 0 || y < 0 || x >= config.tilesPerSide || y >= config.tilesPerSide) continue;
-      const key = `${x},${y}`;
-      if (!queued.has(key)) {
-        queued.add(key);
-        queue.push({ x, y });
-      }
+      const index = tileIndex(config, x, y);
+      const priority = getPriority(x, y);
+      if (priority >= priorities[index]) continue;
+      if (!Number.isFinite(priorities[index])) queued += 1;
+      priorities[index] = priority;
     }
   }
+}
+
+function getFlatRelaxationPriority(
+  config: WorldConfig,
+  tileX: number,
+  tileY: number,
+  surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>,
+  distanceBoundaries: HydrologyTileBoundaryIndex<Uint32Array>
+): number {
+  const size = config.tileSize;
+  let priority = Number.POSITIVE_INFINITY;
+  const inspect = (x: number, y: number): void => {
+    const currentHeight = surfaceBoundaries.getOffset(tileX, tileY, x, y);
+    const currentDistance = distanceBoundaries.getOffset(tileX, tileY, x, y);
+    for (let code = 1; code <= 8; code += 1) {
+      const nx = x + D8_DX[code];
+      const ny = y + D8_DY[code];
+      if (nx >= 0 && ny >= 0 && nx < size && ny < size) continue;
+      const neighborHeight = surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
+      const neighborDistance = distanceBoundaries.getOffset(tileX, tileY, nx, ny);
+      if (neighborHeight === currentHeight && neighborDistance !== NO_FLOW_TARGET && neighborDistance + 1 < currentDistance) {
+        priority = Math.min(priority, neighborDistance + 1);
+      }
+    }
+  };
+  for (let x = 0; x < size; x += 1) {
+    inspect(x, 0);
+    if (size > 1) inspect(x, size - 1);
+  }
+  for (let y = 1; y + 1 < size; y += 1) {
+    inspect(0, y);
+    if (size > 1) inspect(size - 1, y);
+  }
+  return priority;
 }
 
 class NumericDisjointSet {
@@ -1135,6 +1221,72 @@ class HydrologyTileCache<T extends Uint8Array | Uint16Array | Uint32Array> {
   }
 }
 
+interface HydrologyWriteBackEntry<T extends Uint8Array | Uint16Array | Uint32Array> {
+  x: number;
+  y: number;
+  value: T;
+}
+
+class HydrologyWriteBackTileCache<T extends Uint8Array | Uint16Array | Uint32Array> {
+  private readonly values = new Map<string, HydrologyWriteBackEntry<T>>();
+  private readonly dirty = new Set<string>();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly load: (x: number, y: number) => Promise<T>,
+    private readonly write: (x: number, y: number, value: T) => Promise<void>
+  ) {}
+
+  async read(x: number, y: number): Promise<T> {
+    const key = `${x},${y}`;
+    const cached = this.values.get(key);
+    if (cached) {
+      this.touch(key, cached);
+      return cached.value;
+    }
+    const value = await this.load(x, y);
+    await this.insert(key, { x, y, value }, false);
+    return value;
+  }
+
+  async setClean(x: number, y: number, value: T): Promise<void> {
+    await this.insert(`${x},${y}`, { x, y, value }, false);
+  }
+
+  async setDirty(x: number, y: number, value: T): Promise<void> {
+    await this.insert(`${x},${y}`, { x, y, value }, true);
+  }
+
+  async flush(): Promise<void> {
+    const writes: Promise<void>[] = [];
+    for (const key of this.dirty) {
+      const entry = this.values.get(key);
+      if (entry) writes.push(this.write(entry.x, entry.y, entry.value));
+    }
+    await Promise.all(writes);
+    this.dirty.clear();
+  }
+
+  private async insert(key: string, entry: HydrologyWriteBackEntry<T>, dirty: boolean): Promise<void> {
+    this.values.delete(key);
+    this.values.set(key, entry);
+    if (dirty) this.dirty.add(key);
+    else this.dirty.delete(key);
+    while (this.values.size > this.capacity) {
+      const oldestKey = this.values.keys().next().value as string;
+      const oldest = this.values.get(oldestKey);
+      if (oldest && this.dirty.has(oldestKey)) await this.write(oldest.x, oldest.y, oldest.value);
+      this.dirty.delete(oldestKey);
+      this.values.delete(oldestKey);
+    }
+  }
+
+  private touch(key: string, entry: HydrologyWriteBackEntry<T>): void {
+    this.values.delete(key);
+    this.values.set(key, entry);
+  }
+}
+
 interface HydrologyTileBoundary<T extends Uint8Array | Uint16Array | Uint32Array> {
   north: T;
   south: T;
@@ -1151,17 +1303,19 @@ class HydrologyTileBoundaryIndex<T extends Uint8Array | Uint16Array | Uint32Arra
   ) {}
 
   set(tileX: number, tileY: number, tile: T): void {
-    const north = new this.Constructor(this.tileSize);
-    const south = new this.Constructor(this.tileSize);
-    const west = new this.Constructor(this.tileSize);
-    const east = new this.Constructor(this.tileSize);
+    const key = `${tileX},${tileY}`;
+    const existing = this.values.get(key);
+    const north = existing?.north ?? new this.Constructor(this.tileSize);
+    const south = existing?.south ?? new this.Constructor(this.tileSize);
+    const west = existing?.west ?? new this.Constructor(this.tileSize);
+    const east = existing?.east ?? new this.Constructor(this.tileSize);
     north.set(tile.subarray(0, this.tileSize));
     south.set(tile.subarray((this.tileSize - 1) * this.tileSize));
     for (let i = 0; i < this.tileSize; i += 1) {
       west[i] = tile[i * this.tileSize];
       east[i] = tile[i * this.tileSize + this.tileSize - 1];
     }
-    this.values.set(`${tileX},${tileY}`, { north, south, west, east });
+    if (!existing) this.values.set(key, { north, south, west, east });
   }
 
   getOffset(tileX: number, tileY: number, x: number, y: number): number {
