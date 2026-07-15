@@ -1169,7 +1169,7 @@ function relaxFlatDistances(
   return { distances, changedNeighborMask };
 }
 
-function materializeGlobalReceivers(
+export function materializeGlobalReceivers(
   tileSize: number,
   tilesPerSide: number,
   tileX: number,
@@ -1184,11 +1184,11 @@ function materializeGlobalReceivers(
   output.fill(DINF_NO_FLOW);
   const worldCellCount = fullSide * fullSide;
   const flatEpsilon = 0.25 / (worldCellCount + 1);
-  const potentialAt = (hx: number, hy: number): number => {
-    const index = hy * stride + hx;
+  const potentials = new Float64Array(surfaceHalo.length);
+  for (let index = 0; index < potentials.length; index += 1) {
     const distance = distanceHalo[index];
-    return surfaceHalo[index] + (distance === NO_FLOW_TARGET ? 0 : distance * flatEpsilon);
-  };
+    potentials[index] = surfaceHalo[index] + (distance === NO_FLOW_TARGET ? 0 : distance * flatEpsilon);
+  }
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       const gx = tileX * size + x;
@@ -1196,9 +1196,13 @@ function materializeGlobalReceivers(
       if (gx === 0 || gy === 0 || gx === fullSide - 1 || gy === fullSide - 1) continue;
       const hx = x + 1;
       const hy = y + 1;
-      const current = potentialAt(hx, hy);
-      let bestSlope = 0;
-      let bestAngle = -1;
+      const current = potentials[hy * stride + hx];
+      let bestSlopeSquared = 0;
+      let bestEncoded = DINF_NO_FLOW;
+      let bestPlaneX = 0;
+      let bestPlaneY = 0;
+      let bestIsPlane = false;
+      let evaluatedEdges = 0;
       for (let facet = 0; facet < 8; facet += 1) {
         const codeA = DINF_CODES[facet];
         const codeB = DINF_CODES[(facet + 1) & 7];
@@ -1206,41 +1210,54 @@ function materializeGlobalReceivers(
         const ay = D8_DY[codeA];
         const bx = D8_DX[codeB];
         const by = D8_DY[codeB];
-        const za = potentialAt(hx + ax, hy + ay);
-        const zb = potentialAt(hx + bx, hy + by);
-        const determinant = ax * by - bx * ay;
+        const za = potentials[(hy + ay) * stride + hx + ax];
+        const zb = potentials[(hy + by) * stride + hx + bx];
         const da = za - current;
         const db = zb - current;
-        const gradientX = (da * by - db * ay) / determinant;
-        const gradientY = (ax * db - bx * da) / determinant;
-        const downX = -gradientX;
-        const downY = -gradientY;
-        const planeSlope = Math.hypot(downX, downY);
-        const startAngle = facet * Math.PI / 4;
-        const planeAngle = normalizeAngle(Math.atan2(downY, downX));
-        const relative = normalizeAngle(planeAngle - startAngle);
-        const insideFacet = planeSlope > 0 && relative <= Math.PI / 4 + 1e-12;
-        if (insideFacet) {
-          const fractionB = Math.min(1, Math.max(0, relative / (Math.PI / 4)));
-          const usesA = fractionB < 1 - 1e-12;
-          const usesB = fractionB > 1e-12;
-          if ((!usesA || za < current) && (!usesB || zb < current) && planeSlope > bestSlope) {
-            bestSlope = planeSlope;
-            bestAngle = planeAngle;
+        // Consecutive D-infinity direction vectors have determinant +1.
+        const downX = db * ay - da * by;
+        const downY = bx * da - ax * db;
+        const planeSlopeSquared = downX * downX + downY * downY;
+        if (planeSlopeSquared > bestSlopeSquared) {
+          const crossFromA = ax * downY - ay * downX;
+          const crossToB = downX * by - downY * bx;
+          if (crossFromA >= 0 && crossToB >= 0) {
+            const boundaryTolerance = (Math.abs(downX) + Math.abs(downY)) * 1e-12;
+            const usesA = crossToB > boundaryTolerance;
+            const usesB = crossFromA > boundaryTolerance;
+            if ((!usesA || za < current) && (!usesB || zb < current)) {
+              bestSlopeSquared = planeSlopeSquared;
+              bestPlaneX = downX;
+              bestPlaneY = downY;
+              bestIsPlane = true;
+            }
           }
         }
-        const slopeA = (current - za) / Math.hypot(ax, ay);
-        if (slopeA > bestSlope) {
-          bestSlope = slopeA;
-          bestAngle = startAngle;
-        }
-        const slopeB = (current - zb) / Math.hypot(bx, by);
-        if (slopeB > bestSlope) {
-          bestSlope = slopeB;
-          bestAngle = normalizeAngle(startAngle + Math.PI / 4);
+
+        for (let branch = 0; branch < 2; branch += 1) {
+          const directionIndex = (facet + branch) & 7;
+          const directionBit = 1 << directionIndex;
+          if (evaluatedEdges & directionBit) continue;
+          evaluatedEdges |= directionBit;
+          const neighborHeight = branch === 0 ? za : zb;
+          const drop = current - neighborHeight;
+          if (drop <= 0) continue;
+          const code = branch === 0 ? codeA : codeB;
+          const distanceSquared = D8_DX[code] !== 0 && D8_DY[code] !== 0 ? 2 : 1;
+          const slopeSquared = drop * drop / distanceSquared;
+          if (slopeSquared > bestSlopeSquared) {
+            bestSlopeSquared = slopeSquared;
+            bestEncoded = directionIndex * DINF_SECTOR_STEPS;
+            bestIsPlane = false;
+          }
         }
       }
-      if (bestAngle >= 0) output[y * size + x] = encodeDInfinityAngle(bestAngle);
+      if (bestIsPlane) {
+        let angle = Math.atan2(bestPlaneY, bestPlaneX);
+        if (angle < 0) angle += TWO_PI;
+        bestEncoded = Math.round(angle / TWO_PI * DINF_TURN_STEPS) % DINF_TURN_STEPS;
+      }
+      output[y * size + x] = bestEncoded;
     }
   }
   return output;
