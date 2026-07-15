@@ -68,6 +68,7 @@ export interface MaterializeBasinResult {
   tileY: number;
   lakeFillHeights: ArrayBuffer;
   drainageSurface: ArrayBuffer;
+  flatDistances: ArrayBuffer;
   basinIds: Uint32Array;
   areaCells: Uint32Array;
   minTerrain: Uint16Array;
@@ -203,19 +204,24 @@ export async function runHydrologyBasinBake(
   const graph = buildGlobalGraph(config, analyses, nextLabelOffset);
   const graphSolution = solveGraphFillHeights(graph.nodeCount, graph.from, graph.to, graph.weight);
   const globalFillHeights = graphSolution.fills;
-  const outletCells = new Uint32Array(graph.nodeCount);
-  const downstreamCells = new Uint32Array(graph.nodeCount);
-  outletCells.fill(NO_FLOW_TARGET);
-  downstreamCells.fill(NO_FLOW_TARGET);
-  for (let node = 1; node < graph.nodeCount; node += 1) {
-    const edge = graphSolution.parentEdge[node];
-    if (edge === NO_FLOW_TARGET) continue;
-    if (graph.from[edge] === node) {
-      outletCells[node] = graph.cellFrom[edge];
-      downstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellTo[edge];
-    } else {
-      outletCells[node] = graph.cellTo[edge];
-      downstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellFrom[edge];
+  const usePhysicalTopology = Boolean(io.readBasinIdTile && io.readReceiverDirectionTile);
+  let outletCells: Uint32Array | null = null;
+  let solverDownstreamCells: Uint32Array | null = null;
+  if (!usePhysicalTopology) {
+    outletCells = new Uint32Array(graph.nodeCount);
+    solverDownstreamCells = new Uint32Array(graph.nodeCount);
+    outletCells.fill(NO_FLOW_TARGET);
+    solverDownstreamCells.fill(NO_FLOW_TARGET);
+    for (let node = 1; node < graph.nodeCount; node += 1) {
+      const edge = graphSolution.parentEdge[node];
+      if (edge === NO_FLOW_TARGET) continue;
+      if (graph.from[edge] === node) {
+        outletCells[node] = graph.cellFrom[edge];
+        solverDownstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellTo[edge];
+      } else {
+        outletCells[node] = graph.cellTo[edge];
+        solverDownstreamCells[node] = graphSolution.parentNode[node] === OCEAN_NODE ? NO_FLOW_TARGET : graph.cellFrom[edge];
+      }
     }
   }
   completed += 1;
@@ -223,6 +229,8 @@ export async function runHydrologyBasinBake(
 
   const basinStats = new Map<number, BasinAccumulator>();
   const drainageSurfaceBoundaries = new HydrologyTileBoundaryIndex(Uint16Array, config.tileSize);
+  const flatDistanceBoundaries = new HydrologyTileBoundaryIndex(Uint32Array, config.tileSize);
+  const computeFlatDistances = Boolean(io.readDrainageSurfaceTile && io.writeFlatDistanceTile && io.readFlatDistanceTile && io.writeReceiverDirectionTile);
   const collectFallbackBasinStats = !(io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile);
   let lakeCellCount = 0;
   let maxDepth = 0;
@@ -240,7 +248,10 @@ export async function runHydrologyBasinBake(
         tileX: job.x,
         tileY: job.y,
         tileSize: config.tileSize,
+        tilesPerSide: config.tilesPerSide,
         labelOffset: analysis.labelOffset,
+        computeFlatDistances,
+        collectBasinStats: collectFallbackBasinStats,
         heights: heights.buffer.slice(heights.byteOffset, heights.byteOffset + heights.byteLength),
         globalFillHeights: fills.buffer
       } satisfies HydrologyWorkerRequest;
@@ -250,9 +261,12 @@ export async function runHydrologyBasinBake(
       const key = { x: result.tileX, y: result.tileY, d: 0 };
       const drainageSurface = new Uint16Array(result.drainageSurface);
       drainageSurfaceBoundaries.set(result.tileX, result.tileY, drainageSurface);
+      const flatDistances = new Uint32Array(result.flatDistances);
+      if (flatDistances.length > 0) flatDistanceBoundaries.set(result.tileX, result.tileY, flatDistances);
       await Promise.all([
         io.writeLakeFillHeightTile?.(key, new Uint16Array(result.lakeFillHeights)),
-        io.writeDrainageSurfaceTile?.(key, drainageSurface)
+        io.writeDrainageSurfaceTile?.(key, drainageSurface),
+        flatDistances.length > 0 ? io.writeFlatDistanceTile?.(key, flatDistances) : undefined
       ]);
       if (collectFallbackBasinStats) {
         const basinIds = new Uint32Array(result.basinIds);
@@ -288,37 +302,48 @@ export async function runHydrologyBasinBake(
       maxDepth = Math.max(maxDepth, result.maxTileDepth);
       volumeCellHeight += result.tileVolumeCellHeight;
       completed += 1;
-      onProgress?.({ phase: 'hydrology', current: completed, total, label: `Writing lake fill heights ${completed - jobs.length - 1} / ${jobs.length}` });
+      onProgress?.({ phase: 'hydrology', current: completed, total, label: `Materializing fill and local drainage ${completed - jobs.length - 1} / ${jobs.length}` });
     },
     useWorkers
   );
 
-  const downstreamIds = new Uint32Array(graph.nodeCount);
-  downstreamIds.fill(NO_FLOW_TARGET);
-  for (let id = 1; id < graph.nodeCount; id += 1) downstreamIds[id] = graphSolution.parentNode[id];
-  const solverTopology: HydrologyTopologyV1 = {
-    version: 1,
-    width: config.tileSize * config.tilesPerSide,
-    height: config.tileSize * config.tilesPerSide,
-    nodeCount: graph.nodeCount,
-    receiverEncoding: 'd8-clockwise-from-east-u8',
-    basinIds: Uint32Array.from({ length: graph.nodeCount }, (_, id) => id),
-    fillHeights: globalFillHeights,
-    downstreamIds,
-    spillCells: outletCells,
-    downstreamCells
-  };
+  let solverTopology: HydrologyTopologyV1 | null = null;
+  if (!usePhysicalTopology && outletCells && solverDownstreamCells) {
+    const downstreamIds = new Uint32Array(graph.nodeCount);
+    downstreamIds.fill(NO_FLOW_TARGET);
+    for (let id = 1; id < graph.nodeCount; id += 1) downstreamIds[id] = graphSolution.parentNode[id];
+    solverTopology = {
+      version: 1,
+      width: config.tileSize * config.tilesPerSide,
+      height: config.tileSize * config.tilesPerSide,
+      nodeCount: graph.nodeCount,
+      receiverEncoding: 'd8-clockwise-from-east-u8',
+      basinIds: Uint32Array.from({ length: graph.nodeCount }, (_, id) => id),
+      fillHeights: globalFillHeights,
+      downstreamIds,
+      spillCells: outletCells,
+      downstreamCells: solverDownstreamCells
+    };
+  }
   analyses.length = 0;
 
   const physicalBasinStats = io.readLakeFillHeightTile && io.writeBasinIdTile && io.readBasinIdTile
     ? await buildPhysicalBasinIds(config, io, jobs, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }))
     : new Map([...basinStats].map(([id, stats]) => [id, { ...stats, fillHeight: globalFillHeights[id] }]));
   if (io.readDrainageSurfaceTile && io.writeFlatDistanceTile && io.readFlatDistanceTile && io.writeReceiverDirectionTile) {
-    await buildGlobalConditionedReceivers(config, io, jobs, useWorkers, drainageSurfaceBoundaries, (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label }));
+    await buildGlobalConditionedReceivers(
+      config,
+      io,
+      jobs,
+      useWorkers,
+      drainageSurfaceBoundaries,
+      flatDistanceBoundaries,
+      (label) => onProgress?.({ phase: 'hydrology', current: completed, total, label })
+    );
   }
-  const topology = io.readBasinIdTile && io.readReceiverDirectionTile
+  const topology = usePhysicalTopology
     ? await buildPhysicalHydrologyTopology(config, io, jobs, physicalBasinStats)
-    : solverTopology;
+    : solverTopology as HydrologyTopologyV1;
   await io.writeHydrologyTopology?.(topology);
 
   const flowResult = await runFlowStrengthBake(config, io, jobs, useWorkers, completed, total, onProgress);
@@ -430,9 +455,12 @@ export function materializeHydrologyTile(
   tileX: number,
   tileY: number,
   tileSize: number,
+  tilesPerSide: number,
   labelOffset: number,
   heights: Uint16Array,
-  globalFillHeights: Uint16Array
+  globalFillHeights: Uint16Array,
+  computeFlatDistances: boolean,
+  collectBasinStats: boolean
 ): MaterializeBasinResult {
   const solved = solveLocalTile(tileSize, heights);
   const lakeFillHeights = new Uint16Array(heights.length);
@@ -453,31 +481,33 @@ export function materializeHydrologyTile(
       lakeCellCount += 1;
       maxTileDepth = Math.max(maxTileDepth, depth);
       tileVolumeCellHeight += depth;
-      const basinId = labelOffset + localLabel - 1;
-      let accumulator = stats.get(basinId);
-      if (!accumulator) {
-        accumulator = {
-          areaCells: 0,
-          minTerrain: UINT16_MAX,
-          maxDepth: 0,
-          volumeCellHeight: 0,
-          minGlobalX: Number.POSITIVE_INFINITY,
-          minGlobalY: Number.POSITIVE_INFINITY,
-          maxGlobalX: 0,
-          maxGlobalY: 0
-        };
-        stats.set(basinId, accumulator);
+      if (collectBasinStats) {
+        const basinId = labelOffset + localLabel - 1;
+        let accumulator = stats.get(basinId);
+        if (!accumulator) {
+          accumulator = {
+            areaCells: 0,
+            minTerrain: UINT16_MAX,
+            maxDepth: 0,
+            volumeCellHeight: 0,
+            minGlobalX: Number.POSITIVE_INFINITY,
+            minGlobalY: Number.POSITIVE_INFINITY,
+            maxGlobalX: 0,
+            maxGlobalY: 0
+          };
+          stats.set(basinId, accumulator);
+        }
+        const globalX = tileX * tileSize + (i % tileSize);
+        const globalY = tileY * tileSize + Math.floor(i / tileSize);
+        accumulator.areaCells += 1;
+        accumulator.minTerrain = Math.min(accumulator.minTerrain, heights[i]);
+        accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
+        accumulator.volumeCellHeight += depth;
+        accumulator.minGlobalX = Math.min(accumulator.minGlobalX, globalX);
+        accumulator.minGlobalY = Math.min(accumulator.minGlobalY, globalY);
+        accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, globalX);
+        accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, globalY);
       }
-      const globalX = tileX * tileSize + (i % tileSize);
-      const globalY = tileY * tileSize + Math.floor(i / tileSize);
-      accumulator.areaCells += 1;
-      accumulator.minTerrain = Math.min(accumulator.minTerrain, heights[i]);
-      accumulator.maxDepth = Math.max(accumulator.maxDepth, depth);
-      accumulator.volumeCellHeight += depth;
-      accumulator.minGlobalX = Math.min(accumulator.minGlobalX, globalX);
-      accumulator.minGlobalY = Math.min(accumulator.minGlobalY, globalY);
-      accumulator.maxGlobalX = Math.max(accumulator.maxGlobalX, globalX);
-      accumulator.maxGlobalY = Math.max(accumulator.maxGlobalY, globalY);
     }
   }
 
@@ -503,12 +533,16 @@ export function materializeHydrologyTile(
     maxGlobalY[index] = accumulator.maxGlobalY;
     index += 1;
   }
+  const flatDistances = computeFlatDistances
+    ? initializeLocalFlatDistances(tileSize, tilesPerSide, tileX, tileY, drainageSurface, solved.labels)
+    : new Uint32Array(0);
 
   return {
     tileX,
     tileY,
     lakeFillHeights: lakeFillHeights.buffer,
     drainageSurface: drainageSurface.buffer,
+    flatDistances: flatDistances.buffer,
     basinIds,
     areaCells,
     minTerrain,
@@ -702,12 +736,12 @@ async function buildGlobalConditionedReceivers(
   jobs: TileJob[],
   useWorkers: boolean,
   surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>,
+  distanceBoundaries: HydrologyTileBoundaryIndex<Uint32Array>,
   onStatus?: (label: string) => void
 ): Promise<void> {
   if (!io.readDrainageSurfaceTile || !io.writeFlatDistanceTile || !io.readFlatDistanceTile || !io.writeReceiverDirectionTile) {
     throw new Error('Global flat routing requires drainage-surface, flat-distance, and receiver tile storage.');
   }
-  const distanceBoundaries = new HydrologyTileBoundaryIndex(Uint32Array, config.tileSize);
   const surfaceCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => (
     requireHydrologyTile(io.readDrainageSurfaceTile?.({ x, y, d: 0 }), 'drainage surface', x, y)
   ));
@@ -716,23 +750,6 @@ async function buildGlobalConditionedReceivers(
     (x, y) => requireHydrologyTile(io.readFlatDistanceTile?.({ x, y, d: 0 }), 'flat distance', x, y),
     (x, y, distances) => io.writeFlatDistanceTile?.({ x, y, d: 0 }, distances) ?? Promise.resolve()
   );
-
-  const initialDistanceWrites: Promise<void>[] = [];
-  const initialWriteConcurrency = Math.min(4, jobs.length);
-  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
-    const job = jobs[jobIndex];
-    onStatus?.(`Finding flat outlets ${jobIndex + 1} / ${jobs.length}`);
-    const surface = await surfaceCache.read(job.x, job.y);
-    const distances = initializeFlatDistances(config, job.x, job.y, surface, surfaceBoundaries);
-    initialDistanceWrites.push(io.writeFlatDistanceTile({ x: job.x, y: job.y, d: 0 }, distances));
-    await distanceCache.setClean(job.x, job.y, distances);
-    distanceBoundaries.set(job.x, job.y, distances);
-    if (initialDistanceWrites.length >= initialWriteConcurrency) {
-      await Promise.all(initialDistanceWrites);
-      initialDistanceWrites.length = 0;
-    }
-  }
-  await Promise.all(initialDistanceWrites);
 
   await convergeFlatTileQueue(config, jobs, (tileX, tileY) => (
     getFlatRelaxationPriority(config, tileX, tileY, surfaceBoundaries, distanceBoundaries)
@@ -854,18 +871,18 @@ async function buildPhysicalHydrologyTopology(
   };
 }
 
-function initializeFlatDistances(
-  config: WorldConfig,
+function initializeLocalFlatDistances(
+  tileSize: number,
+  tilesPerSide: number,
   tileX: number,
   tileY: number,
   surface: Uint16Array,
-  surfaceBoundaries: HydrologyTileBoundaryIndex<Uint16Array>
+  queue: Uint32Array
 ): Uint32Array {
-  const size = config.tileSize;
-  const fullSide = size * config.tilesPerSide;
+  const size = tileSize;
+  const fullSide = size * tilesPerSide;
   const distances = new Uint32Array(size * size);
   distances.fill(NO_FLOW_TARGET);
-  const queue = new Uint32Array(distances.length);
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
       const gx = tileX * size + x;
@@ -878,10 +895,8 @@ function initializeFlatDistances(
       for (let code = 1; code <= 8; code += 1) {
         const nx = x + D8_DX[code];
         const ny = y + D8_DY[code];
-        const neighbor = nx >= 0 && ny >= 0 && nx < size && ny < size
-          ? surface[ny * size + nx]
-          : surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
-        if (neighbor < current) {
+        if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+        if (surface[ny * size + nx] < current) {
           distances[y * size + x] = 0;
           break;
         }
@@ -949,8 +964,11 @@ function relaxFlatDistances(
         if (nx >= 0 && ny >= 0 && nx < size && ny < size) continue;
         const neighborHeight = surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
         const neighborDistance = distanceBoundaries.getOffset(tileX, tileY, nx, ny);
-        if (neighborHeight !== currentHeight || neighborDistance === NO_FLOW_TARGET) continue;
-        const candidate = neighborDistance + 1;
+        const candidate = neighborHeight < currentHeight
+          ? 0
+          : neighborHeight === currentHeight && neighborDistance !== NO_FLOW_TARGET
+            ? neighborDistance + 1
+            : NO_FLOW_TARGET;
         if (candidate < best) best = candidate;
       }
       if (best < distances[cell]) {
@@ -1149,7 +1167,8 @@ function getFlatRelaxationPriority(
       if (nx >= 0 && ny >= 0 && nx < size && ny < size) continue;
       const neighborHeight = surfaceBoundaries.getOffset(tileX, tileY, nx, ny);
       const neighborDistance = distanceBoundaries.getOffset(tileX, tileY, nx, ny);
-      if (neighborHeight === currentHeight && neighborDistance !== NO_FLOW_TARGET && neighborDistance + 1 < currentDistance) {
+      if (neighborHeight < currentHeight && currentDistance !== 0) priority = 0;
+      else if (neighborHeight === currentHeight && neighborDistance !== NO_FLOW_TARGET && neighborDistance + 1 < currentDistance) {
         priority = Math.min(priority, neighborDistance + 1);
       }
     }
@@ -1247,10 +1266,6 @@ class HydrologyWriteBackTileCache<T extends Uint8Array | Uint16Array | Uint32Arr
     const value = await this.load(x, y);
     await this.insert(key, { x, y, value }, false);
     return value;
-  }
-
-  async setClean(x: number, y: number, value: T): Promise<void> {
-    await this.insert(`${x},${y}`, { x, y, value }, false);
   }
 
   async setDirty(x: number, y: number, value: T): Promise<void> {
@@ -1618,6 +1633,7 @@ type HydrologyMaterializeResponse = {
   tileY: number;
   lakeFillHeights: ArrayBuffer;
   drainageSurface: ArrayBuffer;
+  flatDistances: ArrayBuffer;
   basinIds: ArrayBuffer;
   areaCells: ArrayBuffer;
   minTerrain: ArrayBuffer;
@@ -1685,7 +1701,10 @@ export type HydrologyWorkerRequest =
       tileX: number;
       tileY: number;
       tileSize: number;
+      tilesPerSide: number;
       labelOffset: number;
+      computeFlatDistances: boolean;
+      collectBasinStats: boolean;
       heights: ArrayBuffer;
       globalFillHeights: ArrayBuffer;
     }
@@ -1839,9 +1858,12 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     request.tileX,
     request.tileY,
     request.tileSize,
+    request.tilesPerSide,
     request.labelOffset,
     new Uint16Array(request.heights),
-    new Uint16Array(request.globalFillHeights)
+    new Uint16Array(request.globalFillHeights),
+    request.computeFlatDistances,
+    request.collectBasinStats
   );
   const response: HydrologyMaterializeResponse = {
     id: request.id,
@@ -1850,6 +1872,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
     tileY: result.tileY,
     lakeFillHeights: result.lakeFillHeights,
     drainageSurface: result.drainageSurface,
+    flatDistances: result.flatDistances,
     basinIds: result.basinIds.buffer,
     areaCells: result.areaCells.buffer,
     minTerrain: result.minTerrain.buffer,
