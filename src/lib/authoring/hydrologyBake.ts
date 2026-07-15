@@ -565,6 +565,13 @@ const DINF_TURN_STEPS = 65528;
 const DINF_SECTOR_STEPS = DINF_TURN_STEPS / 8;
 const DINF_CODES = new Uint8Array([1, 3, 2, 8, 4, 6, 5, 7]);
 const TWO_PI = Math.PI * 2;
+const DINF_SECTOR_LOOKUP = new Uint8Array(DINF_TURN_STEPS);
+const DINF_WEIGHT_B_LOOKUP = new Float64Array(DINF_TURN_STEPS);
+for (let encoded = 0; encoded < DINF_TURN_STEPS; encoded += 1) {
+  const sector = Math.floor(encoded / DINF_SECTOR_STEPS) & 7;
+  DINF_SECTOR_LOOKUP[encoded] = sector;
+  DINF_WEIGHT_B_LOOKUP[encoded] = (encoded - sector * DINF_SECTOR_STEPS) / DINF_SECTOR_STEPS;
+}
 
 interface PhysicalBasinAccumulator extends BasinAccumulator {
   fillHeight: number;
@@ -1254,9 +1261,8 @@ export function decodeDInfinityAngle(encoded: number): number | null {
 
 export function decodeDInfinityRecipients(encoded: number): { codeA: number; codeB: number; weightA: number; weightB: number } | null {
   if (encoded >= DINF_TURN_STEPS) return null;
-  const sector = Math.floor(encoded / DINF_SECTOR_STEPS) & 7;
-  const remainder = encoded - sector * DINF_SECTOR_STEPS;
-  const weightB = remainder / DINF_SECTOR_STEPS;
+  const sector = DINF_SECTOR_LOOKUP[encoded];
+  const weightB = DINF_WEIGHT_B_LOOKUP[encoded];
   return {
     codeA: DINF_CODES[sector],
     codeB: DINF_CODES[(sector + 1) & 7],
@@ -1599,22 +1605,54 @@ async function runFlowStrengthBake(
   if (!io.writeFlowStrengthTile || !io.readReceiverDirectionTile || !io.writeFlowAccumulationTile || !io.readFlowAccumulationTile) {
     return { enabled: false, maxFlowAccumulation: 0, completed: completedStart };
   }
+  const sharedWorkers = useWorkers
+    ? Array.from(
+        { length: Math.min(getHydrologyWorkerConcurrency(), jobs.length) },
+        () => new Worker(new URL('./bakeWorker.ts', import.meta.url), { type: 'module' })
+      )
+    : undefined;
+  try {
+    return await runFlowStrengthBakeInternal(config, io, jobs, useWorkers, completedStart, total, onProgress, sharedWorkers);
+  } finally {
+    for (const worker of sharedWorkers ?? []) worker.terminate();
+  }
+}
 
+async function runFlowStrengthBakeInternal(
+  config: WorldConfig,
+  io: HydrologyTileIO,
+  jobs: TileJob[],
+  useWorkers: boolean,
+  completedStart: number,
+  total: number,
+  onProgress?: (progress: HydrologyProgress) => void,
+  sharedWorkers?: Worker[]
+): Promise<{ enabled: boolean; maxFlowAccumulation: number; completed: number }> {
   let completed = completedStart;
   const borderCellCount = Math.max(1, config.tileSize * 4 - 4);
   const incomingTotals = Array.from({ length: jobs.length }, () => new Float64Array(borderCellCount));
   const pending = Array.from({ length: jobs.length }, () => new Float64Array(borderCellCount));
-  const receiverCache = new HydrologyTileCache<Uint16Array>(Math.min(16, jobs.length), (x, y) => (
+  const receiverTileBytes = config.tileSize * config.tileSize * Uint16Array.BYTES_PER_ELEMENT;
+  const cacheReceiversInWorkers = Boolean(sharedWorkers) && receiverTileBytes * jobs.length <= 96 * 1024 * 1024;
+  const receiverCacheCapacity = Math.min(jobs.length, Math.max(4, Math.floor(32 * 1024 * 1024 / receiverTileBytes)));
+  const receiverCache = new HydrologyTileCache<Uint16Array>(receiverCacheCapacity, (x, y) => (
     requireReceiverDirections(io, { x, y, d: 0 })
   ));
-  let activeTiles = new Set<number>();
-  const deliver = (targetCell: number, flow: number): void => {
-    if (!(flow > 0) || !Number.isFinite(flow)) return;
+  const tileEdges = Array.from({ length: jobs.length }, () => new Set<number>());
+  const pendingTiles = new Set<number>();
+  let componentByTile: Int32Array | null = null;
+  let activeComponents: Uint8Array | null = null;
+  let nextComponentWaveTiles: Set<number> | null = null;
+  const deliver = (targetCell: number, flow: number): number => {
+    if (!(flow > 0) || !Number.isFinite(flow)) return -1;
     const target = locateBoundaryCell(config, targetCell);
     const index = tileIndex(config, target.tileX, target.tileY);
     incomingTotals[index][target.borderOffset] += flow;
     pending[index][target.borderOffset] += flow;
-    activeTiles.add(index);
+    pendingTiles.add(index);
+    const component = componentByTile?.[index] ?? -1;
+    if (component >= 0 && activeComponents?.[component]) nextComponentWaveTiles?.add(index);
+    return index;
   };
   await runHydrologyWorkerPool(
     jobs,
@@ -1626,6 +1664,7 @@ async function runFlowStrengthBake(
       tileSize: config.tileSize,
       tilesPerSide: config.tilesPerSide,
       receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
+      cacheReceiverDirections: cacheReceiversInWorkers,
       incomingCells: new Uint32Array(0).buffer,
       incomingFlows: new Float64Array(0).buffer,
       includeBase: true
@@ -1634,51 +1673,78 @@ async function runFlowStrengthBake(
       if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
       const targets = new Uint32Array(response.baseTargetCells);
       const flows = new Float64Array(response.baseFlows);
-      for (let i = 0; i < targets.length; i += 1) deliver(targets[i], flows[i]);
+      const source = tileIndex(config, response.tileX, response.tileY);
+      for (let i = 0; i < targets.length; i += 1) {
+        const target = deliver(targets[i], flows[i]);
+        if (target >= 0 && target !== source) tileEdges[source].add(target);
+      }
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Analyzing flow ${completed - config.tilesPerSide * config.tilesPerSide * 2 - 1} / ${jobs.length}` });
     },
-    useWorkers
+    useWorkers,
+    sharedWorkers
   );
 
+  const componentOrder = buildTileComponentOrder(tileEdges);
+  componentByTile = componentOrder.componentByTile;
   let propagationRound = 0;
   const fullSide = config.tileSize * config.tilesPerSide;
   const maxPropagationRounds = fullSide * fullSide;
-  while (activeTiles.size > 0) {
-    propagationRound += 1;
-    if (propagationRound > maxPropagationRounds) throw new Error('Cross-tile D-infinity flow propagation did not converge.');
-    const roundTiles = [...activeTiles].sort((a, b) => a - b);
-    activeTiles = new Set<number>();
-    const roundInputs = new Map<number, { cells: Uint32Array; flows: Float64Array }>();
-    for (const index of roundTiles) roundInputs.set(index, consumeBoundaryFlows(config.tileSize, pending[index]));
-    onProgress?.({ phase: 'hydrology', current: completed, total, label: `Resolving cross-tile flow (wave ${propagationRound}, ${roundTiles.length} tiles)` });
-    await runHydrologyWorkerPool(
-      roundTiles.map((index) => ({ x: index % config.tilesPerSide, y: Math.floor(index / config.tilesPerSide) })),
-      async (job, id) => {
-        const input = roundInputs.get(tileIndex(config, job.x, job.y));
-        if (!input) throw new Error('Missing cross-tile flow wave input.');
-        return {
-          id,
-          type: 'hydrology-flow-analyze-tile',
-          tileX: job.x,
-          tileY: job.y,
-          tileSize: config.tileSize,
-          tilesPerSide: config.tilesPerSide,
-          receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
-          incomingCells: input.cells.buffer,
-          incomingFlows: input.flows.buffer,
-          includeBase: false
-        };
-      },
-      async (response) => {
-        if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
-        const targets = new Uint32Array(response.baseTargetCells);
-        const flows = new Float64Array(response.baseFlows);
-        for (let i = 0; i < targets.length; i += 1) deliver(targets[i], flows[i]);
-      },
-      useWorkers
-    );
+  for (let levelIndex = 0; levelIndex < componentOrder.levels.length; levelIndex += 1) {
+    const level = componentOrder.levels[levelIndex];
+    activeComponents = new Uint8Array(componentOrder.componentCount);
+    for (const index of level) activeComponents[componentByTile[index]] = 1;
+    let waveTiles = new Set(level.filter((index) => pendingTiles.has(index)));
+    while (waveTiles.size > 0) {
+      propagationRound += 1;
+      if (propagationRound > maxPropagationRounds) throw new Error('Cross-tile D-infinity flow propagation did not converge.');
+      const roundTiles = [...waveTiles].sort((a, b) => a - b);
+      nextComponentWaveTiles = new Set<number>();
+      const roundInputs = new Map<number, { cells: Uint32Array; flows: Float64Array }>();
+      for (const index of roundTiles) {
+        roundInputs.set(index, consumeBoundaryFlows(config.tileSize, pending[index]));
+        pendingTiles.delete(index);
+      }
+      onProgress?.({
+        phase: 'hydrology',
+        current: completed,
+        total,
+        label: `Resolving cross-tile flow (${levelIndex + 1}/${componentOrder.levels.length}, ${roundTiles.length} tiles)`
+      });
+      await runHydrologyWorkerPool(
+        roundTiles.map((index) => ({ x: index % config.tilesPerSide, y: Math.floor(index / config.tilesPerSide) })),
+        async (job, id) => {
+          const input = roundInputs.get(tileIndex(config, job.x, job.y));
+          if (!input) throw new Error('Missing cross-tile flow component input.');
+          return {
+            id,
+            type: 'hydrology-flow-analyze-tile',
+            tileX: job.x,
+            tileY: job.y,
+            tileSize: config.tileSize,
+            tilesPerSide: config.tilesPerSide,
+            receiverDirections: cacheReceiversInWorkers ? new ArrayBuffer(0) : (await receiverCache.read(job.x, job.y)).slice().buffer,
+            cacheReceiverDirections: cacheReceiversInWorkers,
+            incomingCells: input.cells.buffer as ArrayBuffer,
+            incomingFlows: input.flows.buffer as ArrayBuffer,
+            includeBase: false
+          };
+        },
+        async (response) => {
+          if (response.type !== 'hydrology-flow-analyze-result') throw new Error(`Unexpected hydrology response ${response.type}`);
+          const targets = new Uint32Array(response.baseTargetCells);
+          const flows = new Float64Array(response.baseFlows);
+          for (let i = 0; i < targets.length; i += 1) deliver(targets[i], flows[i]);
+        },
+        useWorkers,
+        sharedWorkers
+      );
+      waveTiles = nextComponentWaveTiles;
+    }
   }
+  if (pendingTiles.size > 0) throw new Error('Cross-tile D-infinity flow left unresolved tile inputs.');
+  activeComponents = null;
+  nextComponentWaveTiles = null;
   completed += 1;
   onProgress?.({ phase: 'hydrology', current: completed, total, label: 'Resolving cross-tile flow' });
 
@@ -1694,9 +1760,10 @@ async function runFlowStrengthBake(
         tileY: job.y,
         tileSize: config.tileSize,
         tilesPerSide: config.tilesPerSide,
-        receiverDirections: (await receiverCache.read(job.x, job.y)).slice().buffer,
-        incomingCells: incoming.cells.buffer,
-        incomingFlows: incoming.flows.buffer
+        receiverDirections: cacheReceiversInWorkers ? new ArrayBuffer(0) : (await receiverCache.read(job.x, job.y)).slice().buffer,
+        cacheReceiverDirections: cacheReceiversInWorkers,
+        incomingCells: incoming.cells.buffer as ArrayBuffer,
+        incomingFlows: incoming.flows.buffer as ArrayBuffer
       };
     },
     async (response) => {
@@ -1709,7 +1776,8 @@ async function runFlowStrengthBake(
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Measuring flow ${completed - config.tilesPerSide * config.tilesPerSide * 3 - 2} / ${jobs.length}` });
     },
-    useWorkers
+    useWorkers,
+    sharedWorkers
   );
 
   await runHydrologyWorkerPool(
@@ -1720,7 +1788,7 @@ async function runFlowStrengthBake(
         type: 'hydrology-flow-materialize-tile',
         tileX: job.x,
         tileY: job.y,
-        flowAccumulation: (await requireFlowAccumulation(io, { x: job.x, y: job.y, d: 0 })).buffer,
+        flowAccumulation: (await requireFlowAccumulation(io, { x: job.x, y: job.y, d: 0 })).buffer as ArrayBuffer,
         maxFlowAccumulation
       };
     },
@@ -1730,7 +1798,8 @@ async function runFlowStrengthBake(
       completed += 1;
       onProgress?.({ phase: 'hydrology', current: completed, total, label: `Writing flow strength ${completed - config.tilesPerSide * config.tilesPerSide * 4 - 2} / ${jobs.length}` });
     },
-    useWorkers
+    useWorkers,
+    sharedWorkers
   );
 
   return { enabled: true, maxFlowAccumulation, completed };
@@ -1784,6 +1853,100 @@ function consumeBoundaryFlows(tileSize: number, boundary: Float64Array): { cells
   return result;
 }
 
+function buildTileComponentOrder(tileEdgeSets: Set<number>[]): { componentByTile: Int32Array; componentCount: number; levels: number[][] } {
+  const edges = tileEdgeSets.map((targets) => [...targets].sort((a, b) => a - b));
+  const reverse = Array.from({ length: edges.length }, () => [] as number[]);
+  for (let source = 0; source < edges.length; source += 1) {
+    for (const target of edges[source]) reverse[target].push(source);
+  }
+  const visited = new Uint8Array(edges.length);
+  const finishOrder: number[] = [];
+  for (let start = 0; start < edges.length; start += 1) {
+    if (visited[start]) continue;
+    const nodes = [start];
+    const cursors = [0];
+    visited[start] = 1;
+    while (nodes.length > 0) {
+      const stackIndex = nodes.length - 1;
+      const node = nodes[stackIndex];
+      const cursor = cursors[stackIndex];
+      if (cursor < edges[node].length) {
+        const target = edges[node][cursor];
+        cursors[stackIndex] += 1;
+        if (!visited[target]) {
+          visited[target] = 1;
+          nodes.push(target);
+          cursors.push(0);
+        }
+      } else {
+        finishOrder.push(node);
+        nodes.pop();
+        cursors.pop();
+      }
+    }
+  }
+
+  const componentByTile = new Int32Array(edges.length);
+  componentByTile.fill(-1);
+  const components: number[][] = [];
+  for (let orderIndex = finishOrder.length - 1; orderIndex >= 0; orderIndex -= 1) {
+    const start = finishOrder[orderIndex];
+    if (componentByTile[start] >= 0) continue;
+    const componentId = components.length;
+    const component: number[] = [];
+    const stack = [start];
+    componentByTile[start] = componentId;
+    while (stack.length > 0) {
+      const node = stack.pop() as number;
+      component.push(node);
+      for (const source of reverse[node]) {
+        if (componentByTile[source] >= 0) continue;
+        componentByTile[source] = componentId;
+        stack.push(source);
+      }
+    }
+    component.sort((a, b) => a - b);
+    components.push(component);
+  }
+
+  const componentEdges = Array.from({ length: components.length }, () => new Set<number>());
+  const indegree = new Uint32Array(components.length);
+  for (let source = 0; source < edges.length; source += 1) {
+    const sourceComponent = componentByTile[source];
+    for (const target of edges[source]) {
+      const targetComponent = componentByTile[target];
+      if (sourceComponent === targetComponent || componentEdges[sourceComponent].has(targetComponent)) continue;
+      componentEdges[sourceComponent].add(targetComponent);
+      indegree[targetComponent] += 1;
+    }
+  }
+  const queue: number[] = [];
+  for (let component = 0; component < components.length; component += 1) if (indegree[component] === 0) queue.push(component);
+  const levels: number[][] = [];
+  let head = 0;
+  while (head < queue.length) {
+    const levelEnd = queue.length;
+    const level: number[] = [];
+    while (head < levelEnd) {
+      const component = queue[head++];
+      level.push(...components[component]);
+      for (const target of componentEdges[component]) {
+        indegree[target] -= 1;
+        if (indegree[target] === 0) queue.push(target);
+      }
+    }
+    level.sort((a, b) => a - b);
+    levels.push(level);
+  }
+  let orderedComponentCount = 0;
+  for (const level of levels) {
+    const ids = new Set(level.map((tile) => componentByTile[tile]));
+    orderedComponentCount += ids.size;
+  }
+  if (orderedComponentCount !== components.length) throw new Error('Tile component graph unexpectedly contains a cycle.');
+  return { componentByTile, componentCount: components.length, levels };
+}
+
 async function requireReceiverDirections(io: HydrologyTileIO, key: TileKey): Promise<Uint16Array> {
   const directions = await io.readReceiverDirectionTile?.(key);
   if (!directions) throw new Error(`Missing conditioned receiver tile d${key.d}/y${key.y}/x${key.x}.`);
@@ -1806,23 +1969,23 @@ export function analyzeFlowTile(
   incomingFlows?: Float64Array,
   includeBase = true
 ): FlowTileAnalysisResult {
-  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, receiverDirections);
-  const incoming = incomingCells && incomingFlows ? incomingFromArrays(tileSize, incomingCells, incomingFlows) : undefined;
-  const accumulation = accumulateLocalFlow(routing, incoming, includeBase);
-  const baseMap = new Map<number, number>();
-  for (let i = 0; i < routing.outboundTargetsA.length; i += 1) {
-    const flow = accumulation.values[i];
-    const targetA = routing.outboundTargetsA[i];
-    const targetB = routing.outboundTargetsB[i];
-    if (targetA !== NO_FLOW_TARGET) baseMap.set(targetA, (baseMap.get(targetA) ?? 0) + flow * routing.weightsA[i]);
-    if (targetB !== NO_FLOW_TARGET) baseMap.set(targetB, (baseMap.get(targetB) ?? 0) + flow * routing.weightsB[i]);
-  }
+  const accumulation = accumulateDirectionTile(
+    tileX,
+    tileY,
+    tileSize,
+    tilesPerSide,
+    receiverDirections,
+    incomingCells,
+    incomingFlows,
+    includeBase,
+    true
+  );
 
   return {
     tileX,
     tileY,
-    baseTargetCells: Uint32Array.from(baseMap.keys()),
-    baseFlows: Float64Array.from(baseMap.values()),
+    baseTargetCells: Uint32Array.from(accumulation.outbound.keys()),
+    baseFlows: Float64Array.from(accumulation.outbound.values()),
     transferFromCells: new Uint32Array(0),
     transferToCells: new Uint32Array(0)
   };
@@ -1837,8 +2000,17 @@ export function computeFlowTileMax(
   incomingCells: Uint32Array,
   incomingFlows: Float64Array
 ): FlowTileMaxResult {
-  const routing = buildFlowRouting(tileX, tileY, tileSize, tilesPerSide, receiverDirections);
-  const accumulation = accumulateLocalFlow(routing, incomingFromArrays(tileSize, incomingCells, incomingFlows));
+  const accumulation = accumulateDirectionTile(
+    tileX,
+    tileY,
+    tileSize,
+    tilesPerSide,
+    receiverDirections,
+    incomingCells,
+    incomingFlows,
+    true,
+    false
+  );
   return {
     tileX,
     tileY,
@@ -2002,6 +2174,7 @@ export type HydrologyWorkerRequest =
       tileSize: number;
       tilesPerSide: number;
       receiverDirections: ArrayBuffer;
+      cacheReceiverDirections: boolean;
       incomingCells: ArrayBuffer;
       incomingFlows: ArrayBuffer;
       includeBase: boolean;
@@ -2043,6 +2216,7 @@ export type HydrologyWorkerRequest =
       tileSize: number;
       tilesPerSide: number;
       receiverDirections: ArrayBuffer;
+      cacheReceiverDirections: boolean;
       incomingCells: ArrayBuffer;
       incomingFlows: ArrayBuffer;
     }
@@ -2054,6 +2228,27 @@ export type HydrologyWorkerRequest =
       flowAccumulation: ArrayBuffer;
       maxFlowAccumulation: number;
     };
+
+const workerReceiverDirectionCache = new Map<string, Uint16Array>();
+
+function workerReceiverDirections(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  tilesPerSide: number,
+  buffer: ArrayBuffer,
+  cache: boolean
+): Uint16Array {
+  const key = `${tileSize}:${tilesPerSide}:${tileX}:${tileY}`;
+  if (buffer.byteLength > 0) {
+    const directions = new Uint16Array(buffer);
+    if (cache) workerReceiverDirectionCache.set(key, directions);
+    return directions;
+  }
+  const cached = workerReceiverDirectionCache.get(key);
+  if (!cached) throw new Error(`Flow worker is missing cached receiver directions for tile ${tileX},${tileY}.`);
+  return cached;
+}
 
 export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): { response: HydrologyWorkerResponse; transfers: Transferable[] } {
   if (request.type === 'hydrology-analyze-tile') {
@@ -2086,7 +2281,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint16Array(request.receiverDirections),
+      workerReceiverDirections(request.tileX, request.tileY, request.tileSize, request.tilesPerSide, request.receiverDirections, request.cacheReceiverDirections),
       new Uint32Array(request.incomingCells),
       new Float64Array(request.incomingFlows),
       request.includeBase
@@ -2180,7 +2375,7 @@ export function createHydrologyWorkerResponse(request: HydrologyWorkerRequest): 
       request.tileY,
       request.tileSize,
       request.tilesPerSide,
-      new Uint16Array(request.receiverDirections),
+      workerReceiverDirections(request.tileX, request.tileY, request.tileSize, request.tilesPerSide, request.receiverDirections, request.cacheReceiverDirections),
       new Uint32Array(request.incomingCells),
       new Float64Array(request.incomingFlows)
     );
@@ -2253,7 +2448,8 @@ async function runHydrologyWorkerPool(
   jobs: TileJob[],
   createRequest: (job: TileJob, id: number) => Promise<HydrologyWorkerRequest>,
   handleResult: (response: HydrologyWorkerResponse) => Promise<void>,
-  useWorkers: boolean
+  useWorkers: boolean,
+  sharedWorkers?: Worker[]
 ): Promise<void> {
   if (!useWorkers) {
     let id = 1;
@@ -2265,15 +2461,29 @@ async function runHydrologyWorkerPool(
     return;
   }
 
-  const concurrency = Math.min(getHydrologyWorkerConcurrency(), jobs.length);
+  const concurrency = sharedWorkers?.length ?? Math.min(getHydrologyWorkerConcurrency(), jobs.length);
   let nextJobIndex = 0;
   let nextRequestId = 1;
-  const workers = Array.from({ length: concurrency }, () => new Worker(new URL('./bakeWorker.ts', import.meta.url), { type: 'module' }));
+  const ownsWorkers = !sharedWorkers;
+  const workers = sharedWorkers
+    ? sharedWorkers.slice(0, concurrency)
+    : Array.from({ length: concurrency }, () => new Worker(new URL('./bakeWorker.ts', import.meta.url), { type: 'module' }));
+  const pinnedJobIndices = sharedWorkers ? Array.from({ length: workers.length }, () => [] as number[]) : null;
+  const pinnedCursors = sharedWorkers ? new Uint32Array(workers.length) : null;
+  if (pinnedJobIndices) {
+    for (let index = 0; index < jobs.length; index += 1) {
+      const job = jobs[index];
+      const workerIndex = ((Math.imul(job.y, 65537) + job.x) >>> 0) % workers.length;
+      pinnedJobIndices[workerIndex].push(index);
+    }
+  }
   try {
-    await Promise.all(workers.map((worker) => new Promise<void>((resolveWorker, rejectWorker) => {
+    await Promise.all(workers.map((worker, workerIndex) => new Promise<void>((resolveWorker, rejectWorker) => {
       const runNext = (): void => {
-        const job = jobs[nextJobIndex];
-        nextJobIndex += 1;
+        const pinnedIndex = pinnedJobIndices?.[workerIndex][pinnedCursors?.[workerIndex] ?? 0];
+        if (pinnedCursors && pinnedIndex !== undefined) pinnedCursors[workerIndex] += 1;
+        const jobIndex = pinnedJobIndices ? pinnedIndex : nextJobIndex++;
+        const job = jobIndex === undefined ? undefined : jobs[jobIndex];
         if (!job) {
           resolveWorker();
           return;
@@ -2297,7 +2507,7 @@ async function runHydrologyWorkerPool(
       runNext();
     })));
   } finally {
-    for (const worker of workers) worker.terminate();
+    if (ownsWorkers) for (const worker of workers) worker.terminate();
   }
 }
 
@@ -2312,123 +2522,111 @@ function getHydrologyRequestTransfers(request: HydrologyWorkerRequest): Transfer
   return [request.flowAccumulation];
 }
 
-interface FlowRouting {
-  receiversA: Int32Array;
-  receiversB: Int32Array;
-  weightsA: Float64Array;
-  weightsB: Float64Array;
-  outboundTargetsA: Uint32Array;
-  outboundTargetsB: Uint32Array;
-  indegree: Uint32Array;
-  order: Uint32Array;
-}
-
-function buildFlowRouting(tileX: number, tileY: number, tileSize: number, tilesPerSide: number, receiverDirections: Uint16Array): FlowRouting {
+function accumulateDirectionTile(
+  tileX: number,
+  tileY: number,
+  tileSize: number,
+  tilesPerSide: number,
+  receiverDirections: Uint16Array,
+  incomingCells: Uint32Array | undefined,
+  incomingFlows: Float64Array | undefined,
+  includeBase: boolean,
+  collectOutbound: boolean
+): { values: Float64Array; max: number; outbound: Map<number, number> } {
   const sampleCount = tileSize * tileSize;
-  const receiversA = new Int32Array(sampleCount);
-  const receiversB = new Int32Array(sampleCount);
-  const weightsA = new Float64Array(sampleCount);
-  const weightsB = new Float64Array(sampleCount);
-  const outboundTargetsA = new Uint32Array(sampleCount);
-  const outboundTargetsB = new Uint32Array(sampleCount);
-  const indegree = new Uint32Array(sampleCount);
-  receiversA.fill(-1);
-  receiversB.fill(-1);
-  outboundTargetsA.fill(NO_FLOW_TARGET);
-  outboundTargetsB.fill(NO_FLOW_TARGET);
+  const values = new Float64Array(sampleCount);
+  const indegree = new Uint8Array(sampleCount);
+  const activeCells = includeBase ? null : new Uint32Array(sampleCount);
+  const discovered = includeBase ? null : new Uint8Array(sampleCount);
+  let activeCount = includeBase ? sampleCount : 0;
   const fullSide = tileSize * tilesPerSide;
   const originX = tileX * tileSize;
   const originY = tileY * tileSize;
-
-  for (let y = 0; y < tileSize; y += 1) {
-    for (let x = 0; x < tileSize; x += 1) {
-      const index = y * tileSize + x;
-      const currentGlobalX = originX + x;
-      const currentGlobalY = originY + y;
-      const split = decodeDInfinityRecipients(receiverDirections[index]);
-      if (!split) continue;
-      const assign = (slot: 0 | 1, code: number, weight: number): void => {
-        if (weight <= 0) return;
-        const dx = D8_DX[code];
-        const dy = D8_DY[code];
-        const globalX = currentGlobalX + dx;
-        const globalY = currentGlobalY + dy;
-        if (globalX < 0 || globalY < 0 || globalX >= fullSide || globalY >= fullSide) return;
-        const rx = x + dx;
-        const ry = y + dy;
-        const receiver = rx >= 0 && ry >= 0 && rx < tileSize && ry < tileSize ? ry * tileSize + rx : -1;
-        if (slot === 0) {
-          receiversA[index] = receiver;
-          weightsA[index] = weight;
-          if (receiver < 0) outboundTargetsA[index] = globalY * fullSide + globalX;
-        } else {
-          receiversB[index] = receiver;
-          weightsB[index] = weight;
-          if (receiver < 0) outboundTargetsB[index] = globalY * fullSide + globalX;
-        }
-        if (receiver >= 0) indegree[receiver] += 1;
-      };
-      assign(0, split.codeA, split.weightA);
-      assign(1, split.codeB, split.weightB);
+  if (includeBase) {
+    values.fill(1);
+  }
+  if (incomingCells && incomingFlows) {
+    for (let i = 0; i < incomingCells.length; i += 1) {
+      const cell = incomingCells[i];
+      const flow = incomingFlows[i];
+      if (cell >= sampleCount || flow === 0) continue;
+      values[cell] += flow;
+      if (discovered && discovered[cell] === 0) {
+        discovered[cell] = 1;
+        (activeCells as Uint32Array)[activeCount++] = cell;
+      }
     }
   }
 
-  const order = buildFlowTopologicalOrder(receiversA, receiversB, indegree);
-  return { receiversA, receiversB, weightsA, weightsB, outboundTargetsA, outboundTargetsB, indegree, order };
-}
-
-function buildFlowTopologicalOrder(receiversA: Int32Array, receiversB: Int32Array, indegree: Uint32Array): Uint32Array {
-  const degree = new Uint32Array(indegree);
-  const queue = new Uint32Array(receiversA.length);
-  const order = new Uint32Array(receiversA.length);
-  let head = 0;
-  let tail = 0;
-  let orderLength = 0;
-  for (let i = 0; i < degree.length; i += 1) {
-    if (degree[i] === 0) {
-      queue[tail] = i;
-      tail += 1;
+  for (let cursor = 0; cursor < activeCount; cursor += 1) {
+    const cell = activeCells ? activeCells[cursor] : cursor;
+    const encoded = receiverDirections[cell];
+    if (encoded >= DINF_TURN_STEPS) continue;
+    const sector = DINF_SECTOR_LOOKUP[encoded];
+    const weightB = DINF_WEIGHT_B_LOOKUP[encoded];
+    const y = Math.floor(cell / tileSize);
+    const x = cell - y * tileSize;
+    for (let branch = 0; branch < 2; branch += 1) {
+      if (branch === 1 && weightB === 0) continue;
+      const code = DINF_CODES[(sector + branch) & 7];
+      const receiverX = x + D8_DX[code];
+      const receiverY = y + D8_DY[code];
+      if (receiverX < 0 || receiverY < 0 || receiverX >= tileSize || receiverY >= tileSize) continue;
+      const receiver = receiverY * tileSize + receiverX;
+      indegree[receiver] += 1;
+      if (discovered && discovered[receiver] === 0) {
+        discovered[receiver] = 1;
+        (activeCells as Uint32Array)[activeCount++] = receiver;
+      }
     }
   }
-  while (head < tail) {
-    const current = queue[head];
-    head += 1;
-    order[orderLength] = current;
-    orderLength += 1;
-    const visit = (receiver: number): void => {
-      if (receiver < 0) return;
-      degree[receiver] -= 1;
-      if (degree[receiver] === 0) queue[tail++] = receiver;
-    };
-    visit(receiversA[current]);
-    visit(receiversB[current]);
-  }
-  for (let i = 0; i < receiversA.length; i += 1) {
-    if (degree[i] > 0) {
-      order[orderLength] = i;
-      orderLength += 1;
-    }
-  }
-  return order;
-}
 
-function accumulateLocalFlow(routing: FlowRouting, incoming?: Float64Array, includeBase = true): { values: Float64Array; max: number } {
-  const values = new Float64Array(routing.receiversA.length);
-  if (includeBase) values.fill(1);
-  if (incoming) {
-    for (let i = 0; i < incoming.length; i += 1) values[i] += incoming[i];
+  const queue = new Uint32Array(activeCount);
+  let queueHead = 0;
+  let queueTail = 0;
+  for (let i = 0; i < activeCount; i += 1) {
+    const cell = activeCells ? activeCells[i] : i;
+    if (indegree[cell] === 0) queue[queueTail++] = cell;
   }
-  let max = 1;
-  for (let i = 0; i < routing.order.length; i += 1) {
-    const current = routing.order[i];
-    const flow = values[current];
+  const outbound = new Map<number, number>();
+  let max = includeBase ? 1 : 0;
+  while (queueHead < queueTail) {
+    const cell = queue[queueHead++];
+    const flow = values[cell];
     if (flow > max) max = flow;
-    const receiverA = routing.receiversA[current];
-    const receiverB = routing.receiversB[current];
-    if (receiverA >= 0) values[receiverA] += flow * routing.weightsA[current];
-    if (receiverB >= 0) values[receiverB] += flow * routing.weightsB[current];
+    const encoded = receiverDirections[cell];
+    if (encoded >= DINF_TURN_STEPS) continue;
+    const sector = DINF_SECTOR_LOOKUP[encoded];
+    const weightB = DINF_WEIGHT_B_LOOKUP[encoded];
+    const y = Math.floor(cell / tileSize);
+    const x = cell - y * tileSize;
+    const globalX = originX + x;
+    const globalY = originY + y;
+    for (let branch = 0; branch < 2; branch += 1) {
+      const weight = branch === 0 ? 1 - weightB : weightB;
+      if (weight <= 0) continue;
+      const code = DINF_CODES[(sector + branch) & 7];
+      const dx = D8_DX[code];
+      const dy = D8_DY[code];
+      const receiverX = x + dx;
+      const receiverY = y + dy;
+      if (receiverX >= 0 && receiverY >= 0 && receiverX < tileSize && receiverY < tileSize) {
+        const receiver = receiverY * tileSize + receiverX;
+        values[receiver] += flow * weight;
+        indegree[receiver] -= 1;
+        if (indegree[receiver] === 0) queue[queueTail++] = receiver;
+      } else if (collectOutbound) {
+        const targetX = globalX + dx;
+        const targetY = globalY + dy;
+        if (targetX >= 0 && targetY >= 0 && targetX < fullSide && targetY < fullSide) {
+          const target = targetY * fullSide + targetX;
+          outbound.set(target, (outbound.get(target) ?? 0) + flow * weight);
+        }
+      }
+    }
   }
-  return { values, max };
+  if (queueTail !== activeCount) throw new Error('D-infinity receiver tile contains a cycle.');
+  return { values, max, outbound };
 }
 
 function collectTileBorderCells(tileSize: number): Uint32Array {
@@ -2440,14 +2638,6 @@ function collectTileBorderCells(tileSize: number): Uint32Array {
   for (let x = tileSize - 1; x >= 0; x -= 1) cells[index++] = (tileSize - 1) * tileSize + x;
   for (let y = tileSize - 2; y >= 1; y -= 1) cells[index++] = y * tileSize;
   return cells;
-}
-
-function incomingFromArrays(tileSize: number, incomingCells: Uint32Array, incomingFlows: Float64Array): Float64Array {
-  const incoming = new Float64Array(tileSize * tileSize);
-  for (let i = 0; i < incomingCells.length; i += 1) {
-    incoming[incomingCells[i]] += incomingFlows[i] ?? 0;
-  }
-  return incoming;
 }
 
 function solveLocalTile(tileSize: number, heights: Uint16Array): { filled: Uint16Array; labels: Uint32Array; labelCount: number } {
