@@ -576,7 +576,7 @@
         return;
       }
       commitAuthoring({ ...authoringDocument, hydrology: result.hydrology }, { stale: false });
-      status = `${result.source.name} ${result.replaced ? 'rebuilt' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}.`;
+      status = `${result.source.name} ${result.replaced ? 'rebuilt' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}. Basins: ${result.basinDiagnostics.continuous} continuous, ${result.basinDiagnostics.terminal} terminal.`;
     } catch (error) {
       status = error instanceof Error ? error.message : 'Could not route the river.';
     } finally {
@@ -675,7 +675,8 @@
         ...authoringDocument.hydrology,
         waterBodies: [],
         riverSources: [],
-        reaches: []
+        reaches: [],
+        basinNodes: []
       }
     }, { stale: false });
     status = `Cleared ${lakeCount} ${lakeCount === 1 ? 'lake' : 'lakes'} and ${riverCount} ${riverCount === 1 ? 'river' : 'rivers'}.`;

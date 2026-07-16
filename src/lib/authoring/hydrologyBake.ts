@@ -954,6 +954,10 @@ async function buildPhysicalHydrologyTopology(
   const minCellY = new Uint32Array(ids.length);
   const maxCellX = new Uint32Array(ids.length);
   const maxCellY = new Uint32Array(ids.length);
+  const outletWeights = new Float64Array(ids.length);
+  const outletElevations = new Uint32Array(ids.length);
+  outletWeights.fill(-1);
+  outletElevations.fill(NO_FLOW_TARGET);
   spillCells.fill(NO_FLOW_TARGET);
   downstreamCells.fill(NO_FLOW_TARGET);
   for (let i = 0; i < ids.length; i += 1) {
@@ -988,30 +992,48 @@ async function buildPhysicalHydrologyTopology(
   }
   const basinCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
   const receiverCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => requireHydrologyTile(io.readReceiverDirectionTile?.({ x, y, d: 0 }), 'receiver', x, y));
+  const terrainCache = new HydrologyTileCache<Uint16Array>(12, (x, y) => io.readTile({ x, y, d: 0 }));
   const fullSide = config.tileSize * config.tilesPerSide;
   for (const job of jobs) {
-    const [basins, receivers, basinHalo] = await Promise.all([
+    const [basins, receivers, basinHalo, terrainHalo] = await Promise.all([
       basinCache.read(job.x, job.y),
       receiverCache.read(job.x, job.y),
-      readCachedHalo(config, job.x, job.y, basinCache, Uint32Array)
+      readCachedHalo(config, job.x, job.y, basinCache, Uint32Array),
+      readCachedHalo(config, job.x, job.y, terrainCache, Uint16Array)
     ]);
     const size = config.tileSize;
     const stride = size + 2;
     for (let cell = 0; cell < basins.length; cell += 1) {
       const basinId = basins[cell];
       if (basinId === 0) continue;
-      const code = dominantDInfinityCode(receivers[cell]);
-      if (code === 0) continue;
+      const recipient = dominantDInfinityRecipient(receivers[cell]);
+      if (!recipient) continue;
+      const code = recipient.code;
       const x = cell % size;
       const y = Math.floor(cell / size);
       const downstreamId = basinHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
       if (downstreamId === basinId) continue;
       const index = idToIndex.get(basinId);
       if (index === undefined) continue;
+      const downstreamHeight = terrainHalo[(y + 1 + D8_DY[code]) * stride + x + 1 + D8_DX[code]];
+      // A real filled-basin spill cannot climb materially above the basin's
+      // water level. Reject receiver crossings onto higher banks; those are
+      // the candidates that commonly leave and then route back into the lake.
+      if (downstreamHeight > fillHeights[index] + 1) continue;
       const globalX = job.x * size + x;
       const globalY = job.y * size + y;
       const spillCell = globalY * fullSide + globalX;
-      if (spillCell >= spillCells[index]) continue;
+      // All receiver crossings for one filled basin share its spill elevation.
+      // Prefer the strongest outward D∞ branch, then use cell ID only as a
+      // deterministic tie break. This is the basin's canonical graph exit.
+      const outletElevation = Math.max(fillHeights[index], downstreamHeight);
+      if (
+        outletElevation > outletElevations[index] ||
+        (outletElevation === outletElevations[index] && recipient.weight < outletWeights[index]) ||
+        (outletElevation === outletElevations[index] && recipient.weight === outletWeights[index] && spillCell >= spillCells[index])
+      ) continue;
+      outletElevations[index] = outletElevation;
+      outletWeights[index] = recipient.weight;
       spillCells[index] = spillCell;
       downstreamIds[index] = downstreamId;
       downstreamCells[index] = (globalY + D8_DY[code]) * fullSide + globalX + D8_DX[code];
@@ -1328,9 +1350,15 @@ export function decodeDInfinityRecipients(encoded: number): { codeA: number; cod
 }
 
 function dominantDInfinityCode(encoded: number): number {
+  return dominantDInfinityRecipient(encoded)?.code ?? 0;
+}
+
+function dominantDInfinityRecipient(encoded: number): { code: number; weight: number } | null {
   const recipients = decodeDInfinityRecipients(encoded);
-  if (!recipients) return 0;
-  return recipients.weightB > recipients.weightA ? recipients.codeB : recipients.codeA;
+  if (!recipients) return null;
+  return recipients.weightB > recipients.weightA
+    ? { code: recipients.codeB, weight: recipients.weightB }
+    : { code: recipients.codeA, weight: recipients.weightA };
 }
 
 async function convergeFlatTileQueue(

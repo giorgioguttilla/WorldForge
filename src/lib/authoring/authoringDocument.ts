@@ -157,6 +157,7 @@ export interface RiverReachV2 {
   points: HydrologyPointV1[];
   downstreamReachId?: string;
   targetWaterBodyId?: string;
+  targetBasinId?: number;
   termination: 'reach' | 'water-body' | 'edge' | 'stuck';
   sourceIds: string[];
   discharge: number;
@@ -164,11 +165,27 @@ export interface RiverReachV2 {
   widthHint: number;
 }
 
+/** Derived connector that contracts a filled basin into one graph node. */
+export interface RiverBasinNodeV2 {
+  id: string;
+  basinId: number;
+  waterBodyId: string;
+  status: 'continuous' | 'terminal';
+  inletReachIds: string[];
+  outletReachId?: string;
+  spillCellId?: number;
+  downstreamCellId?: number;
+  sourceIds: string[];
+  inflowDischarge: number;
+  outflowDischarge: number;
+}
+
 export interface HydrologySceneV2 {
   version: 2;
   waterBodies: WaterBodyV1[];
   riverSources: RiverSourceConstraintV2[];
   reaches: RiverReachV2[];
+  basinNodes: RiverBasinNodeV2[];
 }
 
 export interface AuthoringDocumentV1 {
@@ -269,7 +286,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
     fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: [],
     erosion: { ...EROSION_PRESETS.medium, enabled: false },
-    hydrology: { version: 2, waterBodies: [], riverSources: [], reaches: [] }
+    hydrology: { version: 2, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] }
   };
 }
 
@@ -512,7 +529,7 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
 }
 
 function normalizeHydrologyScene(value: unknown): HydrologySceneV2 {
-  if (!isRecord(value)) return { version: 2, waterBodies: [], riverSources: [], reaches: [] };
+  if (!isRecord(value)) return { version: 2, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] };
   return {
     version: 2,
     waterBodies: Array.isArray(value.waterBodies)
@@ -523,6 +540,9 @@ function normalizeHydrologyScene(value: unknown): HydrologySceneV2 {
       : [],
     reaches: value.version === 2 && Array.isArray(value.reaches)
       ? value.reaches.map(normalizeRiverReach).filter((reach): reach is RiverReachV2 => Boolean(reach))
+      : [],
+    basinNodes: value.version === 2 && Array.isArray(value.basinNodes)
+      ? value.basinNodes.map(normalizeRiverBasinNode).filter((node): node is RiverBasinNodeV2 => Boolean(node))
       : []
   };
 }
@@ -570,11 +590,29 @@ function normalizeRiverReach(value: unknown): RiverReachV2 | null {
     points,
     downstreamReachId: typeof value.downstreamReachId === 'string' ? value.downstreamReachId : undefined,
     targetWaterBodyId: typeof value.targetWaterBodyId === 'string' ? value.targetWaterBodyId : undefined,
+    targetBasinId: Number.isFinite(value.targetBasinId) ? Math.max(1, Math.trunc(Number(value.targetBasinId))) : undefined,
     termination: value.termination === 'reach' || value.termination === 'water-body' || value.termination === 'edge' ? value.termination : 'stuck',
     sourceIds: stringArray(value.sourceIds),
     discharge: Math.max(0, finiteNumber(value.discharge, 0)),
     maxFlowStrengthR16: clamp(Math.trunc(finiteNumber(value.maxFlowStrengthR16, 0)), 0, 65535),
     widthHint: Math.max(1, finiteNumber(value.widthHint, 1))
+  };
+}
+
+function normalizeRiverBasinNode(value: unknown): RiverBasinNodeV2 | null {
+  if (!isRecord(value) || typeof value.id !== 'string' || !value.id || !Number.isFinite(value.basinId) || typeof value.waterBodyId !== 'string') return null;
+  return {
+    id: value.id,
+    basinId: Math.max(1, Math.trunc(Number(value.basinId))),
+    waterBodyId: value.waterBodyId,
+    status: value.status === 'continuous' ? 'continuous' : 'terminal',
+    inletReachIds: stringArray(value.inletReachIds),
+    outletReachId: typeof value.outletReachId === 'string' ? value.outletReachId : undefined,
+    spillCellId: Number.isFinite(value.spillCellId) ? Math.max(0, Math.trunc(Number(value.spillCellId))) : undefined,
+    downstreamCellId: Number.isFinite(value.downstreamCellId) ? Math.max(0, Math.trunc(Number(value.downstreamCellId))) : undefined,
+    sourceIds: stringArray(value.sourceIds),
+    inflowDischarge: Math.max(0, finiteNumber(value.inflowDischarge, 0)),
+    outflowDischarge: Math.max(0, finiteNumber(value.outflowDischarge, 0))
   };
 }
 

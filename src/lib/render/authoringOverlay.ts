@@ -400,17 +400,15 @@ export class HydrologyOverlay {
     mesh.renderOrder = 18;
     this.track(mesh);
 
-    const linePoints = ring.map((point) => new THREE.Vector3(point.x, y, point.z));
+    const outlineLift = Math.max(0.01, (this.config?.unitSize ?? 1) * 0.01);
+    const linePoints = ring.map((point) => new THREE.Vector3(point.x, y + outlineLift, point.z));
     const lineGeometry = new THREE.BufferGeometry().setFromPoints(linePoints);
     const lineMaterial = new THREE.LineBasicMaterial({
       color: 0xaee8ff,
       transparent: true,
       opacity: 0.92,
       depthTest: true,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -2
+      depthWrite: false
     });
     const line = new THREE.Line(lineGeometry, lineMaterial);
     line.renderOrder = 19;
@@ -420,6 +418,7 @@ export class HydrologyOverlay {
   private addRiver(points: HydrologyPointV1[], widthHint: number): void {
     if (points.length < 2 || !this.config) return;
     const radius = Math.min(10, Math.max(1.5, widthHint * 0.75));
+    const visualLift = Math.max(2, this.config.unitSize * 2);
     const positions = new Float32Array(points.length * 2 * 3);
     const indices: number[] = [];
     for (let index = 0; index < points.length; index += 1) {
@@ -438,7 +437,7 @@ export class HydrologyOverlay {
       }
       const normalX = -tangentZ * radius;
       const normalZ = tangentX * radius;
-      const y = r16ToElevation(point.heightR16 ?? 0, this.config.worldHeight);
+      const y = r16ToElevation(point.heightR16 ?? 0, this.config.worldHeight) + visualLift;
       const offset = index * 6;
       positions.set([point.x + normalX, y, point.z + normalZ, point.x - normalX, y, point.z - normalZ], offset);
       if (index < points.length - 1) {

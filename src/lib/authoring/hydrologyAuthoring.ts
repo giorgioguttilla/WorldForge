@@ -1,6 +1,6 @@
 import type { TileManager } from '../heightmap/tileManager';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
-import type { HydrologyPointV1, HydrologySceneV2, RiverReachV2, RiverSourceConstraintV2, WaterBodyV1 } from './authoringDocument';
+import type { HydrologyPointV1, HydrologySceneV2, RiverBasinNodeV2, RiverReachV2, RiverSourceConstraintV2, WaterBodyV1 } from './authoringDocument';
 import { decodeDInfinityRecipients, type HydrologyTopologyV3 } from './hydrologyBake';
 
 interface Cell { x: number; y: number }
@@ -13,8 +13,11 @@ interface BasinRecord {
   minY: number;
   maxX: number;
   maxY: number;
+  spillCellId?: number;
+  downstreamCellId?: number;
+  downstreamBasinId?: number;
 }
-interface Terminal { type: 'water-body' | 'edge' | 'stuck'; waterBodyId?: string }
+interface Terminal { type: 'water-body' | 'edge' | 'stuck'; waterBodyId?: string; basinId?: number }
 interface DraftReach {
   cells: number[];
   terminal: Terminal | null;
@@ -23,6 +26,7 @@ interface DraftReach {
 
 const D8_DX = new Int8Array([0, 1, 0, 1, -1, 0, -1, 1, -1]);
 const D8_DY = new Int8Array([0, 0, 1, 1, 0, -1, -1, -1, 1]);
+const NO_FLOW_TARGET = 0xffffffff;
 export const RIVER_SIMPLIFY_TOLERANCE_CELLS = 0.6;
 export const LAKE_RING_SIMPLIFY_TOLERANCE_CELLS = 0.75;
 
@@ -31,8 +35,32 @@ export type WaterFillResult =
   | { ok: false; reason: string };
 
 export type RiverSourceResult =
-  | { ok: true; hydrology: HydrologySceneV2; source: RiverSourceConstraintV2; createdWaterBodies: number; replaced: boolean }
+  | { ok: true; hydrology: HydrologySceneV2; source: RiverSourceConstraintV2; createdWaterBodies: number; replaced: boolean; basinDiagnostics: BasinRoutingDiagnostics }
   | { ok: false; reason: string };
+
+export interface BasinRoutingDiagnostics {
+  total: number;
+  continuous: number;
+  terminal: number;
+}
+
+interface BasinWaterBalanceDecision {
+  status: 'continuous' | 'terminal';
+  outflowFraction: number;
+  reason: 'uniform-pass-through' | 'no-baked-outlet';
+}
+
+/**
+ * Future climate seam: replace this uniform policy with a solver that consumes
+ * discharge, evaporation/infiltration, and a basin hypsometric curve. The graph
+ * traversal and basin-node discharge propagation do not need to change.
+ */
+function evaluateBasinWaterBalance(record: BasinRecord): BasinWaterBalanceDecision {
+  const hasOutlet = record.spillCellId !== undefined && record.downstreamCellId !== undefined;
+  return hasOutlet
+    ? { status: 'continuous', outflowFraction: 1, reason: 'uniform-pass-through' }
+    : { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' };
+}
 
 export async function addWaterFillAtWorld(
   manager: TileManager,
@@ -85,7 +113,8 @@ export async function addRiverSourceAtWorld(
     hydrology: rebuilt.hydrology,
     source,
     createdWaterBodies: rebuilt.createdWaterBodies,
-    replaced: Boolean(existing)
+    replaced: Boolean(existing),
+    basinDiagnostics: rebuilt.basinDiagnostics
   };
 }
 
@@ -94,7 +123,7 @@ export async function rebuildRiverNetworkFromSources(manager: TileManager, hydro
   const config = manager.config;
   if (!config || hydrology.riverSources.length === 0) return hydrology;
   const topology = await manager.readHydrologyTopology();
-  if (!topology) return { ...hydrology, reaches: [] };
+  if (!topology) return { ...hydrology, reaches: [], basinNodes: [] };
   return (await rebuildRiverNetwork(new HydrologyMapSampler(manager, config, topology), hydrology)).hydrology;
 }
 
@@ -114,25 +143,29 @@ async function createSampler(manager: TileManager, worldX: number, worldZ: numbe
 async function rebuildRiverNetwork(
   sampler: HydrologyMapSampler,
   scene: HydrologySceneV2
-): Promise<{ hydrology: HydrologySceneV2; createdWaterBodies: number }> {
+): Promise<{ hydrology: HydrologySceneV2; createdWaterBodies: number; basinDiagnostics: BasinRoutingDiagnostics }> {
   const nextByCell = new Map<number, number>();
   const networkCells = new Set<number>();
   const terminals = new Map<number, Terminal>();
   const sourceCells = new Set(scene.riverSources.map((source) => sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY })));
+  const basinOutletCells = new Set<number>();
+  const outletBasinByCell = new Map<number, number>();
   const waterBodies = [...scene.waterBodies];
   const bodyByBasin = new Map(waterBodies.flatMap((body) => body.basinId ? [[body.basinId, body] as const] : []));
+  const basinDecisions = new Map<number, BasinWaterBalanceDecision>();
   let createdWaterBodies = 0;
 
   for (const source of scene.riverSources) {
     let current = sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY });
     const visited = new Set<number>();
+    const visitedBasins = new Set<number>();
     for (let step = 0; step < sampler.side * sampler.side; step += 1) {
-      if (networkCells.has(current)) break;
-      networkCells.add(current);
       if (visited.has(current)) {
         terminals.set(current, { type: 'stuck' });
         break;
       }
+      if (networkCells.has(current)) break;
+      networkCells.add(current);
       visited.add(current);
       const cell = sampler.cellFromId(current);
       const basinId = await sampler.basin(cell);
@@ -146,8 +179,39 @@ async function rebuildRiverNetwork(
             createdWaterBodies += 1;
           }
         }
-        terminals.set(current, body ? { type: 'water-body', waterBodyId: body.id } : { type: 'stuck' });
-        break;
+        if (!body) {
+          terminals.set(current, { type: 'stuck' });
+          break;
+        }
+        terminals.set(current, { type: 'water-body', waterBodyId: body.id, basinId });
+        const record = sampler.basinRecord(basinId);
+        if (!record) break;
+        const decision = basinDecisions.get(basinId) ?? evaluateBasinWaterBalance(record);
+        basinDecisions.set(basinId, decision);
+        if (decision.status === 'terminal') break;
+        if (visitedBasins.has(basinId)) {
+          console.warn('[WorldForge hydrology] Basin outlet cycle detected; terminating this route.', { basinId });
+          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
+          break;
+        }
+        visitedBasins.add(basinId);
+        const downstream = record.downstreamCellId as number;
+        const downstreamCell = sampler.cellFromId(downstream);
+        if (!sampler.contains(downstreamCell) || await sampler.basin(downstreamCell) === basinId) {
+          console.warn('[WorldForge hydrology] Invalid baked basin outlet; terminating this route.', { basinId, downstreamCellId: downstream });
+          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
+          break;
+        }
+        basinOutletCells.add(downstream);
+        outletBasinByCell.set(downstream, basinId);
+        if (visited.has(downstream)) {
+          console.warn('[WorldForge hydrology] Basin outlet returned to its upstream route; terminating this route.', { basinId, downstreamCellId: downstream });
+          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
+          break;
+        }
+        if (networkCells.has(downstream)) break;
+        current = downstream;
+        continue;
       }
       if (sampler.isEdge(cell)) {
         terminals.set(current, { type: 'edge' });
@@ -159,6 +223,10 @@ async function rebuildRiverNetwork(
         break;
       }
       const nextId = sampler.cellId(next);
+      if (visited.has(nextId)) {
+        terminals.set(current, { type: 'stuck' });
+        break;
+      }
       nextByCell.set(current, nextId);
       if (networkCells.has(nextId)) break;
       current = nextId;
@@ -167,7 +235,7 @@ async function rebuildRiverNetwork(
 
   const indegree = new Map<number, number>();
   for (const next of nextByCell.values()) indegree.set(next, (indegree.get(next) ?? 0) + 1);
-  const breakpoints = new Set<number>(sourceCells);
+  const breakpoints = new Set<number>([...sourceCells, ...basinOutletCells]);
   for (const cell of networkCells) {
     if ((indegree.get(cell) ?? 0) !== 1 || terminals.has(cell) || !nextByCell.has(cell)) breakpoints.add(cell);
   }
@@ -200,6 +268,17 @@ async function rebuildRiverNetwork(
       point.heightR16 = await sampler.height(cell);
       return point;
     }));
+    const outletBasinId = outletBasinByCell.get(draft.cells[0]);
+    if (outletBasinId !== undefined) {
+      const outletRecord = sampler.basinRecord(outletBasinId);
+      const outletBody = bodyByBasin.get(outletBasinId);
+      if (outletRecord?.spillCellId !== undefined && outletBody) {
+        densePoints.unshift({
+          ...cellCenterToWorld(sampler.config, sampler.cellFromId(outletRecord.spillCellId)),
+          heightR16: outletBody.waterLevelR16
+        });
+      }
+    }
     if (draft.terminal?.type === 'water-body') {
       const body = waterBodies.find((item) => item.id === draft.terminal?.waterBodyId);
       if (body) densePoints[densePoints.length - 1].heightR16 = body.waterLevelR16;
@@ -214,6 +293,7 @@ async function rebuildRiverNetwork(
       points: simplifyRiverPolyline(smoothRiverLateralJitter(densePoints), RIVER_SIMPLIFY_TOLERANCE_CELLS * sampler.config.unitSize, sampler.config.worldHeight),
       downstreamReachId,
       targetWaterBodyId: draft.terminal?.waterBodyId,
+      targetBasinId: draft.terminal?.basinId,
       termination: downstreamReachId ? 'reach' : draft.terminal?.type ?? 'stuck',
       sourceIds: [],
       discharge: 0,
@@ -224,20 +304,68 @@ async function rebuildRiverNetwork(
 
   const reachById = new Map(reaches.map((reach) => [reach.id, reach]));
   const reachByStart = new Map(reaches.map((reach) => [reach.startCellId, reach]));
+  const basinNodes: RiverBasinNodeV2[] = [...basinDecisions.entries()].map(([basinId, decision]) => {
+    const record = sampler.basinRecord(basinId) as BasinRecord;
+    const body = bodyByBasin.get(basinId) as WaterBodyV1;
+    return {
+      id: `basin-${basinId}`,
+      basinId,
+      waterBodyId: body.id,
+      status: decision.status,
+      inletReachIds: reaches.filter((reach) => reach.targetBasinId === basinId).map((reach) => reach.id),
+      outletReachId: decision.status === 'continuous' && record.downstreamCellId !== undefined ? reachByStart.get(record.downstreamCellId)?.id : undefined,
+      spillCellId: record.spillCellId,
+      downstreamCellId: record.downstreamCellId,
+      sourceIds: [],
+      inflowDischarge: 0,
+      outflowDischarge: 0
+    };
+  });
+  const basinById = new Map(basinNodes.map((node) => [node.basinId, node]));
   for (const source of scene.riverSources) {
-    let reach = reachByStart.get(sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY }));
+    const sourceCell = { x: source.sourceCellX, y: source.sourceCellY };
+    let reach = reachByStart.get(sampler.cellId(sourceCell));
+    let basin = reach ? undefined : basinById.get(await sampler.basin(sourceCell));
     const visited = new Set<string>();
-    while (reach && !visited.has(reach.id)) {
-      visited.add(reach.id);
-      reach.discharge += source.discharge;
-      reach.sourceIds.push(source.id);
-      reach = reach.downstreamReachId ? reachById.get(reach.downstreamReachId) : undefined;
+    while (reach || basin) {
+      if (reach) {
+        if (visited.has(reach.id)) break;
+        visited.add(reach.id);
+        reach.discharge += source.discharge;
+        reach.sourceIds.push(source.id);
+        if (reach.downstreamReachId) {
+          reach = reachById.get(reach.downstreamReachId);
+          basin = undefined;
+        } else if (reach.targetBasinId) {
+          basin = basinById.get(reach.targetBasinId);
+          reach = undefined;
+        } else break;
+      } else if (basin) {
+        if (visited.has(basin.id)) break;
+        visited.add(basin.id);
+        basin.inflowDischarge += source.discharge;
+        basin.sourceIds.push(source.id);
+        const decision = basinDecisions.get(basin.basinId) as BasinWaterBalanceDecision;
+        basin.outflowDischarge += source.discharge * decision.outflowFraction;
+        reach = basin.outletReachId ? reachById.get(basin.outletReachId) : undefined;
+        basin = undefined;
+      }
     }
   }
   for (const reach of reaches) {
     reach.widthHint = Math.max(1, 1 + reach.maxFlowStrengthR16 / 16384 + Math.sqrt(reach.discharge));
   }
-  return { hydrology: { ...scene, waterBodies, reaches }, createdWaterBodies };
+  const basinDiagnostics = {
+    total: basinNodes.length,
+    continuous: basinNodes.filter((node) => node.status === 'continuous').length,
+    terminal: basinNodes.filter((node) => node.status === 'terminal').length
+  };
+  console.info('[WorldForge hydrology] Basin routing summary', {
+    ...basinDiagnostics,
+    continuousBasinIds: basinNodes.filter((node) => node.status === 'continuous').map((node) => node.basinId),
+    terminalBasinIds: basinNodes.filter((node) => node.status === 'terminal').map((node) => node.basinId)
+  });
+  return { hydrology: { ...scene, waterBodies, reaches, basinNodes }, createdWaterBodies, basinDiagnostics };
 }
 
 async function materializeBasin(sampler: HydrologyMapSampler, basinId: number, index: number): Promise<WaterBodyV1 | null> {
@@ -275,6 +403,7 @@ class HydrologyMapSampler {
 
   cellId(cell: Cell): number { return cell.y * this.side + cell.x; }
   cellFromId(id: number): Cell { return { x: id % this.side, y: Math.floor(id / this.side) }; }
+  contains(cell: Cell): boolean { return cell.x >= 0 && cell.y >= 0 && cell.x < this.side && cell.y < this.side; }
   isEdge(cell: Cell): boolean { return cell.x === 0 || cell.y === 0 || cell.x === this.side - 1 || cell.y === this.side - 1; }
 
   async height(cell: Cell): Promise<number> {
@@ -301,13 +430,19 @@ class HydrologyMapSampler {
   basinRecord(id: number): BasinRecord | null {
     const index = this.basinIndex.get(id);
     if (index === undefined) return null;
+    const spillCellId = this.topology.spillCells[index] === NO_FLOW_TARGET ? undefined : this.topology.spillCells[index];
+    const downstreamCellId = this.topology.downstreamCells[index] === NO_FLOW_TARGET ? undefined : this.topology.downstreamCells[index];
+    const downstreamBasinId = this.topology.downstreamIds[index] === NO_FLOW_TARGET ? undefined : this.topology.downstreamIds[index];
     return {
       id,
       fillHeight: this.topology.fillHeights[index],
       areaCells: this.topology.areaCells[index],
       maxDepth: this.topology.maxDepths[index],
       minX: this.topology.minCellX[index], minY: this.topology.minCellY[index],
-      maxX: this.topology.maxCellX[index], maxY: this.topology.maxCellY[index]
+      maxX: this.topology.maxCellX[index], maxY: this.topology.maxCellY[index],
+      spillCellId,
+      downstreamCellId,
+      downstreamBasinId
     };
   }
   async cellsForBasin(record: BasinRecord): Promise<Cell[]> {
