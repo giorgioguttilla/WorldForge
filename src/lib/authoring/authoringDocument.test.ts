@@ -101,10 +101,10 @@ describe('authoring document', () => {
     });
   });
 
-  it('normalizes authored hydrology objects conservatively', () => {
+  it('normalizes durable graph hydrology objects conservatively', () => {
     const document = normalizeAuthoringDocument({
       hydrology: {
-        version: 1,
+        version: 2,
         waterBodies: [{
           id: 'waterBody-1',
           name: 'Lake One',
@@ -113,6 +113,7 @@ describe('authoring document', () => {
           waterLevelR16: 10,
           areaCells: 4,
           maxDepthR16: 8,
+          basinId: 12,
           rings: [[
             { x: 0, z: 0 },
             { x: 1, z: 0 },
@@ -123,38 +124,35 @@ describe('authoring document', () => {
           id: 'bad',
           rings: []
         }],
-        rivers: [{
-          id: 'river-1',
+        riverSources: [{
+          id: 'source-1',
+          name: 'Headwater',
+          sourceCellX: 2,
+          sourceCellY: 3,
+          discharge: 2
+        }],
+        reaches: [{
+          id: 'reach-1',
+          startCellId: 12,
+          endCellId: 13,
           points: [{ x: 0, z: 0, heightR16: 9 }, { x: 1, z: 1, heightR16: 8 }],
-          mouth: 'edge',
-          waterBodyIds: ['waterBody-1'],
+          termination: 'edge',
+          sourceIds: ['source-1'],
+          discharge: 2,
           maxFlowStrengthR16: 40000,
           widthHint: 2
-        }, {
-          id: 'bad-river',
-          points: [{ x: 0, z: 0 }]
         }]
       }
     }, 'world-a');
 
     expect(document.hydrology.waterBodies).toHaveLength(1);
-    expect(document.hydrology.waterBodies[0]).toMatchObject({ name: 'Lake One', sourceCellX: 4, sourceCellY: 5 });
-    expect(document.hydrology.rivers).toHaveLength(1);
-    expect(document.hydrology.rivers[0]).toMatchObject({ mouth: 'edge', waterBodyIds: ['waterBody-1'] });
-    expect(document.hydrology.rivers[0].segments).toEqual([expect.objectContaining({
-      id: 'river-1-segment-1',
-      termination: 'edge',
-      initialMomentum: { x: 0, z: 0 },
-      finalMomentum: { x: 0, z: 0 }
-    })]);
-    expect(document.hydrology.riverTrace).toEqual({ maxMomentum: 64 });
+    expect(document.hydrology.waterBodies[0]).toMatchObject({ name: 'Lake One', sourceCellX: 4, sourceCellY: 5, basinId: 12 });
+    expect(document.hydrology.riverSources).toEqual([expect.objectContaining({ id: 'source-1', discharge: 2 })]);
+    expect(document.hydrology.reaches).toEqual([expect.objectContaining({ id: 'reach-1', termination: 'edge', sourceIds: ['source-1'], discharge: 2 })]);
   });
 
-  it('migrates only the legacy default river momentum', () => {
-    const legacy = normalizeAuthoringDocument({ hydrology: { version: 1, riverTrace: { maxMomentum: 6 } } }, 'world-a');
-    const customized = normalizeAuthoringDocument({ hydrology: { version: 1, riverTrace: { maxMomentum: 24 } } }, 'world-a');
-
-    expect(legacy.hydrology.riverTrace.maxMomentum).toBe(64);
-    expect(customized.hydrology.riverTrace.maxMomentum).toBe(24);
+  it('drops legacy momentum rivers while retaining valid water bodies', () => {
+    const legacy = normalizeAuthoringDocument({ hydrology: { version: 1, riverTrace: { maxMomentum: 24 }, rivers: [{ id: 'old' }] } }, 'world-a');
+    expect(legacy.hydrology).toMatchObject({ version: 2, riverSources: [], reaches: [] });
   });
 });

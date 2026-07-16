@@ -113,7 +113,7 @@ export interface HydrologyBakeSummaryV1 {
   lakeFillHeight: 'closed-basin-fill-height-r16';
   basinIds?: 'physical-filled-basin-id-u32';
   receiverDirections?: 'conditioned-flat-resolved-d-infinity-u16';
-  topology?: 'physical-basin-topology-v2';
+  topology?: 'physical-basin-topology-v3';
   flowStrength?: 'log1p-contributing-area-r16';
   flowAccumulation?: 'contributing-area-f32';
   maxFlowAccumulation?: number;
@@ -128,15 +128,6 @@ export interface HydrologyPointV1 {
   heightR16?: number;
 }
 
-export interface HydrologyVectorV1 {
-  x: number;
-  z: number;
-}
-
-export interface RiverTraceSettingsV1 {
-  maxMomentum: number;
-}
-
 export interface WaterBodyV1 {
   id: string;
   name: string;
@@ -147,34 +138,37 @@ export interface WaterBodyV1 {
   areaCells: number;
   maxDepthR16: number;
   rings: HydrologyPointV1[][];
+  basinId?: number;
 }
 
-export interface RiverV1 {
+export interface RiverSourceConstraintV2 {
   id: string;
   name: string;
   createdAt: string;
-  segments: RiverSegmentV1[];
-  mouth: 'edge' | 'stuck';
-  waterBodyIds: string[];
+  sourceCellX: number;
+  sourceCellY: number;
+  discharge: number;
+}
+
+export interface RiverReachV2 {
+  id: string;
+  startCellId: number;
+  endCellId: number;
+  points: HydrologyPointV1[];
+  downstreamReachId?: string;
+  targetWaterBodyId?: string;
+  termination: 'reach' | 'water-body' | 'edge' | 'stuck';
+  sourceIds: string[];
+  discharge: number;
   maxFlowStrengthR16: number;
   widthHint: number;
 }
 
-export interface RiverSegmentV1 {
-  id: string;
-  sourceWaterBodyId?: string;
-  targetWaterBodyId?: string;
-  points: HydrologyPointV1[];
-  initialMomentum: HydrologyVectorV1;
-  finalMomentum: HydrologyVectorV1;
-  termination: 'water-body' | 'edge' | 'stuck';
-}
-
-export interface HydrologySceneV1 {
-  version: 1;
-  riverTrace: RiverTraceSettingsV1;
+export interface HydrologySceneV2 {
+  version: 2;
   waterBodies: WaterBodyV1[];
-  rivers: RiverV1[];
+  riverSources: RiverSourceConstraintV2[];
+  reaches: RiverReachV2[];
 }
 
 export interface AuthoringDocumentV1 {
@@ -183,14 +177,9 @@ export interface AuthoringDocumentV1 {
   fieldLibrary: NoiseFieldGraphV1[];
   primitives: PrimitiveV1[];
   erosion: ErosionSettingsV1;
-  hydrology: HydrologySceneV1;
+  hydrology: HydrologySceneV2;
   lastBake?: BakeMetadataV1;
 }
-
-export const DEFAULT_RIVER_TRACE_SETTINGS: RiverTraceSettingsV1 = {
-  maxMomentum: 64
-};
-const LEGACY_DEFAULT_RIVER_MAX_MOMENTUM = 6;
 
 const LAND_MODES = new Set<LandformModeV1>(['land', 'water', 'plateau']);
 
@@ -280,7 +269,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
     fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: [],
     erosion: { ...EROSION_PRESETS.medium, enabled: false },
-    hydrology: { version: 1, riverTrace: { ...DEFAULT_RIVER_TRACE_SETTINGS }, waterBodies: [], rivers: [] }
+    hydrology: { version: 2, waterBodies: [], riverSources: [], reaches: [] }
   };
 }
 
@@ -512,7 +501,7 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
     lakeFillHeight: 'closed-basin-fill-height-r16',
     basinIds: value.basinIds === 'physical-filled-basin-id-u32' ? value.basinIds : undefined,
     receiverDirections: value.receiverDirections === 'conditioned-flat-resolved-d-infinity-u16' ? value.receiverDirections : undefined,
-    topology: value.topology === 'physical-basin-topology-v2' ? value.topology : undefined,
+    topology: value.topology === 'physical-basin-topology-v3' ? value.topology : undefined,
     flowStrength: value.flowStrength === 'log1p-contributing-area-r16' ? value.flowStrength : undefined,
     flowAccumulation: value.flowAccumulation === 'contributing-area-f32' ? value.flowAccumulation : undefined,
     maxFlowAccumulation: Number.isFinite(value.maxFlowAccumulation) ? Math.max(0, Number(value.maxFlowAccumulation)) : undefined,
@@ -522,22 +511,18 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
   };
 }
 
-function normalizeHydrologyScene(value: unknown): HydrologySceneV1 {
-  if (!isRecord(value) || value.version !== 1) return { version: 1, riverTrace: { ...DEFAULT_RIVER_TRACE_SETTINGS }, waterBodies: [], rivers: [] };
-  const riverTrace = isRecord(value.riverTrace) ? value.riverTrace : {};
-  const storedMaxMomentum = finiteNumber(riverTrace.maxMomentum, DEFAULT_RIVER_TRACE_SETTINGS.maxMomentum);
+function normalizeHydrologyScene(value: unknown): HydrologySceneV2 {
+  if (!isRecord(value)) return { version: 2, waterBodies: [], riverSources: [], reaches: [] };
   return {
-    version: 1,
-    riverTrace: {
-      maxMomentum: storedMaxMomentum === LEGACY_DEFAULT_RIVER_MAX_MOMENTUM
-        ? DEFAULT_RIVER_TRACE_SETTINGS.maxMomentum
-        : clamp(storedMaxMomentum, 0.25, 256)
-    },
+    version: 2,
     waterBodies: Array.isArray(value.waterBodies)
       ? value.waterBodies.map(normalizeWaterBody).filter((body): body is WaterBodyV1 => Boolean(body))
       : [],
-    rivers: Array.isArray(value.rivers)
-      ? value.rivers.map(normalizeRiver).filter((river): river is RiverV1 => Boolean(river))
+    riverSources: value.version === 2 && Array.isArray(value.riverSources)
+      ? value.riverSources.map(normalizeRiverSource).filter((source): source is RiverSourceConstraintV2 => Boolean(source))
+      : [],
+    reaches: value.version === 2 && Array.isArray(value.reaches)
+      ? value.reaches.map(normalizeRiverReach).filter((reach): reach is RiverReachV2 => Boolean(reach))
       : []
   };
 }
@@ -557,59 +542,40 @@ function normalizeWaterBody(value: unknown): WaterBodyV1 | null {
     waterLevelR16: clamp(Math.trunc(finiteNumber(value.waterLevelR16, finiteNumber(value.maxFillHeightR16, 0))), 0, 65535),
     areaCells: Math.max(0, Math.trunc(finiteNumber(value.areaCells, 0))),
     maxDepthR16: clamp(Math.trunc(finiteNumber(value.maxDepthR16, 0)), 0, 65535),
-    rings
+    rings,
+    basinId: Number.isFinite(value.basinId) ? Math.max(1, Math.trunc(Number(value.basinId))) : undefined
   };
 }
 
-function normalizeRiver(value: unknown): RiverV1 | null {
+function normalizeRiverSource(value: unknown): RiverSourceConstraintV2 | null {
   if (!isRecord(value) || typeof value.id !== 'string' || !value.id) return null;
-  const segments = Array.isArray(value.segments)
-    ? value.segments.map((segment, index) => normalizeRiverSegment(segment, `${value.id}-segment-${index + 1}`)).filter((segment): segment is RiverSegmentV1 => Boolean(segment))
-    : normalizeLegacyRiverSegment(value, value.id);
-  if (segments.length === 0) return null;
-  const mouth = value.mouth === 'edge' ? 'edge' : 'stuck';
   return {
     id: value.id,
-    name: typeof value.name === 'string' && value.name ? value.name : 'River',
+    name: typeof value.name === 'string' && value.name ? value.name : 'River source',
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : new Date().toISOString(),
-    segments,
-    mouth,
-    waterBodyIds: stringArray(value.waterBodyIds),
-    maxFlowStrengthR16: clamp(Math.trunc(finiteNumber(value.maxFlowStrengthR16, 0)), 0, 65535),
-    widthHint: Math.max(1, finiteNumber(value.widthHint, 1))
+    sourceCellX: Math.max(0, Math.trunc(finiteNumber(value.sourceCellX, 0))),
+    sourceCellY: Math.max(0, Math.trunc(finiteNumber(value.sourceCellY, 0))),
+    discharge: Math.max(0.001, finiteNumber(value.discharge, 1))
   };
 }
 
-function normalizeRiverSegment(value: unknown, fallbackId: string): RiverSegmentV1 | null {
-  if (!isRecord(value)) return null;
+function normalizeRiverReach(value: unknown): RiverReachV2 | null {
+  if (!isRecord(value) || typeof value.id !== 'string' || !value.id) return null;
   const points = Array.isArray(value.points) ? value.points.map(normalizeHydrologyPoint).filter((point): point is HydrologyPointV1 => Boolean(point)) : [];
   if (points.length < 2) return null;
   return {
-    id: typeof value.id === 'string' && value.id ? value.id : fallbackId,
-    sourceWaterBodyId: typeof value.sourceWaterBodyId === 'string' ? value.sourceWaterBodyId : undefined,
+    id: value.id,
+    startCellId: Math.max(0, Math.trunc(finiteNumber(value.startCellId, 0))),
+    endCellId: Math.max(0, Math.trunc(finiteNumber(value.endCellId, 0))),
+    points,
+    downstreamReachId: typeof value.downstreamReachId === 'string' ? value.downstreamReachId : undefined,
     targetWaterBodyId: typeof value.targetWaterBodyId === 'string' ? value.targetWaterBodyId : undefined,
-    points,
-    initialMomentum: normalizeHydrologyVector(value.initialMomentum),
-    finalMomentum: normalizeHydrologyVector(value.finalMomentum),
-    termination: value.termination === 'water-body' || value.termination === 'edge' ? value.termination : 'stuck'
+    termination: value.termination === 'reach' || value.termination === 'water-body' || value.termination === 'edge' ? value.termination : 'stuck',
+    sourceIds: stringArray(value.sourceIds),
+    discharge: Math.max(0, finiteNumber(value.discharge, 0)),
+    maxFlowStrengthR16: clamp(Math.trunc(finiteNumber(value.maxFlowStrengthR16, 0)), 0, 65535),
+    widthHint: Math.max(1, finiteNumber(value.widthHint, 1))
   };
-}
-
-function normalizeLegacyRiverSegment(value: Record<string, unknown>, riverId: string): RiverSegmentV1[] {
-  const points = Array.isArray(value.points) ? value.points.map(normalizeHydrologyPoint).filter((point): point is HydrologyPointV1 => Boolean(point)) : [];
-  if (points.length < 2) return [];
-  return [{
-    id: `${riverId}-segment-1`,
-    points,
-    initialMomentum: { x: 0, z: 0 },
-    finalMomentum: { x: 0, z: 0 },
-    termination: value.mouth === 'edge' ? 'edge' : 'stuck'
-  }];
-}
-
-function normalizeHydrologyVector(value: unknown): HydrologyVectorV1 {
-  if (!isRecord(value)) return { x: 0, z: 0 };
-  return { x: finiteNumber(value.x, 0), z: finiteNumber(value.z, 0) };
 }
 
 function normalizeHydrologyPoint(value: unknown): HydrologyPointV1 | null {

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { AnchorV1, AuthoringDocumentV1, HydrologyPointV1, HydrologySceneV1, PrimitiveV1 } from '../authoring/authoringDocument';
+import type { AnchorV1, AuthoringDocumentV1, HydrologyPointV1, HydrologySceneV2, PrimitiveV1 } from '../authoring/authoringDocument';
 import { DEFAULT_SPLINE_SMOOTHNESS, sampleSplineAnchors, type SplinePoint2D } from '../authoring/spline';
 import { LAKE_RING_SIMPLIFY_TOLERANCE_CELLS, simplifyLakeRing } from '../authoring/hydrologyAuthoring';
 import { r16ToElevation, type WorldConfig } from '../heightmap/worldConfig';
@@ -336,7 +336,7 @@ export class AuthoringOverlay {
 export class HydrologyOverlay {
   readonly group = new THREE.Group();
 
-  private hydrology: HydrologySceneV1 | null = null;
+  private hydrology: HydrologySceneV2 | null = null;
   private config: WorldConfig | null = null;
   private visible = true;
   private readonly disposable: THREE.Object3D[] = [];
@@ -345,7 +345,7 @@ export class HydrologyOverlay {
     this.group.renderOrder = 18;
   }
 
-  setHydrology(hydrology: HydrologySceneV1 | null | undefined): void {
+  setHydrology(hydrology: HydrologySceneV2 | null | undefined): void {
     this.hydrology = hydrology ?? null;
     this.rebuild();
   }
@@ -374,10 +374,8 @@ export class HydrologyOverlay {
         this.addWaterBodyRing(simplifyLakeRing(ring, LAKE_RING_SIMPLIFY_TOLERANCE_CELLS * this.config.unitSize), y);
       }
     }
-    for (const river of this.hydrology.rivers) {
-      for (const segment of river.segments) {
-        this.addRiver(segment.points, Math.max(1, river.widthHint));
-      }
+    for (const reach of this.hydrology.reaches) {
+      this.addRiver(reach.points, Math.max(1, reach.widthHint));
     }
   }
 

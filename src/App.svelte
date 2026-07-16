@@ -10,7 +10,7 @@
   import { estimateErosionBakeMemoryMb } from './lib/authoring/erosionBakeWebGpu';
   import { distanceToSpline, pointInSplinePolygon } from './lib/authoring/geometry';
   import { sampleSplineAnchorsWithSegments } from './lib/authoring/spline';
-  import { addRiverSourceAtWorld, addWaterFillAtWorld } from './lib/authoring/hydrologyAuthoring';
+  import { addRiverSourceAtWorld, addWaterFillAtWorld, rebuildRiverNetworkFromSources } from './lib/authoring/hydrologyAuthoring';
   import NoiseGraphEditor from './lib/noiseGraph/NoiseGraphEditor.svelte';
   import { createNoiseGraph, type NoiseFieldGraphV1 } from './lib/noiseGraph';
   import NumericInput from './lib/ui/NumericInput.svelte';
@@ -549,7 +549,7 @@
   async function applyWaterFill(point: AuthoringPointerPoint) {
     if (!authoringDocument) return;
     hydrologyToolBusy = true;
-    status = 'Reading fill region...';
+    status = 'Reading baked basin...';
     try {
       const result = await addWaterFillAtWorld(manager, authoringDocument.hydrology, point.x, point.z);
       if (!result.ok) {
@@ -568,7 +568,7 @@
   async function applyRiverSource(point: AuthoringPointerPoint) {
     if (!authoringDocument) return;
     hydrologyToolBusy = true;
-    status = 'Routing river downhill...';
+    status = 'Traversing baked river graph...';
     try {
       const result = await addRiverSourceAtWorld(manager, authoringDocument.hydrology, point.x, point.z);
       if (!result.ok) {
@@ -576,7 +576,7 @@
         return;
       }
       commitAuthoring({ ...authoringDocument, hydrology: result.hydrology }, { stale: false });
-      status = `${result.river.name} ${result.replaced ? 'rerouted' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}.`;
+      status = `${result.source.name} ${result.replaced ? 'rebuilt' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}.`;
     } catch (error) {
       status = error instanceof Error ? error.message : 'Could not route the river.';
     } finally {
@@ -667,14 +667,15 @@
   function clearHydrologyObjects() {
     if (!authoringDocument) return;
     const lakeCount = authoringDocument.hydrology.waterBodies.length;
-    const riverCount = authoringDocument.hydrology.rivers.length;
+    const riverCount = authoringDocument.hydrology.riverSources.length;
     if (lakeCount === 0 && riverCount === 0) return;
     commitAuthoring({
       ...authoringDocument,
       hydrology: {
         ...authoringDocument.hydrology,
         waterBodies: [],
-        rivers: []
+        riverSources: [],
+        reaches: []
       }
     }, { stale: false });
     status = `Cleared ${lakeCount} ${lakeCount === 1 ? 'lake' : 'lakes'} and ${riverCount} ${riverCount === 1 ? 'river' : 'rivers'}.`;
@@ -871,6 +872,13 @@
         preferWebGpu: preferWebGpuBake
       });
       bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
+      if (bakeState === 'clean' && authoringDocument.hydrology.riverSources.length > 0) {
+        status = 'Reprojecting authored river sources...';
+        authoringDocument = await manager.saveAuthoringDocument({
+          ...authoringDocument,
+          hydrology: await rebuildRiverNetworkFromSources(manager, authoringDocument.hydrology)
+        });
+      }
       status = bakeState === 'failed' ? authoringDocument.lastBake?.error ?? 'Bake failed.' : 'Bake complete.';
       metrics = { ...manager.metrics };
       viewport?.refreshTerrain();
@@ -1311,28 +1319,11 @@
       </div>
 
       <div class="authoring-inspector-scroll">
-        <label title="Maximum carried river momentum in map-cell units. Downhill acceleration approaches this value asymptotically.">
-          <span>River max momentum</span>
-          <NumericInput
-            min="0.25"
-            max="256"
-            step="1"
-            value={authoringDocument.hydrology.riverTrace.maxMomentum}
-            onCommit={(value) => commitAuthoring({
-              ...authoringDocument,
-              hydrology: {
-                ...authoringDocument.hydrology,
-                riverTrace: { maxMomentum: Math.max(0.25, Math.min(256, value)) }
-              }
-            }, { stale: false })}
-          />
-        </label>
-
         <div class="draft-row">
-          <span>{authoringDocument.hydrology.waterBodies.length} lakes · {authoringDocument.hydrology.rivers.length} rivers</span>
+          <span>{authoringDocument.hydrology.waterBodies.length} lakes · {authoringDocument.hydrology.riverSources.length} sources · {authoringDocument.hydrology.reaches.length} reaches</span>
           <button
             type="button"
-            disabled={authoringDocument.hydrology.waterBodies.length === 0 && authoringDocument.hydrology.rivers.length === 0}
+            disabled={authoringDocument.hydrology.waterBodies.length === 0 && authoringDocument.hydrology.riverSources.length === 0}
             title="Clear all authored lakes and rivers"
             onclick={clearHydrologyObjects}
           ><Trash2 size={14} /> Clear lakes & rivers</button>

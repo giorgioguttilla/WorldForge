@@ -2,7 +2,7 @@ import { R16HeightmapCodec } from './r16Codec';
 import { tilePath, type TileKey } from './tileKey';
 import { normalizeWorldConfig, type WorldConfig } from './worldConfig';
 import { normalizeAuthoringDocument, type AuthoringDocumentV1 } from '../authoring/authoringDocument';
-import type { HydrologyTopologyV2 } from '../authoring/hydrologyBake';
+import type { HydrologyTopologyV3 } from '../authoring/hydrologyBake';
 
 export interface TileMetricsSnapshot {
   cachedTiles: number;
@@ -130,13 +130,19 @@ export class HeightmapTileStore {
     await this.writeTypedTile(flowAccumulationTilePath(key), samples, 'flow accumulation');
   }
 
-  async writeHydrologyTopology(topology: HydrologyTopologyV2): Promise<void> {
+  async writeHydrologyTopology(topology: HydrologyTopologyV3): Promise<void> {
     await Promise.all([
       this.writeTypedTile('hydrology/basin-ids.u32', topology.basinIds, 'hydrology basin ids'),
       this.writeTypedTile('hydrology/fill-heights.u16', topology.fillHeights, 'hydrology fill heights'),
       this.writeTypedTile('hydrology/downstream-ids.u32', topology.downstreamIds, 'hydrology downstream ids'),
       this.writeTypedTile('hydrology/spill-cells.u32', topology.spillCells, 'hydrology spill cells'),
-      this.writeTypedTile('hydrology/downstream-cells.u32', topology.downstreamCells, 'hydrology downstream cells')
+      this.writeTypedTile('hydrology/downstream-cells.u32', topology.downstreamCells, 'hydrology downstream cells'),
+      this.writeTypedTile('hydrology/area-cells.u32', topology.areaCells, 'hydrology basin areas'),
+      this.writeTypedTile('hydrology/max-depths.u16', topology.maxDepths, 'hydrology basin depths'),
+      this.writeTypedTile('hydrology/min-cell-x.u32', topology.minCellX, 'hydrology basin minimum x'),
+      this.writeTypedTile('hydrology/min-cell-y.u32', topology.minCellY, 'hydrology basin minimum y'),
+      this.writeTypedTile('hydrology/max-cell-x.u32', topology.maxCellX, 'hydrology basin maximum x'),
+      this.writeTypedTile('hydrology/max-cell-y.u32', topology.maxCellY, 'hydrology basin maximum y')
     ]);
     const root = this.requireRoot();
     const dir = await this.ensureDirectory(root, ['hydrology']);
@@ -153,28 +159,40 @@ export class HeightmapTileStore {
       fillHeights: 'fill-heights.u16',
       downstreamIds: 'downstream-ids.u32',
       spillCells: 'spill-cells.u32',
-      downstreamCells: 'downstream-cells.u32'
+      downstreamCells: 'downstream-cells.u32',
+      areaCells: 'area-cells.u32',
+      maxDepths: 'max-depths.u16',
+      minCellX: 'min-cell-x.u32',
+      minCellY: 'min-cell-y.u32',
+      maxCellX: 'max-cell-x.u32',
+      maxCellY: 'max-cell-y.u32'
     }, null, 2));
     await writable.close();
   }
 
-  async readHydrologyTopology(): Promise<HydrologyTopologyV2 | null> {
+  async readHydrologyTopology(): Promise<HydrologyTopologyV3 | null> {
     const root = this.requireRoot();
     try {
       const file = await (await this.getFile(root, 'hydrology/topology.json')).getFile();
       const metadata = JSON.parse(await file.text()) as Record<string, unknown>;
       const length = Math.max(0, Math.trunc(Number(metadata.arrayLength)));
-      if (metadata.version !== 2 || metadata.receiverEncoding !== 'd-infinity-angle-u16-turn65528' || length < 1) return null;
-      const [basinIds, fillHeights, downstreamIds, spillCells, downstreamCells] = await Promise.all([
+      if (metadata.version !== 3 || metadata.receiverEncoding !== 'd-infinity-angle-u16-turn65528' || length < 1) return null;
+      const [basinIds, fillHeights, downstreamIds, spillCells, downstreamCells, areaCells, maxDepths, minCellX, minCellY, maxCellX, maxCellY] = await Promise.all([
         this.readOptionalBinaryTile('hydrology/basin-ids.u32', length * Uint32Array.BYTES_PER_ELEMENT),
         this.readOptionalBinaryTile('hydrology/fill-heights.u16', length * Uint16Array.BYTES_PER_ELEMENT),
         this.readOptionalBinaryTile('hydrology/downstream-ids.u32', length * Uint32Array.BYTES_PER_ELEMENT),
         this.readOptionalBinaryTile('hydrology/spill-cells.u32', length * Uint32Array.BYTES_PER_ELEMENT),
-        this.readOptionalBinaryTile('hydrology/downstream-cells.u32', length * Uint32Array.BYTES_PER_ELEMENT)
+        this.readOptionalBinaryTile('hydrology/downstream-cells.u32', length * Uint32Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/area-cells.u32', length * Uint32Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/max-depths.u16', length * Uint16Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/min-cell-x.u32', length * Uint32Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/min-cell-y.u32', length * Uint32Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/max-cell-x.u32', length * Uint32Array.BYTES_PER_ELEMENT),
+        this.readOptionalBinaryTile('hydrology/max-cell-y.u32', length * Uint32Array.BYTES_PER_ELEMENT)
       ]);
-      if (!basinIds || !fillHeights || !downstreamIds || !spillCells || !downstreamCells) throw new Error('Hydrology topology arrays are incomplete.');
+      if (!basinIds || !fillHeights || !downstreamIds || !spillCells || !downstreamCells || !areaCells || !maxDepths || !minCellX || !minCellY || !maxCellX || !maxCellY) throw new Error('Hydrology topology arrays are incomplete.');
       return {
-        version: 2,
+        version: 3,
         width: Number(metadata.width),
         height: Number(metadata.height),
         nodeCount: Number(metadata.nodeCount),
@@ -183,7 +201,13 @@ export class HeightmapTileStore {
         fillHeights: new Uint16Array(fillHeights),
         downstreamIds: new Uint32Array(downstreamIds),
         spillCells: new Uint32Array(spillCells),
-        downstreamCells: new Uint32Array(downstreamCells)
+        downstreamCells: new Uint32Array(downstreamCells),
+        areaCells: new Uint32Array(areaCells),
+        maxDepths: new Uint16Array(maxDepths),
+        minCellX: new Uint32Array(minCellX),
+        minCellY: new Uint32Array(minCellY),
+        maxCellX: new Uint32Array(maxCellX),
+        maxCellY: new Uint32Array(maxCellY)
       };
     } catch (error) {
       if (error instanceof DOMException && error.name === 'NotFoundError') return null;

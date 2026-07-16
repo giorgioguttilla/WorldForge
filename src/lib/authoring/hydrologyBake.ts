@@ -17,11 +17,11 @@ export interface HydrologyTileIO {
   writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
   writeFlowAccumulationTile?(key: TileKey, samples: Float32Array): Promise<void>;
   readFlowAccumulationTile?(key: TileKey): Promise<Float32Array | null>;
-  writeHydrologyTopology?(topology: HydrologyTopologyV2): Promise<void>;
+  writeHydrologyTopology?(topology: HydrologyTopologyV3): Promise<void>;
 }
 
-export interface HydrologyTopologyV2 {
-  version: 2;
+export interface HydrologyTopologyV3 {
+  version: 3;
   width: number;
   height: number;
   nodeCount: number;
@@ -32,6 +32,12 @@ export interface HydrologyTopologyV2 {
   downstreamIds: Uint32Array;
   spillCells: Uint32Array;
   downstreamCells: Uint32Array;
+  areaCells: Uint32Array;
+  maxDepths: Uint16Array;
+  minCellX: Uint32Array;
+  minCellY: Uint32Array;
+  maxCellX: Uint32Array;
+  maxCellY: Uint32Array;
 }
 
 export interface HydrologyProgress {
@@ -307,13 +313,13 @@ export async function runHydrologyBasinBake(
     useWorkers
   );
 
-  let solverTopology: HydrologyTopologyV2 | null = null;
+  let solverTopology: HydrologyTopologyV3 | null = null;
   if (!usePhysicalTopology && outletCells && solverDownstreamCells) {
     const downstreamIds = new Uint32Array(graph.nodeCount);
     downstreamIds.fill(NO_FLOW_TARGET);
     for (let id = 1; id < graph.nodeCount; id += 1) downstreamIds[id] = graphSolution.parentNode[id];
     solverTopology = {
-      version: 2,
+      version: 3,
       width: config.tileSize * config.tilesPerSide,
       height: config.tileSize * config.tilesPerSide,
       nodeCount: graph.nodeCount,
@@ -322,7 +328,13 @@ export async function runHydrologyBasinBake(
       fillHeights: globalFillHeights,
       downstreamIds,
       spillCells: outletCells,
-      downstreamCells: solverDownstreamCells
+      downstreamCells: solverDownstreamCells,
+      areaCells: new Uint32Array(graph.nodeCount),
+      maxDepths: new Uint16Array(graph.nodeCount),
+      minCellX: new Uint32Array(graph.nodeCount),
+      minCellY: new Uint32Array(graph.nodeCount),
+      maxCellX: new Uint32Array(graph.nodeCount),
+      maxCellY: new Uint32Array(graph.nodeCount)
     };
   }
   analyses.length = 0;
@@ -343,7 +355,7 @@ export async function runHydrologyBasinBake(
   }
   const topology = usePhysicalTopology
     ? await buildPhysicalHydrologyTopology(config, io, jobs, physicalBasinStats)
-    : solverTopology as HydrologyTopologyV2;
+    : solverTopology as HydrologyTopologyV3;
   await io.writeHydrologyTopology?.(topology);
 
   const flowResult = await runFlowStrengthBake(config, io, jobs, useWorkers, completed, total, onProgress);
@@ -373,7 +385,7 @@ export async function runHydrologyBasinBake(
       lakeFillHeight: 'closed-basin-fill-height-r16',
       basinIds: 'physical-filled-basin-id-u32',
       receiverDirections: 'conditioned-flat-resolved-d-infinity-u16',
-      topology: 'physical-basin-topology-v2',
+      topology: 'physical-basin-topology-v3',
       flowStrength: flowResult.enabled ? 'log1p-contributing-area-r16' : undefined,
       flowAccumulation: flowResult.enabled ? 'contributing-area-f32' : undefined,
       maxFlowAccumulation: flowResult.enabled ? flowResult.maxFlowAccumulation : undefined,
@@ -928,7 +940,7 @@ async function buildPhysicalHydrologyTopology(
   io: HydrologyTileIO,
   jobs: TileJob[],
   stats: Map<number, PhysicalBasinAccumulator>
-): Promise<HydrologyTopologyV2> {
+): Promise<HydrologyTopologyV3> {
   const ids = Uint32Array.from([...stats.keys()].sort((a, b) => a - b));
   const idToIndex = new Map<number, number>();
   for (let i = 0; i < ids.length; i += 1) idToIndex.set(ids[i], i);
@@ -936,12 +948,27 @@ async function buildPhysicalHydrologyTopology(
   const downstreamIds = new Uint32Array(ids.length);
   const spillCells = new Uint32Array(ids.length);
   const downstreamCells = new Uint32Array(ids.length);
+  const areaCells = new Uint32Array(ids.length);
+  const maxDepths = new Uint16Array(ids.length);
+  const minCellX = new Uint32Array(ids.length);
+  const minCellY = new Uint32Array(ids.length);
+  const maxCellX = new Uint32Array(ids.length);
+  const maxCellY = new Uint32Array(ids.length);
   spillCells.fill(NO_FLOW_TARGET);
   downstreamCells.fill(NO_FLOW_TARGET);
-  for (let i = 0; i < ids.length; i += 1) fillHeights[i] = stats.get(ids[i])?.fillHeight ?? 0;
+  for (let i = 0; i < ids.length; i += 1) {
+    const record = stats.get(ids[i]);
+    fillHeights[i] = record?.fillHeight ?? 0;
+    areaCells[i] = record?.areaCells ?? 0;
+    maxDepths[i] = record?.maxDepth ?? 0;
+    minCellX[i] = Number.isFinite(record?.minGlobalX) ? record!.minGlobalX : 0;
+    minCellY[i] = Number.isFinite(record?.minGlobalY) ? record!.minGlobalY : 0;
+    maxCellX[i] = record?.maxGlobalX ?? 0;
+    maxCellY[i] = record?.maxGlobalY ?? 0;
+  }
   if (!io.readBasinIdTile || !io.readReceiverDirectionTile) {
     return {
-      version: 2,
+      version: 3,
       width: config.tileSize * config.tilesPerSide,
       height: config.tileSize * config.tilesPerSide,
       nodeCount: ids.length,
@@ -950,7 +977,13 @@ async function buildPhysicalHydrologyTopology(
       fillHeights,
       downstreamIds,
       spillCells,
-      downstreamCells
+      downstreamCells,
+      areaCells,
+      maxDepths,
+      minCellX,
+      minCellY,
+      maxCellX,
+      maxCellY
     };
   }
   const basinCache = new HydrologyTileCache<Uint32Array>(12, (x, y) => requireHydrologyTile(io.readBasinIdTile?.({ x, y, d: 0 }), 'basin id', x, y));
@@ -985,7 +1018,7 @@ async function buildPhysicalHydrologyTopology(
     }
   }
   return {
-    version: 2,
+    version: 3,
     width: fullSide,
     height: fullSide,
     nodeCount: ids.length,
@@ -994,7 +1027,13 @@ async function buildPhysicalHydrologyTopology(
     fillHeights,
     downstreamIds,
     spillCells,
-    downstreamCells
+    downstreamCells,
+    areaCells,
+    maxDepths,
+    minCellX,
+    minCellY,
+    maxCellX,
+    maxCellY
   };
 }
 

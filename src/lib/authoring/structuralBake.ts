@@ -16,7 +16,7 @@ import {
 import type { CompiledNoiseFieldGraph, NoiseFieldEvaluationContext } from '../noiseGraph';
 import { tryCreateWebGpuDepthZeroBake } from './structuralBakeWebGpu';
 import { runWebGpuErosionBake, type ErosionProgress } from './erosionBakeWebGpu';
-import { runHydrologyBasinBake, type HydrologyProgress, type HydrologyTopologyV2 } from './hydrologyBake';
+import { runHydrologyBasinBake, type HydrologyProgress, type HydrologyTopologyV3 } from './hydrologyBake';
 
 export interface BakeProgress {
   phase: 'baking' | 'eroding' | 'hydrology' | 'building-lod';
@@ -43,7 +43,7 @@ export interface BakeTileIO {
   writeFlowStrengthTile?(key: TileKey, samples: Uint16Array): Promise<void>;
   writeFlowAccumulationTile?(key: TileKey, samples: Float32Array): Promise<void>;
   readFlowAccumulationTile?(key: TileKey): Promise<Float32Array | null>;
-  writeHydrologyTopology?(topology: HydrologyTopologyV2): Promise<void>;
+  writeHydrologyTopology?(topology: HydrologyTopologyV3): Promise<void>;
 }
 
 export interface BakePassResult {
