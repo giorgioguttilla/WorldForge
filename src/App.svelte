@@ -576,7 +576,7 @@
         return;
       }
       commitAuthoring({ ...authoringDocument, hydrology: result.hydrology }, { stale: false });
-      status = `${result.source.name} ${result.replaced ? 'rebuilt' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}. Basins: ${result.basinDiagnostics.continuous} continuous, ${result.basinDiagnostics.terminal} terminal.`;
+      status = `${result.source.name} ${result.replaced ? 'rebuilt' : 'created'}${result.createdWaterBodies ? ` with ${result.createdWaterBodies} water ${result.createdWaterBodies === 1 ? 'body' : 'bodies'}` : ''}. ${result.channelDiagnostics.reaches} reaches; basins: ${result.basinDiagnostics.continuous} continuous, ${result.basinDiagnostics.terminal} terminal.`;
     } catch (error) {
       status = error instanceof Error ? error.message : 'Could not route the river.';
     } finally {
@@ -680,6 +680,24 @@
       }
     }, { stale: false });
     status = `Cleared ${lakeCount} ${lakeCount === 1 ? 'lake' : 'lakes'} and ${riverCount} ${riverCount === 1 ? 'river' : 'rivers'}.`;
+  }
+
+  async function updateChannelThreshold(value: number) {
+    if (!authoringDocument || hydrologyToolBusy) return;
+    hydrologyToolBusy = true;
+    status = 'Extracting automatic channel network...';
+    try {
+      const hydrology = await rebuildRiverNetworkFromSources(manager, {
+        ...authoringDocument.hydrology,
+        channelThreshold: Math.max(1, value)
+      });
+      commitAuthoring({ ...authoringDocument, hydrology }, { stale: false });
+      status = `Automatic channels rebuilt at discharge threshold ${hydrology.channelThreshold.toLocaleString()}.`;
+    } catch (error) {
+      status = error instanceof Error ? error.message : 'Could not rebuild automatic channels.';
+    } finally {
+      hydrologyToolBusy = false;
+    }
   }
 
   function findControlPointInsertion(x: number, z: number): { primitive: PrimitiveV1; insertIndex: number; distance: number } | null {
@@ -873,8 +891,8 @@
         preferWebGpu: preferWebGpuBake
       });
       bakeState = authoringDocument.lastBake?.status === 'failed' ? 'failed' : 'clean';
-      if (bakeState === 'clean' && authoringDocument.hydrology.riverSources.length > 0) {
-        status = 'Reprojecting authored river sources...';
+      if (bakeState === 'clean') {
+        status = 'Extracting automatic channels and reprojecting river sources...';
         authoringDocument = await manager.saveAuthoringDocument({
           ...authoringDocument,
           hydrology: await rebuildRiverNetworkFromSources(manager, authoringDocument.hydrology)
@@ -1320,6 +1338,16 @@
       </div>
 
       <div class="authoring-inspector-scroll">
+        <label title="Minimum exact accumulated discharge required for an automatic channel. Authored river sources can force sub-threshold reaches.">
+          <span>Channel threshold</span>
+          <NumericInput
+            min="1"
+            step="16"
+            value={authoringDocument.hydrology.channelThreshold}
+            onCommit={(value) => void updateChannelThreshold(value)}
+          />
+        </label>
+
         <div class="draft-row">
           <span>{authoringDocument.hydrology.waterBodies.length} lakes · {authoringDocument.hydrology.riverSources.length} sources · {authoringDocument.hydrology.reaches.length} reaches</span>
           <button
