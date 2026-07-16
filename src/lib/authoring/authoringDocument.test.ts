@@ -17,6 +17,7 @@ describe('authoring document', () => {
       'preset-himalayas',
       'preset-canyon'
     ]);
+    expect(document.hydrology.channelThreshold).toBe(512);
   });
 
   it('normalizes missing or corrupt documents to an empty document', () => {
@@ -149,6 +150,7 @@ describe('authoring document', () => {
     expect(document.hydrology.waterBodies[0]).toMatchObject({ name: 'Lake One', sourceCellX: 4, sourceCellY: 5, basinId: 12 });
     expect(document.hydrology.riverSources).toEqual([expect.objectContaining({ id: 'source-1', discharge: 2 })]);
     expect(document.hydrology.reaches).toEqual([expect.objectContaining({ id: 'reach-1', termination: 'edge', sourceIds: ['source-1'], discharge: 2 })]);
+    expect(document.hydrology.channelThreshold).toBe(512);
   });
 
   it('drops legacy momentum rivers while retaining valid water bodies', () => {

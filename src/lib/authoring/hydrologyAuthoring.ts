@@ -24,24 +24,91 @@ interface DraftReach {
   downstreamStartCell?: number;
 }
 
+const CELL_ID_CHUNK_SIZE = 262144;
+
+/**
+ * Sparse, tile-backed cell membership. A world-sized bitmap is still enormous
+ * for large projects, so allocate bits only for tiles touched by the network.
+ */
+class TiledCellSet implements Iterable<number> {
+  private readonly membership = new Map<number, Uint8Array>();
+  private readonly chunks: Array<{ values: Uint32Array; length: number }> = [];
+  size = 0;
+
+  constructor(private readonly side: number, private readonly tileSize: number, private readonly trackEntries = true) {}
+
+  has(cellId: number): boolean {
+    const location = this.locate(cellId);
+    const bits = this.membership.get(location.tileId);
+    return bits ? (bits[location.localId >>> 3] & (1 << (location.localId & 7))) !== 0 : false;
+  }
+
+  add(cellId: number): boolean {
+    const location = this.locate(cellId);
+    let bits = this.membership.get(location.tileId);
+    if (!bits) {
+      bits = new Uint8Array(Math.ceil(this.tileSize * this.tileSize / 8));
+      this.membership.set(location.tileId, bits);
+    }
+    const byte = location.localId >>> 3;
+    const bit = 1 << (location.localId & 7);
+    if ((bits[byte] & bit) !== 0) return false;
+    bits[byte] |= bit;
+    this.size += 1;
+    if (!this.trackEntries) return true;
+    let chunk = this.chunks[this.chunks.length - 1];
+    if (!chunk || chunk.length === chunk.values.length) {
+      chunk = { values: new Uint32Array(CELL_ID_CHUNK_SIZE), length: 0 };
+      this.chunks.push(chunk);
+    }
+    chunk.values[chunk.length] = cellId;
+    chunk.length += 1;
+    return true;
+  }
+
+  *[Symbol.iterator](): Iterator<number> {
+    for (const chunk of this.chunks) for (let index = 0; index < chunk.length; index += 1) yield chunk.values[index];
+  }
+
+  private locate(cellId: number): { tileId: number; localId: number } {
+    const x = cellId % this.side;
+    const y = Math.floor(cellId / this.side);
+    const tileX = Math.floor(x / this.tileSize);
+    const tileY = Math.floor(y / this.tileSize);
+    return {
+      tileId: tileY * Math.ceil(this.side / this.tileSize) + tileX,
+      localId: (y - tileY * this.tileSize) * this.tileSize + x - tileX * this.tileSize
+    };
+  }
+}
+
 const D8_DX = new Int8Array([0, 1, 0, 1, -1, 0, -1, 1, -1]);
 const D8_DY = new Int8Array([0, 0, 1, 1, 0, -1, -1, -1, 1]);
 const NO_FLOW_TARGET = 0xffffffff;
 export const RIVER_SIMPLIFY_TOLERANCE_CELLS = 0.6;
 export const LAKE_RING_SIMPLIFY_TOLERANCE_CELLS = 0.75;
+const AUTOMATIC_TRIBUTARY_MIN_CELLS = 6;
 
 export type WaterFillResult =
   | { ok: true; hydrology: HydrologySceneV2; waterBody: WaterBodyV1; created: boolean }
   | { ok: false; reason: string };
 
 export type RiverSourceResult =
-  | { ok: true; hydrology: HydrologySceneV2; source: RiverSourceConstraintV2; createdWaterBodies: number; replaced: boolean; basinDiagnostics: BasinRoutingDiagnostics }
+  | { ok: true; hydrology: HydrologySceneV2; source: RiverSourceConstraintV2; createdWaterBodies: number; replaced: boolean; basinDiagnostics: BasinRoutingDiagnostics; channelDiagnostics: ChannelExtractionDiagnostics }
   | { ok: false; reason: string };
 
 export interface BasinRoutingDiagnostics {
   total: number;
   continuous: number;
   terminal: number;
+}
+
+export interface ChannelExtractionDiagnostics {
+  threshold: number;
+  automaticCells: number;
+  automaticSources: number;
+  confluences: number;
+  reaches: number;
 }
 
 interface BasinWaterBalanceDecision {
@@ -114,14 +181,15 @@ export async function addRiverSourceAtWorld(
     source,
     createdWaterBodies: rebuilt.createdWaterBodies,
     replaced: Boolean(existing),
-    basinDiagnostics: rebuilt.basinDiagnostics
+    basinDiagnostics: rebuilt.basinDiagnostics,
+    channelDiagnostics: rebuilt.channelDiagnostics
   };
 }
 
 /** Reprojects durable source constraints after a terrain bake changes the receiver graph. */
 export async function rebuildRiverNetworkFromSources(manager: TileManager, hydrology: HydrologySceneV2): Promise<HydrologySceneV2> {
   const config = manager.config;
-  if (!config || hydrology.riverSources.length === 0) return hydrology;
+  if (!config) return hydrology;
   const topology = await manager.readHydrologyTopology();
   if (!topology) return { ...hydrology, reaches: [], basinNodes: [] };
   return (await rebuildRiverNetwork(new HydrologyMapSampler(manager, config, topology), hydrology)).hydrology;
@@ -143,9 +211,9 @@ async function createSampler(manager: TileManager, worldX: number, worldZ: numbe
 async function rebuildRiverNetwork(
   sampler: HydrologyMapSampler,
   scene: HydrologySceneV2
-): Promise<{ hydrology: HydrologySceneV2; createdWaterBodies: number; basinDiagnostics: BasinRoutingDiagnostics }> {
-  const nextByCell = new Map<number, number>();
-  const networkCells = new Set<number>();
+): Promise<{ hydrology: HydrologySceneV2; createdWaterBodies: number; basinDiagnostics: BasinRoutingDiagnostics; channelDiagnostics: ChannelExtractionDiagnostics }> {
+  const cellCount = sampler.side * sampler.side;
+  const tileSize = sampler.config.tileSize;
   const terminals = new Map<number, Terminal>();
   const sourceCells = new Set(scene.riverSources.map((source) => sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY })));
   const basinOutletCells = new Set<number>();
@@ -154,105 +222,175 @@ async function rebuildRiverNetwork(
   const bodyByBasin = new Map(waterBodies.flatMap((body) => body.basinId ? [[body.basinId, body] as const] : []));
   const basinDecisions = new Map<number, BasinWaterBalanceDecision>();
   let createdWaterBodies = 0;
+  type ForcedTrace = { startCellId: number; visitedBasins: ReadonlySet<number> };
+  const forcedTraces: ForcedTrace[] = scene.riverSources.map((source) => ({
+    startCellId: sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY }),
+    visitedBasins: new Set<number>()
+  }));
+  const queuedBasinOutlets = new Set<number>();
+  const forcedCells = new TiledCellSet(sampler.side, tileSize);
+  const forcedBreakpoints = new TiledCellSet(sampler.side, tileSize);
+  const nextByForcedCell = new Map<number, number>();
+  for (const source of sourceCells) forcedBreakpoints.add(source);
 
-  for (const source of scene.riverSources) {
-    let current = sampler.cellId({ x: source.sourceCellX, y: source.sourceCellY });
+  const enterBasin = async (inletCellId: number, basinId: number, visitedBasins: ReadonlySet<number>): Promise<void> => {
+    let body = bodyByBasin.get(basinId);
+    if (!body) {
+      body = await materializeBasin(sampler, basinId, waterBodies.length + 1) ?? undefined;
+      if (body) {
+        waterBodies.push(body);
+        bodyByBasin.set(basinId, body);
+        createdWaterBodies += 1;
+      }
+    }
+    if (!body) {
+      terminals.set(inletCellId, { type: 'stuck' });
+      return;
+    }
+    terminals.set(inletCellId, { type: 'water-body', waterBodyId: body.id, basinId });
+    const record = sampler.basinRecord(basinId);
+    if (!record) return;
+    const decision = basinDecisions.get(basinId) ?? evaluateBasinWaterBalance(record);
+    basinDecisions.set(basinId, decision);
+    if (decision.status === 'terminal') return;
+    if (visitedBasins.has(basinId)) {
+      console.warn('[WorldForge hydrology] Basin outlet cycle detected; terminating this route.', { basinId });
+      basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
+      return;
+    }
+    if (queuedBasinOutlets.has(basinId)) return;
+    const downstream = record.downstreamCellId as number;
+    const downstreamCell = sampler.cellFromId(downstream);
+    if (!sampler.contains(downstreamCell) || await sampler.basin(downstreamCell) === basinId) {
+      console.warn('[WorldForge hydrology] Invalid baked basin outlet; terminating this route.', { basinId, downstreamCellId: downstream });
+      basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
+      return;
+    }
+    queuedBasinOutlets.add(basinId);
+    basinOutletCells.add(downstream);
+    forcedBreakpoints.add(downstream);
+    outletBasinByCell.set(downstream, basinId);
+    forcedTraces.push({ startCellId: downstream, visitedBasins: new Set([...visitedBasins, basinId]) });
+  };
+
+  const traceForcedDownstream = async (startCellId: number, visitedBasins: ReadonlySet<number>): Promise<void> => {
+    if (forcedCells.has(startCellId)) {
+      forcedBreakpoints.add(startCellId);
+      return;
+    }
+    let current = startCellId;
     const visited = new Set<number>();
-    const visitedBasins = new Set<number>();
-    for (let step = 0; step < sampler.side * sampler.side; step += 1) {
+    for (let step = 0; step < cellCount; step += 1) {
       if (visited.has(current)) {
         terminals.set(current, { type: 'stuck' });
-        break;
+        forcedBreakpoints.add(current);
+        return;
       }
-      if (networkCells.has(current)) break;
-      networkCells.add(current);
+      forcedCells.add(current);
       visited.add(current);
       const cell = sampler.cellFromId(current);
       const basinId = await sampler.basin(cell);
       if (basinId !== 0) {
-        let body = bodyByBasin.get(basinId);
-        if (!body) {
-          body = await materializeBasin(sampler, basinId, waterBodies.length + 1) ?? undefined;
-          if (body) {
-            waterBodies.push(body);
-            bodyByBasin.set(basinId, body);
-            createdWaterBodies += 1;
-          }
-        }
-        if (!body) {
-          terminals.set(current, { type: 'stuck' });
-          break;
-        }
-        terminals.set(current, { type: 'water-body', waterBodyId: body.id, basinId });
-        const record = sampler.basinRecord(basinId);
-        if (!record) break;
-        const decision = basinDecisions.get(basinId) ?? evaluateBasinWaterBalance(record);
-        basinDecisions.set(basinId, decision);
-        if (decision.status === 'terminal') break;
-        if (visitedBasins.has(basinId)) {
-          console.warn('[WorldForge hydrology] Basin outlet cycle detected; terminating this route.', { basinId });
-          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
-          break;
-        }
-        visitedBasins.add(basinId);
-        const downstream = record.downstreamCellId as number;
-        const downstreamCell = sampler.cellFromId(downstream);
-        if (!sampler.contains(downstreamCell) || await sampler.basin(downstreamCell) === basinId) {
-          console.warn('[WorldForge hydrology] Invalid baked basin outlet; terminating this route.', { basinId, downstreamCellId: downstream });
-          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
-          break;
-        }
-        basinOutletCells.add(downstream);
-        outletBasinByCell.set(downstream, basinId);
-        if (visited.has(downstream)) {
-          console.warn('[WorldForge hydrology] Basin outlet returned to its upstream route; terminating this route.', { basinId, downstreamCellId: downstream });
-          basinDecisions.set(basinId, { status: 'terminal', outflowFraction: 0, reason: 'no-baked-outlet' });
-          break;
-        }
-        if (networkCells.has(downstream)) break;
-        current = downstream;
-        continue;
+        forcedBreakpoints.add(current);
+        await enterBasin(current, basinId, visitedBasins);
+        return;
       }
       if (sampler.isEdge(cell)) {
         terminals.set(current, { type: 'edge' });
-        break;
+        forcedBreakpoints.add(current);
+        return;
       }
       const next = await sampler.receiver(cell);
       if (!next) {
         terminals.set(current, { type: 'stuck' });
-        break;
+        forcedBreakpoints.add(current);
+        return;
       }
       const nextId = sampler.cellId(next);
       if (visited.has(nextId)) {
         terminals.set(current, { type: 'stuck' });
-        break;
+        forcedBreakpoints.add(current);
+        return;
       }
-      nextByCell.set(current, nextId);
-      if (networkCells.has(nextId)) break;
+      nextByForcedCell.set(current, nextId);
+      if (forcedCells.has(nextId)) {
+        forcedBreakpoints.add(nextId);
+        return;
+      }
       current = nextId;
     }
+    terminals.set(current, { type: 'stuck' });
+    forcedBreakpoints.add(current);
+  };
+
+  // First reconstruct the authored trunks and their recursive basin exits using
+  // the baked downstream graph, exactly as Phase 3 did.
+  for (let traceIndex = 0; traceIndex < forcedTraces.length; traceIndex += 1) {
+    const trace = forcedTraces[traceIndex];
+    await traceForcedDownstream(trace.startCellId, trace.visitedBasins);
   }
 
-  const indegree = new Map<number, number>();
-  for (const next of nextByCell.values()) indegree.set(next, (indegree.get(next) ?? 0) + 1);
-  const breakpoints = new Set<number>([...sourceCells, ...basinOutletCells]);
-  for (const cell of networkCells) {
-    if ((indegree.get(cell) ?? 0) !== 1 || terminals.has(cell) || !nextByCell.has(cell)) breakpoints.add(cell);
+  for (const cell of basinOutletCells) forcedBreakpoints.add(cell);
+
+  // Grow only threshold-qualified D-infinity branches whose vectors feed an
+  // existing trunk/branch. Newly accepted cells become targets in turn, so the
+  // search walks upstream without ever scanning unrelated parts of the world.
+  const tributaryCells = new TiledCellSet(sampler.side, tileSize);
+  const upstreamStack = [...forcedCells];
+  while (upstreamStack.length > 0) {
+    const targetId = upstreamStack.pop() as number;
+    const target = sampler.cellFromId(targetId);
+    if (!sampler.hasLoadedUpstreamNeighborhood(target)) await sampler.loadUpstreamNeighborhood(target);
+    for (const upstream of sampler.upstreamChannelNeighborsLoaded(target, scene.channelThreshold)) {
+      const upstreamId = sampler.cellId(upstream);
+      if (forcedCells.has(upstreamId)) continue;
+      forcedCells.add(upstreamId);
+      tributaryCells.add(upstreamId);
+      nextByForcedCell.set(upstreamId, targetId);
+      upstreamStack.push(upstreamId);
+    }
   }
+  sampler.clearLoadedUpstreamTiles();
+
+  const unprunedIndegree = new Map<number, number>();
+  for (const next of nextByForcedCell.values()) if (forcedCells.has(next)) unprunedIndegree.set(next, (unprunedIndegree.get(next) ?? 0) + 1);
+  const prunedTributaryCells = new TiledCellSet(sampler.side, tileSize, false);
+  const minimumTributaryCells = Math.min(AUTOMATIC_TRIBUTARY_MIN_CELLS, Math.max(1, Math.floor(sampler.side / 64)));
+  for (const headwater of tributaryCells) {
+    if ((unprunedIndegree.get(headwater) ?? 0) !== 0 || prunedTributaryCells.has(headwater)) continue;
+    const twig: number[] = [];
+    let current = headwater;
+    while (twig.length < minimumTributaryCells && tributaryCells.has(current) && !prunedTributaryCells.has(current)) {
+      twig.push(current);
+      const next = nextByForcedCell.get(current);
+      if (next === undefined || !tributaryCells.has(next) || (unprunedIndegree.get(next) ?? 0) > 1) break;
+      current = next;
+    }
+    if (twig.length < minimumTributaryCells) for (const cell of twig) prunedTributaryCells.add(cell);
+  }
+
+  const isActiveCell = (cellId: number): boolean => forcedCells.has(cellId) && !prunedTributaryCells.has(cellId);
+  const forcedIndegree = new Map<number, number>();
+  for (const [cell, next] of nextByForcedCell) if (isActiveCell(cell) && isActiveCell(next)) {
+    forcedIndegree.set(next, (forcedIndegree.get(next) ?? 0) + 1);
+  }
+  for (const cell of forcedCells) {
+    if (!isActiveCell(cell)) continue;
+    if ((forcedIndegree.get(cell) ?? 0) !== 1 || terminals.has(cell) || !nextByForcedCell.has(cell)) forcedBreakpoints.add(cell);
+  }
+
   const drafts: DraftReach[] = [];
-  for (const start of breakpoints) {
-    const firstNext = nextByCell.get(start);
+  for (const start of forcedBreakpoints) {
+    const firstNext = nextByForcedCell.get(start);
     if (firstNext === undefined) continue;
     const cells = [start];
     let current = start;
-    const seen = new Set<number>([start]);
-    while (true) {
-      const next = nextByCell.get(current);
-      if (next === undefined || seen.has(next)) break;
+    for (let step = 0; step < cellCount; step += 1) {
+      const next = nextByForcedCell.get(current);
+      if (next === undefined || !isActiveCell(next)) break;
       cells.push(next);
-      seen.add(next);
       current = next;
-      if (breakpoints.has(current)) break;
+      if (forcedBreakpoints.has(current)) break;
     }
     const terminal = terminals.get(current) ?? null;
     drafts.push({ cells, terminal, downstreamStartCell: terminal ? undefined : current });
@@ -262,12 +400,7 @@ async function rebuildRiverNetwork(
   for (const draft of drafts) idByStart.set(draft.cells[0], stableReachId(draft.cells));
   const reaches: RiverReachV2[] = [];
   for (const draft of drafts) {
-    const densePoints = await Promise.all(draft.cells.map(async (id) => {
-      const cell = sampler.cellFromId(id);
-      const point = cellCenterToWorld(sampler.config, cell);
-      point.heightR16 = await sampler.height(cell);
-      return point;
-    }));
+    const { points: densePoints, exactDischarge } = await sampler.sampleReach(draft.cells);
     const outletBasinId = outletBasinByCell.get(draft.cells[0]);
     if (outletBasinId !== undefined) {
       const outletRecord = sampler.basinRecord(outletBasinId);
@@ -283,8 +416,6 @@ async function rebuildRiverNetwork(
       const body = waterBodies.find((item) => item.id === draft.terminal?.waterBodyId);
       if (body) densePoints[densePoints.length - 1].heightR16 = body.waterLevelR16;
     }
-    const flowValues = await Promise.all(draft.cells.map((id) => sampler.flow(sampler.cellFromId(id))));
-    const maxFlowStrengthR16 = flowValues.reduce((max, value) => Math.max(max, value), 0);
     const downstreamReachId = draft.downstreamStartCell === undefined ? undefined : idByStart.get(draft.downstreamStartCell);
     reaches.push({
       id: idByStart.get(draft.cells[0]) as string,
@@ -296,8 +427,8 @@ async function rebuildRiverNetwork(
       targetBasinId: draft.terminal?.basinId,
       termination: downstreamReachId ? 'reach' : draft.terminal?.type ?? 'stuck',
       sourceIds: [],
-      discharge: 0,
-      maxFlowStrengthR16,
+      discharge: exactDischarge,
+      maxFlowStrengthR16: 0,
       widthHint: 1
     });
   }
@@ -322,6 +453,12 @@ async function rebuildRiverNetwork(
     };
   });
   const basinById = new Map(basinNodes.map((node) => [node.basinId, node]));
+  for (const basin of basinNodes) {
+    basin.inflowDischarge = basin.inletReachIds.reduce((sum, reachId) => sum + (reachById.get(reachId)?.discharge ?? 0), 0);
+    basin.outflowDischarge = basin.status === 'continuous'
+      ? Math.max(basin.inflowDischarge, basin.outletReachId ? reachById.get(basin.outletReachId)?.discharge ?? 0 : 0)
+      : 0;
+  }
   for (const source of scene.riverSources) {
     const sourceCell = { x: source.sourceCellX, y: source.sourceCellY };
     let reach = reachByStart.get(sampler.cellId(sourceCell));
@@ -353,7 +490,7 @@ async function rebuildRiverNetwork(
     }
   }
   for (const reach of reaches) {
-    reach.widthHint = Math.max(1, 1 + reach.maxFlowStrengthR16 / 16384 + Math.sqrt(reach.discharge));
+    reach.widthHint = Math.max(1, 1 + Math.log2(1 + reach.discharge) * 0.55);
   }
   const basinDiagnostics = {
     total: basinNodes.length,
@@ -365,7 +502,22 @@ async function rebuildRiverNetwork(
     continuousBasinIds: basinNodes.filter((node) => node.status === 'continuous').map((node) => node.basinId),
     terminalBasinIds: basinNodes.filter((node) => node.status === 'terminal').map((node) => node.basinId)
   });
-  return { hydrology: { ...scene, waterBodies, reaches, basinNodes }, createdWaterBodies, basinDiagnostics };
+  let automaticSourceCount = 0;
+  for (const cell of tributaryCells) if (!prunedTributaryCells.has(cell) && (forcedIndegree.get(cell) ?? 0) === 0) automaticSourceCount += 1;
+  let confluenceCount = 0;
+  for (const count of forcedIndegree.values()) if (count > 1) confluenceCount += 1;
+  const channelDiagnostics: ChannelExtractionDiagnostics = {
+    threshold: scene.channelThreshold,
+    automaticCells: tributaryCells.size - prunedTributaryCells.size,
+    automaticSources: automaticSourceCount,
+    confluences: confluenceCount,
+    reaches: reaches.length
+  };
+  console.info('[WorldForge hydrology] Automatic channel extraction summary', {
+    ...channelDiagnostics,
+    prunedShortTributaryCells: prunedTributaryCells.size
+  });
+  return { hydrology: { ...scene, waterBodies, reaches, basinNodes }, createdWaterBodies, basinDiagnostics, channelDiagnostics };
 }
 
 async function materializeBasin(sampler: HydrologyMapSampler, basinId: number, index: number): Promise<WaterBodyV1 | null> {
@@ -393,7 +545,10 @@ class HydrologyMapSampler {
   private readonly heights = new Map<string, Promise<Uint16Array>>();
   private readonly basins = new Map<string, Promise<Uint32Array | null>>();
   private readonly receivers = new Map<string, Promise<Uint16Array | null>>();
-  private readonly flows = new Map<string, Promise<Uint16Array | null>>();
+  private readonly accumulations = new Map<string, Promise<Float32Array | null>>();
+  private readonly loadedBasins = new Map<string, Uint32Array | null>();
+  private readonly loadedReceivers = new Map<string, Uint16Array | null>();
+  private readonly loadedAccumulations = new Map<string, Float32Array | null>();
   private readonly basinIndex = new Map<number, number>();
 
   constructor(private readonly manager: TileManager, readonly config: WorldConfig, private readonly topology: HydrologyTopologyV3) {
@@ -414,18 +569,112 @@ class HydrologyMapSampler {
     const { tile, index } = this.locate(cell);
     return (await this.cached(this.basins, tile, () => this.manager.readBasinIdTile({ ...tile, d: 0 })))?.[index] ?? 0;
   }
-  async flow(cell: Cell): Promise<number> {
+  async accumulation(cell: Cell): Promise<number> {
     const { tile, index } = this.locate(cell);
-    return (await this.cached(this.flows, tile, () => this.manager.readFlowStrengthTile({ ...tile, d: 0 })))?.[index] ?? 0;
+    return (await this.cached(this.accumulations, tile, () => this.manager.readFlowAccumulationTile({ ...tile, d: 0 })))?.[index] ?? 0;
+  }
+  hasLoadedUpstreamNeighborhood(cell: Cell): boolean {
+    return this.upstreamNeighborhoodTiles(cell).every((tile) => {
+      const key = `${tile.x},${tile.y}`;
+      return this.loadedAccumulations.has(key) && this.loadedBasins.has(key) && this.loadedReceivers.has(key);
+    });
+  }
+  async loadUpstreamNeighborhood(cell: Cell): Promise<void> {
+    const required = this.upstreamNeighborhoodTiles(cell);
+    const requiredKeys = new Set(required.map((tile) => `${tile.x},${tile.y}`));
+    await Promise.all(required.map(async (tile) => {
+      const key = `${tile.x},${tile.y}`;
+      if (this.loadedAccumulations.has(key)) return;
+      const [accumulation, basins, receivers] = await Promise.all([
+        this.cached(this.accumulations, tile, () => this.manager.readFlowAccumulationTile({ ...tile, d: 0 })),
+        this.cached(this.basins, tile, () => this.manager.readBasinIdTile({ ...tile, d: 0 })),
+        this.cached(this.receivers, tile, () => this.manager.readReceiverDirectionTile({ ...tile, d: 0 }))
+      ]);
+      this.loadedAccumulations.set(key, accumulation);
+      this.loadedBasins.set(key, basins);
+      this.loadedReceivers.set(key, receivers);
+    }));
+    while (this.loadedAccumulations.size > 24) {
+      const evict = [...this.loadedAccumulations.keys()].find((key) => !requiredKeys.has(key));
+      if (evict === undefined) break;
+      this.loadedAccumulations.delete(evict);
+      this.loadedBasins.delete(evict);
+      this.loadedReceivers.delete(evict);
+    }
+  }
+  upstreamChannelNeighborsLoaded(target: Cell, threshold: number): Cell[] {
+    const upstream: Array<{ cell: Cell; accumulation: number }> = [];
+    for (let codeToCandidate = 1; codeToCandidate <= 8; codeToCandidate += 1) {
+      const candidate = { x: target.x + D8_DX[codeToCandidate], y: target.y + D8_DY[codeToCandidate] };
+      if (!this.contains(candidate) || this.loadedBasin(candidate) !== 0) continue;
+      const accumulation = this.loadedAccumulation(candidate);
+      if (accumulation < threshold) continue;
+      const selected = this.dominantReceiverLoaded(candidate);
+      if (selected?.x === target.x && selected.y === target.y) upstream.push({ cell: candidate, accumulation });
+    }
+    upstream.sort((a, b) => b.accumulation - a.accumulation || this.cellId(a.cell) - this.cellId(b.cell));
+    return upstream.map((item) => item.cell);
+  }
+  clearLoadedUpstreamTiles(): void {
+    this.loadedAccumulations.clear();
+    this.loadedBasins.clear();
+    this.loadedReceivers.clear();
+  }
+  private loadedBasin(cell: Cell): number {
+    const { tile, index } = this.locate(cell);
+    return this.loadedBasins.get(`${tile.x},${tile.y}`)?.[index] ?? 0;
+  }
+  private loadedAccumulation(cell: Cell): number {
+    const { tile, index } = this.locate(cell);
+    return this.loadedAccumulations.get(`${tile.x},${tile.y}`)?.[index] ?? 0;
   }
   async receiver(cell: Cell): Promise<Cell | null> {
     const { tile, index } = this.locate(cell);
     const encoded = (await this.cached(this.receivers, tile, () => this.manager.readReceiverDirectionTile({ ...tile, d: 0 })))?.[index];
     const recipients = encoded === undefined ? null : decodeDInfinityRecipients(encoded);
     if (!recipients) return null;
-    const code = recipients.weightB > recipients.weightA ? recipients.codeB : recipients.codeA;
-    const next = { x: cell.x + D8_DX[code], y: cell.y + D8_DY[code] };
-    return next.x >= 0 && next.y >= 0 && next.x < this.side && next.y < this.side ? next : null;
+    const candidates = [
+      { code: recipients.codeA, weight: recipients.weightA },
+      { code: recipients.codeB, weight: recipients.weightB }
+    ];
+    const evaluated: Array<{ cell: Cell; accumulation: number; weight: number }> = [];
+    for (const candidate of candidates) {
+      if (candidate.weight <= 1e-6) continue;
+      const next = { x: cell.x + D8_DX[candidate.code], y: cell.y + D8_DY[candidate.code] };
+      if (!this.contains(next)) continue;
+      const accumulation = await this.accumulation(next);
+      evaluated.push({ cell: next, accumulation, weight: candidate.weight });
+    }
+    evaluated.sort((a, b) => b.accumulation - a.accumulation || b.weight - a.weight || this.cellId(a.cell) - this.cellId(b.cell));
+    return evaluated[0]?.cell ?? null;
+  }
+  async sampleReach(cellIds: number[]): Promise<{ points: HydrologyPointV1[]; exactDischarge: number }> {
+    const points: HydrologyPointV1[] = [];
+    let exactDischarge = 0;
+    for (let start = 0; start < cellIds.length;) {
+      const firstCell = this.cellFromId(cellIds[start]);
+      const firstLocation = this.locate(firstCell);
+      let end = start + 1;
+      while (end < cellIds.length) {
+        const location = this.locate(this.cellFromId(cellIds[end]));
+        if (location.tile.x !== firstLocation.tile.x || location.tile.y !== firstLocation.tile.y) break;
+        end += 1;
+      }
+      const [heights, accumulations] = await Promise.all([
+        this.cached(this.heights, firstLocation.tile, () => this.manager.readTile({ ...firstLocation.tile, d: 0 })),
+        this.cached(this.accumulations, firstLocation.tile, () => this.manager.readFlowAccumulationTile({ ...firstLocation.tile, d: 0 }))
+      ]);
+      for (let index = start; index < end; index += 1) {
+        const cell = this.cellFromId(cellIds[index]);
+        const location = this.locate(cell);
+        const point = cellCenterToWorld(this.config, cell);
+        point.heightR16 = heights[location.index];
+        points.push(point);
+        exactDischarge = Math.max(exactDischarge, accumulations?.[location.index] ?? 0);
+      }
+      start = end;
+    }
+    return { points, exactDischarge };
   }
   basinRecord(id: number): BasinRecord | null {
     const index = this.basinIndex.get(id);
@@ -469,10 +718,61 @@ class HydrologyMapSampler {
     const localX = cell.x - tileX * this.config.tileSize, localY = cell.y - tileY * this.config.tileSize;
     return { tile: { x: tileX, y: tileY }, index: localY * this.config.tileSize + localX };
   }
+  private upstreamNeighborhoodTiles(cell: Cell): Array<{ x: number; y: number }> {
+    const tiles = new Map<string, { x: number; y: number }>();
+    // Two cells covers both recipients of every candidate adjacent to `cell`.
+    for (let y = Math.max(0, cell.y - 2); y <= Math.min(this.side - 1, cell.y + 2); y += 1) {
+      for (let x = Math.max(0, cell.x - 2); x <= Math.min(this.side - 1, cell.x + 2); x += 1) {
+        const tile = this.locate({ x, y }).tile;
+        tiles.set(`${tile.x},${tile.y}`, tile);
+      }
+    }
+    return [...tiles.values()];
+  }
+  private dominantReceiverLoaded(cell: Cell): Cell | null {
+    const { tile, index } = this.locate(cell);
+    const encoded = this.loadedReceivers.get(`${tile.x},${tile.y}`)?.[index];
+    const recipients = encoded === undefined ? null : decodeDInfinityRecipients(encoded);
+    if (!recipients) return null;
+    let best: Cell | null = null;
+    let bestAccumulation = -Infinity;
+    let bestWeight = -Infinity;
+    let bestId = Infinity;
+    for (let recipientIndex = 0; recipientIndex < 2; recipientIndex += 1) {
+      const code = recipientIndex === 0 ? recipients.codeA : recipients.codeB;
+      const weight = recipientIndex === 0 ? recipients.weightA : recipients.weightB;
+      if (weight <= 1e-6) continue;
+      const next = { x: cell.x + D8_DX[code], y: cell.y + D8_DY[code] };
+      if (!this.contains(next)) continue;
+      const accumulation = this.loadedAccumulation(next);
+      const id = this.cellId(next);
+      if (accumulation > bestAccumulation ||
+        (accumulation === bestAccumulation && (weight > bestWeight || (weight === bestWeight && id < bestId)))) {
+        best = next;
+        bestAccumulation = accumulation;
+        bestWeight = weight;
+        bestId = id;
+      }
+    }
+    return best;
+  }
   private cached<T>(cache: Map<string, Promise<T>>, tile: { x: number; y: number }, read: () => Promise<T>): Promise<T> {
     const key = `${tile.x},${tile.y}`;
     let value = cache.get(key);
-    if (!value) { value = read(); cache.set(key, value); }
+    if (value) {
+      // Refresh insertion order to make this a tiny LRU rather than retaining
+      // every tile touched by a world-spanning river network.
+      cache.delete(key);
+      cache.set(key, value);
+      return value;
+    }
+    while (cache.size >= 18) {
+      const oldest = cache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+    value = read();
+    cache.set(key, value);
     return value;
   }
 }

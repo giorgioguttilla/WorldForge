@@ -374,9 +374,7 @@ export class HydrologyOverlay {
         this.addWaterBodyRing(simplifyLakeRing(ring, LAKE_RING_SIMPLIFY_TOLERANCE_CELLS * this.config.unitSize), y);
       }
     }
-    for (const reach of this.hydrology.reaches) {
-      this.addRiver(reach.points, Math.max(1, reach.widthHint));
-    }
+    this.addRivers(this.hydrology.reaches.map((reach) => ({ points: reach.points, widthHint: Math.max(1, reach.widthHint) })));
   }
 
   private addWaterBodyRing(ring: HydrologyPointV1[], y: number): void {
@@ -415,42 +413,52 @@ export class HydrologyOverlay {
     this.track(line);
   }
 
-  private addRiver(points: HydrologyPointV1[], widthHint: number): void {
-    if (points.length < 2 || !this.config) return;
-    const radius = Math.min(10, Math.max(1.5, widthHint * 0.75));
+  private addRivers(rivers: Array<{ points: HydrologyPointV1[]; widthHint: number }>): void {
+    if (!this.config) return;
+    const valid = rivers.filter((river) => river.points.length >= 2);
+    if (valid.length === 0) return;
+    const pointCount = valid.reduce((sum, river) => sum + river.points.length, 0);
+    const segmentCount = valid.reduce((sum, river) => sum + river.points.length - 1, 0);
+    const positions = new Float32Array(pointCount * 2 * 3);
+    const indices = new Uint32Array(segmentCount * 6);
     const visualLift = Math.max(2, this.config.unitSize * 2);
-    const positions = new Float32Array(points.length * 2 * 3);
-    const indices: number[] = [];
-    for (let index = 0; index < points.length; index += 1) {
-      const point = points[index];
-      const previous = points[Math.max(0, index - 1)];
-      const next = points[Math.min(points.length - 1, index + 1)];
-      let tangentX = next.x - previous.x;
-      let tangentZ = next.z - previous.z;
-      const tangentLength = Math.hypot(tangentX, tangentZ);
-      if (tangentLength > 0) {
-        tangentX /= tangentLength;
-        tangentZ /= tangentLength;
-      } else {
-        tangentX = 1;
-        tangentZ = 0;
+    let pointOffset = 0;
+    let indexOffset = 0;
+    for (const river of valid) {
+      const radius = Math.min(10, Math.max(1.5, river.widthHint * 0.75));
+      for (let index = 0; index < river.points.length; index += 1) {
+        const point = river.points[index];
+        const previous = river.points[Math.max(0, index - 1)];
+        const next = river.points[Math.min(river.points.length - 1, index + 1)];
+        let tangentX = next.x - previous.x;
+        let tangentZ = next.z - previous.z;
+        const tangentLength = Math.hypot(tangentX, tangentZ);
+        if (tangentLength > 0) {
+          tangentX /= tangentLength;
+          tangentZ /= tangentLength;
+        } else {
+          tangentX = 1;
+          tangentZ = 0;
+        }
+        const normalX = -tangentZ * radius;
+        const normalZ = tangentX * radius;
+        const y = r16ToElevation(point.heightR16 ?? 0, this.config.worldHeight) + visualLift;
+        const positionOffset = (pointOffset + index) * 6;
+        positions.set([point.x + normalX, y, point.z + normalZ, point.x - normalX, y, point.z - normalZ], positionOffset);
+        if (index < river.points.length - 1) {
+          const left = (pointOffset + index) * 2;
+          const right = left + 1;
+          const nextLeft = left + 2;
+          const nextRight = left + 3;
+          indices.set([left, right, nextLeft, right, nextRight, nextLeft], indexOffset);
+          indexOffset += 6;
+        }
       }
-      const normalX = -tangentZ * radius;
-      const normalZ = tangentX * radius;
-      const y = r16ToElevation(point.heightR16 ?? 0, this.config.worldHeight) + visualLift;
-      const offset = index * 6;
-      positions.set([point.x + normalX, y, point.z + normalZ, point.x - normalX, y, point.z - normalZ], offset);
-      if (index < points.length - 1) {
-        const left = index * 2;
-        const right = left + 1;
-        const nextLeft = left + 2;
-        const nextRight = left + 3;
-        indices.push(left, right, nextLeft, right, nextRight, nextLeft);
-      }
+      pointOffset += river.points.length;
     }
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setIndex(indices);
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
     geometry.computeVertexNormals();
     const material = new THREE.MeshBasicMaterial({
       color: 0x0aa7ff,

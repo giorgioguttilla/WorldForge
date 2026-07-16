@@ -2,12 +2,72 @@ import { describe, expect, it } from 'vitest';
 import type { TileManager } from '../heightmap/tileManager';
 import type { HydrologySceneV2 } from './authoringDocument';
 import { encodeDInfinityAngle, type HydrologyTopologyV3 } from './hydrologyBake';
-import { addRiverSourceAtWorld, addWaterFillAtWorld, simplifyLakeRing, simplifyRiverPolyline, smoothRiverLateralJitter } from './hydrologyAuthoring';
+import { addRiverSourceAtWorld, addWaterFillAtWorld, rebuildRiverNetworkFromSources, simplifyLakeRing, simplifyRiverPolyline, smoothRiverLateralJitter } from './hydrologyAuthoring';
 
 const SIDE = 5;
-const EMPTY: HydrologySceneV2 = { version: 2, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] };
+const EMPTY: HydrologySceneV2 = { version: 2, channelThreshold: 512, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] };
 
 describe('authored graph hydrology tools', () => {
+  it('does not spend work extracting disconnected channels without an authored trunk', async () => {
+    const accumulation = grid();
+    accumulation[2 * SIDE + 1] = 2;
+    accumulation[2 * SIDE + 2] = 3;
+    accumulation[2 * SIDE + 3] = 4;
+    accumulation[2 * SIDE + 4] = 5;
+    const hydrology = await rebuildRiverNetworkFromSources(mockManager({
+      accumulation,
+      receivers: receiverGrid([[1, 2, 0], [2, 2, 0], [3, 2, 0]])
+    }), { ...EMPTY, channelThreshold: 2 });
+    expect(hydrology.riverSources).toHaveLength(0);
+    expect(hydrology.reaches).toHaveLength(0);
+  });
+
+  it('compresses automatic tributaries into reaches split at their confluence', async () => {
+    const accumulation = grid();
+    for (const [x, y, value] of [[1, 1, 2], [3, 1, 2], [2, 2, 4], [2, 3, 5], [2, 4, 6]] as Array<[number, number, number]>) {
+      accumulation[y * SIDE + x] = value;
+    }
+    const result = await addRiverSourceAtWorld(mockManager({
+      accumulation,
+      receivers: receiverGrid([[1, 1, Math.PI / 4], [3, 1, Math.PI * 3 / 4], [2, 2, Math.PI / 2], [2, 3, Math.PI / 2]])
+    }), { ...EMPTY, channelThreshold: 2 }, 0, 0);
+    if (!result.ok) throw new Error(result.reason);
+    const hydrology = result.hydrology;
+    expect(hydrology.reaches).toHaveLength(3);
+    const downstream = hydrology.reaches.find((reach) => reach.startCellId === 12);
+    expect(downstream).toMatchObject({ endCellId: 22, discharge: 7, termination: 'edge' });
+    expect(hydrology.reaches.filter((reach) => reach.downstreamReachId === downstream?.id)).toHaveLength(2);
+  });
+
+  it('finds an inward tributary across a tile boundary without scanning the world', async () => {
+    const side = 4;
+    const accumulation = new Array(side * side).fill(0);
+    for (const [x, value] of [[1, 2], [2, 4], [3, 5]] as Array<[number, number]>) accumulation[side + x] = value;
+    const receivers = new Array(side * side).fill(65535);
+    for (const x of [1, 2]) receivers[side + x] = encodeDInfinityAngle(0);
+    const result = await addRiverSourceAtWorld(mockTiledManager(side, 2, accumulation, receivers), { ...EMPTY, channelThreshold: 2 }, 0, -1);
+    if (!result.ok) throw new Error(result.reason);
+    expect(result.hydrology.reaches).toHaveLength(2);
+    expect(result.hydrology.reaches.some((reach) => reach.startCellId === 5 && reach.endCellId === 6)).toBe(true);
+    expect(result.hydrology.reaches.some((reach) => reach.startCellId === 6 && reach.endCellId === 7 && reach.discharge === 6)).toBe(true);
+  });
+
+  it('unions an authored source into the automatic graph and adds downstream discharge', async () => {
+    const accumulation = grid();
+    for (const [x, value] of [[1, 2], [2, 3], [3, 4], [4, 5]] as Array<[number, number]>) accumulation[2 * SIDE + x] = value;
+    const manager = mockManager({
+      accumulation,
+      receivers: receiverGrid([[1, 2, 0], [2, 2, 0], [3, 2, 0]])
+    });
+    const automatic = await rebuildRiverNetworkFromSources(manager, { ...EMPTY, channelThreshold: 2 });
+    const result = await addRiverSourceAtWorld(manager, automatic, 0, 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const downstream = result.hydrology.reaches.find((reach) => reach.startCellId === 12);
+    expect(downstream).toMatchObject({ endCellId: 14, discharge: 6, termination: 'edge' });
+    expect(downstream?.sourceIds).toEqual([result.source.id]);
+  });
+
   it('materializes the clicked durable basin record and avoids duplicates', async () => {
     const basins = grid();
     for (const [x, y] of [[1, 1], [2, 1], [1, 2], [2, 2]]) basins[y * SIDE + x] = 7;
@@ -182,6 +242,7 @@ function mockManager(options: {
   basins?: number[];
   receivers?: number[];
   flows?: number[];
+  accumulation?: number[];
   basinRecords?: Array<{ id: number; fill: number; depth: number; bounds: [number, number, number, number]; outlet?: [number, number, number] }>;
   topology?: HydrologyTopologyV3 | null;
 } = {}): TileManager {
@@ -220,6 +281,43 @@ function mockManager(options: {
     readBasinIdTile: async () => basins,
     readReceiverDirectionTile: async () => Uint16Array.from(options.receivers ?? new Array(SIDE * SIDE).fill(65535)),
     readFlowStrengthTile: async () => Uint16Array.from(options.flows ?? grid()),
+    readFlowAccumulationTile: async () => Float32Array.from(options.accumulation ?? grid()),
     readHydrologyTopology: async () => options.topology === null ? null : topology
+  } as unknown as TileManager;
+}
+
+function mockTiledManager(side: number, tileSize: number, accumulation: number[], receivers: number[]): TileManager {
+  const tilesPerSide = side / tileSize;
+  const tile = <T extends Uint16Array | Uint32Array | Float32Array>(values: number[], x: number, y: number, make: (items: number[]) => T): T => {
+    const items: number[] = [];
+    for (let localY = 0; localY < tileSize; localY += 1) for (let localX = 0; localX < tileSize; localX += 1) {
+      items.push(values[(y * tileSize + localY) * side + x * tileSize + localX]);
+    }
+    return make(items);
+  };
+  const topology: HydrologyTopologyV3 = {
+    version: 3,
+    width: side,
+    height: side,
+    nodeCount: 0,
+    receiverEncoding: 'd-infinity-angle-u16-turn65528',
+    basinIds: new Uint32Array(),
+    fillHeights: new Uint16Array(),
+    downstreamIds: new Uint32Array(),
+    spillCells: new Uint32Array(),
+    downstreamCells: new Uint32Array(),
+    areaCells: new Uint32Array(),
+    maxDepths: new Uint16Array(),
+    minCellX: new Uint32Array(), minCellY: new Uint32Array(),
+    maxCellX: new Uint32Array(), maxCellY: new Uint32Array()
+  };
+  const zeros = new Array(side * side).fill(0);
+  return {
+    config: { tileSize, tilesPerSide, unitSize: 1, worldHeight: 1000 },
+    readTile: async ({ x, y }: { x: number; y: number }) => tile(new Array(side * side).fill(100), x, y, (items) => Uint16Array.from(items)),
+    readBasinIdTile: async ({ x, y }: { x: number; y: number }) => tile(zeros, x, y, (items) => Uint32Array.from(items)),
+    readReceiverDirectionTile: async ({ x, y }: { x: number; y: number }) => tile(receivers, x, y, (items) => Uint16Array.from(items)),
+    readFlowAccumulationTile: async ({ x, y }: { x: number; y: number }) => tile(accumulation, x, y, (items) => Float32Array.from(items)),
+    readHydrologyTopology: async () => topology
   } as unknown as TileManager;
 }

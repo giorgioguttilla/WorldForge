@@ -182,11 +182,14 @@ export interface RiverBasinNodeV2 {
 
 export interface HydrologySceneV2 {
   version: 2;
+  channelThreshold: number;
   waterBodies: WaterBodyV1[];
   riverSources: RiverSourceConstraintV2[];
   reaches: RiverReachV2[];
   basinNodes: RiverBasinNodeV2[];
 }
+
+export const DEFAULT_CHANNEL_THRESHOLD = 512;
 
 export interface AuthoringDocumentV1 {
   version: 1;
@@ -286,7 +289,7 @@ export function createEmptyAuthoringDocument(worldId: string): AuthoringDocument
     fieldLibrary: createDefaultNoiseFieldLibrary(),
     primitives: [],
     erosion: { ...EROSION_PRESETS.medium, enabled: false },
-    hydrology: { version: 2, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] }
+    hydrology: { version: 2, channelThreshold: DEFAULT_CHANNEL_THRESHOLD, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] }
   };
 }
 
@@ -529,9 +532,10 @@ function normalizeHydrologyBakeSummary(value: unknown): HydrologyBakeSummaryV1 |
 }
 
 function normalizeHydrologyScene(value: unknown): HydrologySceneV2 {
-  if (!isRecord(value)) return { version: 2, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] };
+  if (!isRecord(value)) return { version: 2, channelThreshold: DEFAULT_CHANNEL_THRESHOLD, waterBodies: [], riverSources: [], reaches: [], basinNodes: [] };
   return {
     version: 2,
+    channelThreshold: Math.max(1, finiteNumber(value.channelThreshold, DEFAULT_CHANNEL_THRESHOLD)),
     waterBodies: Array.isArray(value.waterBodies)
       ? value.waterBodies.map(normalizeWaterBody).filter((body): body is WaterBodyV1 => Boolean(body))
       : [],
